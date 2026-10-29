@@ -1,0 +1,17 @@
+{
+  "name": "xacqora-track",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Xacqora Track - lead tracker & attribution CRM (zero-dependency Node.js + SQLite demo build)",
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "seed": "node scripts/seed.js",
+    "test": "node test/replay.js",
+    "tracker": "node public/test-samples/serve.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

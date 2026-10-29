@@ -1,0 +1,10 @@
+{
+  "action": "attendee_joined",
+  "timestamp": "2026-10-28T18:05:00+05:30",
+  "data": {
+    "id": "ATT-2001",
+    "name": "Meera",
+    "email": "meera@example.com",
+    "phone": "+91-98222-33344"
+  }
+}

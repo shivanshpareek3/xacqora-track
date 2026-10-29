@@ -1,0 +1,9 @@
+{
+  "data": {
+    "message_id": "wamid.TEST001",
+    "type": "inbound",
+    "from": "919812345678",
+    "text": "Yes I attended the webinar, want the course link",
+    "timestamp": "2026-10-29T07:30:00+00:00"
+  }
+}

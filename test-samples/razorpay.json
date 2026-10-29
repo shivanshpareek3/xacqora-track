@@ -1,0 +1,20 @@
+{
+  "event": "payment.captured",
+  "payload": {
+    "payment": {
+      "entity": {
+        "id": "pay_NX9abcDEF",
+        "email": "ravi@example.com",
+        "contact": "9812345678",
+        "amount": 499900,
+        "currency": "INR",
+        "status": "captured",
+        "created_at": 1761711120,
+        "notes": {
+          "phone_number": "9812345678",
+          "product": "Webinar + Course"
+        }
+      }
+    }
+  }
+}

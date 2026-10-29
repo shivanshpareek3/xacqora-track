@@ -1,0 +1,536 @@
+// Shared pure logic: identity rules, CAPI payloads, attribution, reports, UI helpers.
+const crypto = require('node:crypto');
+
+// ---------------------------------------------------------------- identity
+function normPhone(p) {
+  if (!p) return null;
+  let s = String(p).replace(/[\s\-()]/g, '');
+  if (!/^\+?[0-9]+$/.test(s)) return null;
+  s = s.replace(/^\+/, '');
+  if (s.startsWith('0091')) s = s.slice(4);
+  if (s.startsWith('91') && s.length === 12) s = s.slice(2);
+  if (s.startsWith('0') && s.length === 11) s = s.slice(1);
+  if (s.length === 10) s = '91' + s;
+  if (!/^91\d{10}$/.test(s)) return null;
+  return '+' + s;
+}
+function normEmail(e) {
+  if (!e) return null;
+  const x = String(e).trim().toLowerCase();
+  return x.includes('@') ? x : null;
+}
+function sha256(s) {
+  return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
+}
+// CAPI rules: hash E.164 WITHOUT the leading + ; email lowercase trimmed.
+function capiHashedPhone(p) {
+  const n = normPhone(p);
+  return n ? sha256(n.replace('+', '')) : null;
+}
+function capiHashedEmail(e) {
+  const n = normEmail(e);
+  return n ? sha256(n) : null;
+}
+function buildCapiEvent(opts) {
+  const { eventName, hashedPhone, hashedEmail, eventTime, value, currency = 'INR', fbc, fbp, eventId, externalId, dedupable = true } = opts;
+  return {
+    eventName,
+    action_time: eventTime,
+    user_data: {
+      ...(hashedPhone ? { ph: [hashedPhone] } : {}),
+      ...(hashedEmail ? { em: [hashedEmail] } : {}),
+      ...(externalId ? { external_id: [externalId] } : {}),
+      ...(fbc ? { fbc } : {}),
+      ...(fbp ? { fbp } : {}),
+    },
+    custom_data: { ...(value != null ? { value, currency } : {}), ...(dedupable ? { dedupable: true } : {}) },
+    ...(eventId ? { event_id: eventId } : {}),
+  };
+}
+function buildCapiPayload(opts) {
+  return { data: [buildCapiEvent(opts)], event_id: opts.eventId || sha256('capi|' + opts.clientId + '|' + Date.now() + '|' + Math.random()) };
+}
+function maskPhone(p) {
+  const n = normPhone(p);
+  if (!n) return p ? String(p) : '';
+  return '+91 ••••• ' + n.slice(-4);
+}
+
+// ---------------------------------------------------------------- stages
+const DEFAULT_STAGES = ['New', 'Registered', 'Attended', 'Hot', 'Call Booked', 'Paid', 'Lost'];
+const STAGE_EVENTS = {
+  registered: 'Registered',
+  webinar_joined: 'Attended',
+  call_booked: 'Call Booked',
+  payment_success: 'Paid',
+  refund: 'Lost',
+};
+function stageOrder(stages) {
+  return (s) => {
+    const i = stages.indexOf(s);
+    return i === -1 ? 90 : i;
+  };
+}
+function autoStage(stages, current, eventType) {
+  const target = STAGE_EVENTS[eventType];
+  if (!target || !stages.includes(target)) return current;
+  const ord = stageOrder(stages);
+  if (ord(target) > ord(current)) return target;
+  if (target === 'Paid') return 'Paid';
+  return current;
+}
+
+// ---------------------------------------------------------------- attribution
+// models: last_paid_click (default, 30d window), first_click, linear, lead_source
+function adClicksInWindow(tps, tsIso, days) {
+  const t = Date.parse(tsIso);
+  const from = t - days * 86400000;
+  const to = t + 86400000; // 1-day slack for same-day clicks stored as date strings
+  return tps.filter((x) => x.ad_id && Date.parse(x.ts) >= from && Date.parse(x.ts) <= to);
+}
+function attributeSale(leadRow, clientName, settings, tps, tpsByLead) {
+  const model = settings.attribution_model || 'last_paid_click';
+  const win = Number(settings.attribution_window_days) || 30;
+  const clicks = adClicksInWindow(tps, leadRow.paid_at, win);
+  let attributedAdId = null, amount = leadRow.amount, bucket = 'Organic / unknown';
+  if (clicks.length) {
+    if (model === 'first_click') { attributedAdId = clicks[0].ad_id; bucket = 'Attributed'; }
+    else if (model === 'last_paid_click') {
+      attributedAdId = clicks[clicks.length - 1].ad_id;
+      bucket = 'Attributed';
+    } else if (model === 'linear') { bucket = 'Linear (split)'; attributedAdId = null; }
+    else if (model === 'lead_source') {
+      const firstForm = tps.find((x) => x.utm_campaign || x.ad_id);
+      attributedAdId = firstForm ? (firstForm.ad_id || null) : null;
+      bucket = attributedAdId ? 'Attributed' : 'Organic / unknown';
+    }
+  }
+  return {
+    client: clientName,
+    lead_name: leadRow.name || 'Unknown',
+    phone: leadRow.phone,
+    email: leadRow.email,
+    paid_at: leadRow.paid_at,
+    amount,
+    net: !leadRow.refunded_at ? leadRow.amount : 0,
+    status: leadRow.refunded_at ? 'refunded' : 'active',
+    model,
+    window_days: win,
+    attributed_ad_id: attributedAdId,
+    bucket,
+    ad_clicks: clicks.length,
+    leads: [ { id: leadRow.lead_id, name: leadRow.name, phone: leadRow.phone } ],
+    is_new_lead: isWithinRange(leadRow.created_at, settings.report_from, settings.report_to),
+  };
+}
+function isWithinRange(iso, from, to) {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(t)) return true;
+  if (from && t < Date.parse(from + 'T00:00:00Z')) return false;
+  if (to && t > Date.parse(to + 'T23:59:59Z')) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------- reports
+function funnelReport(tx, clientId, settings, clientIds) {
+  // clientId null -> all clients (dashboard); a number -> one client; clientIds -> portal set
+  const inList = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
+  const filter = clientId != null ? `WHERE l.client_id = ${Number(clientId)}` : inList ? `WHERE l.client_id IN (${inList})` : '';
+  const rows = tx.all(`
+    SELECT l.id, l.stage, l.created_at, l.source_unknown,
+           COALESCE(d.net,0) rev, d.refunded_at
+    FROM lead l LEFT JOIN (
+      SELECT lead_id,
+        SUM(CASE WHEN status='success' AND refunded_at IS NULL THEN amount END) net,
+        MIN(CASE WHEN refunded_at IS NOT NULL AND status='refunded' THEN 1 ELSE 0 END) refunded_at
+      FROM deal GROUP BY lead_id
+    ) d ON d.lead_id = l.id
+    ${filter}`).map((r) => ({ ...r, refunded_at: r.refunded_at ? 1 : 0 }));
+
+  // revenue per lead (net of refunds)
+  const rev = {};
+  for (const r of rows) if (r.rev > 0) rev[r.id] = r.rev;
+
+  // attribution buckets per sale
+  const sales = rows.filter((r) => rev[r.id] > 0).map((s) => ({
+    ...s,
+    paid_at: tx.get(`SELECT MIN(paid_at) paid_at FROM deal WHERE lead_id=? AND status='success' AND refunded_at IS NULL`, s.id)?.paid_at || null,
+  }));
+  let attributed = 0, organic = 0, linearSplit = 0;
+  for (const s of sales) {
+    const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, s.id);
+    const a = attributeSale({ ...s, amount: rev[s.id], name: null, phone: null, email: null, refunded_at: s.refunded_at }, '', settings, tps);
+    if (a.bucket === 'Linear (split)') linearSplit = true;
+    else if (a.bucket === 'Organic / unknown') organic += 1;
+    else attributed += 1;
+  }
+
+  const st = (name) => rows.filter((r) => r.stage === name).length;
+  // scope spend to the same clients
+  const spendWhere = inList ? `WHERE s.ad_id IN (SELECT a.id FROM meta_ad a JOIN meta_adset as_ ON as_.id=a.adset_id WHERE as_.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inList})))` : '';
+  const spend = (inList
+    ? tx.get(`SELECT COALESCE(SUM(s.spend_inr),0) v FROM spend_daily s ${spendWhere}`)
+    : tx.get(`SELECT COALESCE(SUM(spend_inr),0) v FROM spend_daily`)
+  )?.v || 0;
+  const leadsCount = rows.length;
+  const registered = st('Registered') + st('Attended') + st('Hot') + st('Call Booked') + st('Paid') + st('Lost');
+  const attended = st('Attended') + st('Hot') + st('Call Booked') + st('Paid');
+  const calls = st('Call Booked') + st('Paid');
+  const paidLeads = st('Paid');
+  const totalNet = Object.values(rev).reduce((a, b) => a + b, 0);
+  const pct = (num, den) => (den ? Math.round((num / den) * 1000) / 10 : null);
+  const money = (n) => n ? Math.round(n).toLocaleString('en-IN') : '0';
+  return {
+    leads: leadsCount,
+    registered, attended, calls, paid: paidLeads,
+    show_up_rate: pct(attended, registered || 0),
+    close_rate: pct(paidLeads, registered || 0),
+    spend, cpl: leadsCount ? Math.round(spend / leadsCount) : null,
+    cpl_note: 'spend is all-accounts total; filter by ad account in Ad performance',
+    revenue: totalNet,
+    cost_per_sale: paidLeads ? Math.round(spend / paidLeads) : null,
+    attribution: { attributed, organic, linear_split: linearSplit, sales_count: sales.length },
+  };
+}
+
+// clientIds: optional array; when present, only that client's ads/spend/deals count
+function adPerformance(tx, settings, clientIds) {
+  const model = settings.attribution_model || 'last_paid_click';
+  const win = Number(settings.attribution_window_days) || 30;
+  const inClause = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
+  const accWhere = inClause ? `WHERE a.client_id IN (${inClause})` : '';
+  const salesWhere = inClause ? `WHERE l.client_id IN (${inClause})` : '';
+  const ads = inClause
+    ? tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
+       COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
+       JOIN meta_adset a ON a.id=ad.adset_id ${accWhere}
+       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)`)
+    : tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
+       COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
+       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)`);
+  const adAccounts = inClause
+    ? tx.all(`SELECT ad_account_id, name FROM meta_ad_account WHERE client_id IN (${inClause})`)
+    : tx.all(`SELECT ad_account_id, name FROM meta_ad_account`);
+  const accById = {}; for (const a of adAccounts) accById[a.ad_account_id] = a.name;
+  const adIdList = ads.map((a) => a.id).map((x) => `'${String(x).replace(/'/g, '')}'`).join(',');
+  const spends = (adIdList && inClause)
+    ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk
+        FROM spend_daily s WHERE s.ad_id IN (${adIdList}) GROUP BY s.ad_id`)
+    : tx.all(`SELECT ad_id, SUM(spend_inr) spend, SUM(impressions) imp, SUM(clicks) clk FROM spend_daily GROUP BY ad_id`);
+  const spendByAd = {}; for (const s of spends) spendByAd[s.ad_id] = s;
+
+  // revenue attribution per ad
+  const revByAd = {};
+  const salesWhereL = inClause ? `WHERE l.client_id IN (${inClause})` : '';
+  const sales = tx.all(`
+    SELECT l.id lead_id, l.name, l.phone, l.client_id,
+      (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) amount,
+      (SELECT MIN(d.paid_at) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid_at
+    FROM lead l ${salesWhereL}`);
+  for (const s of sales) {
+    if (!s.amount) continue;
+    const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, s.lead_id);
+    const a = attributeSale({ ...s, paid_at: s.paid_at || null, refunded_at: null }, '', settings, tps);
+    if (a.model === 'linear' && a.bucket === 'Linear (split)') {
+      const ids = adClicksInWindow(tps, s.paid_at, win).map((x) => x.ad_id).filter((x) => x && x !== 'unknown');
+      if (ids.length) {
+        for (const id of ids) revByAd[id] = (revByAd[id] || 0) + s.amount / ids.length;
+      }
+    } else if (a.attributed_ad_id && a.attributed_ad_id !== 'unknown') {
+      revByAd[a.attributed_ad_id] = (revByAd[a.attributed_ad_id] || 0) + s.amount;
+    }
+  }
+  const leadsByAd = {};
+  const leadsTps = inClause
+    ? tx.all(`SELECT t.ad_id, COUNT(DISTINCT t.lead_id) c FROM touchpoint t
+        JOIN lead l ON l.id=t.lead_id
+        WHERE t.ad_id IS NOT NULL AND t.ad_id != '' AND l.client_id IN (${inClause}) GROUP BY t.ad_id`)
+    : tx.all(`SELECT ad_id, COUNT(DISTINCT lead_id) c FROM touchpoint WHERE ad_id IS NOT NULL AND ad_id != '' GROUP BY ad_id`);
+  for (const tp of leadsTps) {
+    if (tp.ad_id) leadsByAd[tp.ad_id] = (leadsByAd[tp.ad_id] || 0) + tp.c;
+  }
+  const out = [];
+  for (const ad of ads) {
+    const sp = spendByAd[ad.id] || { spend: 0, imp: 0, clk: 0 };
+    const rev = Math.round(revByAd[ad.id] || 0);
+    const leads = leadsByAd[ad.id] || 0;
+    const wasted = sp.spend >= Number(settings.wasted_spend_threshold || 0) && rev === 0;
+    out.push({
+      ad_id: ad.id, name: ad.name, adset: ad.adset_id, campaign: ad.campaign_name,
+      account: accById[ad.adset_id ? tx.get(`SELECT ad_account_id FROM meta_adset WHERE id=?`, ad.adset_id)?.ad_account_id : ''] || '',
+      status: ad.status, img: ad.creative_img || null,
+      spend: Math.round(sp.spend), impressions: sp.imp || 0, clicks: sp.clk || 0,
+      cpc: sp.clk ? Math.round(sp.spend / sp.clk) : null, cpm: sp.imp ? Math.round((sp.spend / sp.imp) * 1000) : null,
+      leads, revenue: rev, roas: sp.spend ? Math.round((rev / sp.spend) * 100) / 100 : null,
+      profit: sp.spend ? rev - sp.spend : null, wasted,
+      model,
+    });
+  }
+  out.sort((a, b) => b.spend - a.spend);
+  const tot = { spend: 0, revenue: 0, leads: 0, cpl: null, cpo: null, wasted_ads: 0 };
+  for (const r of out) {
+    tot.spend += r.spend; tot.revenue += r.revenue; tot.leads += r.leads;
+    if (r.wasted) tot.wasted_ads += 1;
+  }
+  tot.roas = tot.spend ? Math.round((tot.revenue / tot.spend) * 100) / 100 : null;
+  tot.profit = tot.revenue - tot.spend;
+  tot.cpl = tot.leads ? Math.round(tot.spend / tot.leads) : null;
+  const paidLeads = tx.get(`SELECT COUNT(*) c FROM lead l WHERE EXISTS (SELECT 1 FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) ${salesWhereL}`)?.c;
+  tot.cpo = paidLeads ? Math.round(tot.spend / paidLeads) : null;
+  return { rows: out, total: tot, model, window_days: win };
+}
+
+function wastedSpend(ap) { return ap.rows.filter((r) => r.wasted); }
+function newVsOld(tx, settings, clientIds) {
+  const from = settings.report_from || null;
+  const to = settings.report_to || null;
+  const inClause = clientIds && clientIds.length ? `WHERE l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
+  const all = tx.all(`SELECT l.id, l.created_at, (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) rev FROM lead l ${inClause}`);
+  const inRange = all.filter((r) => isWithinRange(r.created_at, from, to));
+  const out = { in_range: [], older: [] };
+  for (const r of inRange) out.in_range.push(r);
+  for (const r of all) if (!inRange.includes(r) && r.rev > 0) out.older.push(r);
+  const sum = (arr) => arr.reduce((a, b) => a + b.rev, 0);
+  return {
+    in_range_count: inRange.length, in_range_revenue: sum(inRange),
+    older_count: out.older.length, older_revenue: sum(out.older),
+    in_range: out.in_range.map((x) => ({ id: x.id, created_at: x.created_at, rev: x.rev })),
+    older: out.older.map((x) => ({ id: x.id, created_at: x.created_at, rev: x.rev })),
+  };
+}
+function metaVsTracker(tx, settings, clientIds) {
+  // per ad: ad clicks vs our counted conversions (sales attributed)
+  const ap = adPerformance(tx, settings || {}, clientIds);
+  const inClause = clientIds && clientIds.length ? `WHERE e.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
+  const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id ${inClause} AND e.type='meta_form_lead'`)?.c || 0;
+  return {
+    meta_lead_total: metaLeadTotal,
+    attributed_sales: ap.rows.filter((r) => r.revenue > 0).length,
+    organic: ap.total ? ap.rows.filter((r) => r.bucket === 'Organic / unknown').length : 0,
+    note: 'Compare Meta Ads Manager "Conversions" column against this table; delta = Meta over/under reporting.',
+  };
+}
+function sourceMix(tx, clientIds) {
+  const inClause = clientIds && clientIds.length ? `WHERE l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
+  const rows = tx.all(`
+    SELECT
+      CASE
+        WHEN EXISTS(SELECT 1 FROM event e WHERE e.lead_id=l.id AND e.type='meta_form_lead') THEN 'Meta Instant Form'
+        WHEN l.phone IS NOT NULL OR l.email IS NOT NULL THEN 'Landing page form'
+        ELSE 'Organic / unknown'
+      END src, COUNT(*) c
+    FROM lead l ${inClause} GROUP BY src`);
+  return rows;
+}
+function weeklySummary(tx, settings, clientIds) {
+  const fp = funnelReport(tx, null, settings, clientIds);
+  const ap = adPerformance(tx, settings, clientIds);
+  const waste = wastedSpend(ap);
+  return {
+    generated_at: new Date().toISOString(),
+    settings: { model: settings.attribution_model, window: settings.attribution_window_days },
+    funnel: fp,
+    ad_top: ap.rows.slice(0, 5),
+    ad_worst: waste.slice(0, 5),
+    total: ap.total,
+    note: 'Auto-generated weekly summary. Revenue is net of refunds. Spend matches Meta Ads Manager within 1% when the Meta pull is up to date.',
+  };
+}
+
+// ---------------------------------------------------------------- scoping
+// Team roles (owner, admin, media_buyer, sales_rep, viewer) work across all
+// internal clients. The client role is locked to its own client_ids.
+function allowedClients(user, allClientIds) {
+  if (!user || user.role !== 'client') return allClientIds || null; // null = unrestricted
+  const mine = (user.client_ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return allClientIds ? allClientIds.filter((id) => mine.includes(String(id))) : mine;
+}
+
+// ---------------------------------------------------------------- UI helpers
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function fmtINR(n) {
+  if (n == null) return '—';
+  return '₹' + Math.round(n).toLocaleString('en-IN');
+}
+function fmtN(n) {
+  return n == null ? '—' : n.toLocaleString('en-IN');
+}
+function fmtPct(n) {
+  return n == null ? '—' : n + '%';
+}
+function fmtDT(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' IST';
+}
+function css() {
+  return `
+:root{--bg:#0f1117;--panel:#161a25;--panel2:#1c2130;--line:#252c40;--tx:#e7ecf7;--mut:#8a93ad;
+--blue:#4f8cff;--green:#38c78a;--orange:#f5a54a;--red:#e05d5d;--pur:#b57bff;--cy:#43c6e0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.top{display:flex;align-items:center;gap:18px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.brand{font-weight:700;font-size:15px;letter-spacing:.3px}
+.brand span{color:var(--blue)}
+.nav{display:flex;gap:2px;flex-wrap:wrap}
+.nav a{color:var(--mut);padding:6px 10px;border-radius:8px;font-size:13px}
+.nav a:hover{background:var(--panel2);color:var(--tx);text-decoration:none}
+.nav a.on{background:var(--panel2);color:var(--tx)}
+.userbox{margin-left:auto;text-align:right;font-size:12px;color:var(--mut)}
+.userbox b{color:var(--tx);font-size:13px;display:block}
+main{padding:16px;max-width:1280px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:14px}
+h1{font-size:18px;margin:0 0 12px} h2{font-size:15px;margin:0 0 8px}
+.grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:900px){.g4{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+.kpi .v{font-size:22px;font-weight:700}.kpi .l{color:var(--mut);font-size:12px;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--mut);text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+td{padding:8px;border-bottom:1px solid rgba(37,44,64,.6);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
+.pill.g{background:rgba(56,199,138,.15);color:var(--green)}
+.pill.o{background:rgba(245,165,74,.15);color:var(--orange)}
+.pill.r{background:rgba(224,93,93,.15);color:var(--red)}
+.pill.b{background:rgba(79,140,255,.15);color:var(--blue)}
+.pill.p{background:rgba(181,123,255,.15);color:var(--pur)}
+.pill.m{background:rgba(138,147,173,.15);color:var(--mut)}
+.btn{display:inline-block;background:var(--blue);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none}
+.btn:hover{filter:brightness(1.1);text-decoration:none}
+.btn.sec{background:var(--panel2);color:var(--tx);border:1px solid var(--line)}
+.btn.sm{padding:4px 10px;font-size:12px}
+.btn.danger{background:var(--red)}
+input,select,textarea{background:var(--panel2);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:7px 10px;font-size:13px;font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue)}
+label{font-size:12px;color:var(--mut);display:block;margin-bottom:3px}
+form.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.badge{font-size:11px;color:var(--mut)}
+.bar{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;min-width:90px}
+.bar i{display:block;height:100%;background:var(--blue);border-radius:4px}
+.chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-size:12px;color:var(--mut);margin:2px 4px 2px 0}
+.chip b{color:var(--tx)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.sp{flex:1}
+.muted{color:var(--mut)} .small{font-size:12px}
+.tabwrap{overflow-x:auto}
+.lead-img{width:52px;height:52px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
+.tl{border-left:2px solid var(--line);margin-left:8px;padding-left:16px;position:relative}
+.tl .ev{position:relative;padding:6px 0}
+.tl .ev::before{content:'';position:absolute;left:-22px;top:12px;width:10px;height:10px;border-radius:50%;background:var(--blue);border:2px solid var(--bg)}
+.tl .ev.g::before{background:var(--green)}.tl .ev.o::before{background:var(--orange)}.tl .ev.r::before{background:var(--red)}.tl .ev.p::before{background:var(--pur)}
+.log{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#0b0d13;border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:340px;overflow:auto}
+.note{background:rgba(79,140,255,.08);border:1px solid rgba(79,140,255,.25);border-radius:10px;padding:10px 12px;font-size:13px;margin:10px 0}
+.note.warn{background:rgba(245,165,74,.08);border-color:rgba(245,165,74,.3)}
+.kanban{display:flex;gap:10px;overflow-x:auto;padding-bottom:8px}
+.kcol{min-width:230px;flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px}
+.kcol h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut)}
+.kcard{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:8px;font-size:12px}
+.kcard a{font-weight:600}
+footer{color:var(--mut);font-size:11px;text-align:center;padding:18px}
+`;
+}
+function layout({ title, nav, active, user, body, notes = '' }) {
+  const links = nav.map((n) => `<a href="/${n.path}" class="${n.path === active ? 'on' : ''}">${esc(n.label)}</a>`).join('');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} · Xacqora Track</title><style>${css()}</style></head>
+<body>
+<div class="top">
+  <div class="brand">XACQORA <span>TRACK</span></div>
+  <div class="nav">${links}</div>
+  <div class="userbox"><b>${esc(user.name)}</b>${esc(user.role)}${user.clientNames ? ' · ' + esc(user.clientNames.join(', ')) : ''}<br><a href="/signout">Sign out</a></div>
+</div>
+<main>${notes}${body}</main>
+<footer>Xacqora Track demo build · SQLite + Node ${process.versions.node} · all webhooks verified with secret · CAPI events deduplicated by event_id</footer>
+</body></html>`;
+}
+const NAV = [
+  { path: 'leads', label: 'Leads' },
+  { path: 'leads.html', label: 'Lead' },
+  { path: 'pipeline.html', label: 'Pipeline' },
+  { path: 'reports.html', label: 'Reports' },
+  { path: 'meta.html', label: 'Meta' },
+  { path: 'integrations.html', label: 'Integrations' },
+  { path: 'duplicates.html', label: 'Duplicates' },
+  { path: 'admin.html', label: 'Admin' },
+];
+function navFor(user) {
+  if (user.role === 'client') return [{ path: 'dashboard.html', label: 'Dashboard' }, { path: 'portal-leads.html', label: 'My leads' }, { path: 'portal-reports.html', label: 'My reports' }];
+  const n = [];
+  if (user.role !== 'viewer') n.push({ path: 'dashboard.html', label: 'Dashboard' });
+  n.push({ path: 'leads.html', label: 'Leads' }, { path: 'pipeline.html', label: 'Pipeline' }, { path: 'reports.html', label: 'Reports' }, { path: 'meta.html', label: 'Meta' });
+  if (['owner', 'admin', 'media_buyer'].includes(user.role)) n.push({ path: 'integrations.html', label: 'Integrations' });
+  if (user.role === 'owner' || user.role === 'admin') n.push({ path: 'duplicates.html', label: 'Duplicates' }, { path: 'admin.html', label: 'Admin' });
+  return n;
+}
+
+// ---------------------------------------------------------------- meta mock (used when live Meta API unavailable)
+function mockMetaPull(adAccounts) {
+  const campaigns = [
+    ['CAM-101', 'LeadGen Webinar', 'campaign'],
+    ['CAM-102', 'Workshop Cold Reach', 'campaign'],
+  ];
+  const adsets = [
+    ['ADS-111', 'CAM-101', 'Webinar — lookalike', 'adset'],
+    ['ADS-112', 'CAM-101', 'Webinar — retargeting', 'adset'],
+    ['ADS-121', 'CAM-102', 'Workshop — cold', 'adset'],
+    ['ADS-122', 'CAM-102', 'Workshop — cold 2', 'adset'],
+  ];
+  const ads = [
+    ['AD-3001', 'ADS-111', 'Webinar hook A (video)', 'active', 'CR-501', 'img1'],
+    ['AD-3002', 'ADS-111', 'Webinar hook B (creative)', 'active', 'CR-502', 'img2'],
+    ['AD-3003', 'ADS-112', 'Webinar retarget', 'active', 'CR-503', 'img3'],
+    ['AD-4001', 'ADS-121', 'Workshop offer 1', 'active', 'CR-511', 'img4'],
+    ['AD-4002', 'ADS-122', 'Workshop offer 2', 'paused', 'CR-512', 'img5'],
+  ];
+  const now = new Date();
+  const dates = [];
+  for (let i = 6; i >= 0; i--) dates.push(now.toISOString().slice(0, 10).replace(/^(\d{4}-\d{2}-\d{2})/, (m) => new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10)));
+  const uniq = [...new Set(dates)];
+  const rng = (min, max) => Math.floor(min + Math.random() * (max - min));
+  const out = { campaigns: [], adsets: [], ads: [], spend: [] };
+  for (const a of adAccounts) {
+    out.campaigns.push({ id: a.ad_account_id + '-101', name: campaigns[0][1], status: 'ACTIVE' });
+    out.campaigns.push({ id: a.ad_account_id + '-102', name: campaigns[1][1], status: 'ACTIVE' });
+    out.adsets.push({ id: a.ad_account_id + '-111', name: adsets[0][2], campaign_id: a.ad_account_id + '-101' });
+    out.adsets.push({ id: a.ad_account_id + '-112', name: adsets[1][2], campaign_id: a.ad_account_id + '-101' });
+    out.adsets.push({ id: a.ad_account_id + '-121', name: adsets[2][2], campaign_id: a.ad_account_id + '-102' });
+    out.adsets.push({ id: a.ad_account_id + '-122', name: adsets[3][2], campaign_id: a.ad_account_id + '-102' });
+    const adList = [
+      { id: a.ad_account_id + '-3001', adset_id: a.ad_account_id + '-111', name: ads[0][2], status: 'ACTIVE', creative_img: 'img1' },
+      { id: a.ad_account_id + '-3002', adset_id: a.ad_account_id + '-111', name: ads[1][2], status: 'ACTIVE', creative_img: 'img2' },
+      { id: a.ad_account_id + '-3003', adset_id: a.ad_account_id + '-112', name: ads[2][2], status: 'ACTIVE', creative_img: 'img3' },
+      { id: a.ad_account_id + '-4001', adset_id: a.ad_account_id + '-121', name: ads[3][2], status: 'ACTIVE', creative_img: 'img4' },
+      { id: a.ad_account_id + '-4002', adset_id: a.ad_account_id + '-122', name: ads[4][2], status: 'PAUSED', creative_img: 'img5' },
+    ];
+    for (const ad of adList) out.ads.push({ ...ad, status: ad.status });
+    for (const d of uniq) {
+      const sp = d === uniq[uniq.length - 1] ? rng(2000, 9000) : rng(4000, 22000);
+      for (const ad of adList) {
+        const share = [0.32, 0.28, 0.2, 0.13, 0.07][adList.indexOf(ad)];
+        out.spend.push({
+          ad_id: ad.id, date: d, ad_account_id: a.ad_account_id,
+          spend: Math.round(sp * share),
+          impressions: Math.round(rng(3000, 14000) * share * 100) / 100,
+          reach: Math.round(rng(2000, 9000) * share * 100) / 100,
+          clicks: rng(40, 300),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+module.exports = {
+  normPhone, normEmail, sha256, capiHashedPhone, capiHashedEmail,
+  buildCapiEvent, buildCapiPayload, maskPhone,
+  DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
+  attributeSale, adClicksInWindow, isWithinRange,
+  funnelReport, adPerformance, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary,
+  allowedClients,
+  esc, fmtINR, fmtN, fmtPct, fmtDT, layout, NAV, navFor, mockMetaPull,
+};
