@@ -2,7 +2,52 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
-## 2026-10-30
+## 2026-10-30 (Phase S)
+
+### Phase S — Security checklist (PRD §10)
+- **S.1 Client isolation at the data layer** — `test/isolation.js` proof: (a) canary
+  leads/revenue/ads in two clients, rendered through every screen + every report
+  function as client-2's user; no client-1 marker leaks anywhere; `?client=` filters
+  cannot widen a client login's scope; cross-client lead routes are refused.
+  (b) query-dump: wraps the tx API, captures every data-table statement in the
+  scoped reports, asserts lead-table reads carry a client filter, no unscoped
+  top-level aggregation, and no FK child lookup touches a foreign client's key.
+- **S.2 Secrets encrypted at rest (AES-256-GCM)** — new `server/lib/security.js`
+  (`encryptSecret`/`decryptSecret`, master key from `XACQORA_SECRET_KEY`; the
+  no-env-key dev fallback is flagged insecure). Meta tokens, webhook endpoint
+  secrets and TOTP secrets are now stored encrypted; decrypt-at-read is wired
+  in `server/lib/meta.js` (pull + CAPI) and `server/index.js` (ingest secret
+  check + live gateway signature verify). Seed writes encrypted blobs.
+- **S.3 2FA for team logins (TOTP, RFC 6238)** — `user.totp_secret`/`totp_enabled`
+  + a short-lived `tfa_pending` row. Sign-in for a 2FA-enabled account (or a
+  team account when `settings.two_factor_enforced=1`) redirects to `/2fa/verify`;
+  a correct 6-digit code (±1 step drift, timing-safe, 5-strike lockout) issues
+  the session; wrong codes are rejected and audited. Admin screen: enroll /
+  disable with an on-screen authenticator-app secret (never in the URL).
+- **S.4 Masking + export audit** — `maskEmail`/`roleSeesFullContacts` in
+  `shared.js`; phone AND email are masked in every role-conditional view
+  (leads, lead timeline, pipeline, portal) for roles without full-contact
+  access. New `GET /export/leads` and `GET /export/ report` (CSV, client- and
+  role-scoped, phone/email masked for the caller's role) — every export writes
+  an `audit_log` row (`export.csv`).
+- **S.5 Backups + restore drill** — `scripts/backup.js` (WAL-safe `VACUUM INTO`
+  snapshot into `backups/`, keep-7 retention), `server/lib/backup.js` invoked
+  once per IST calendar day by the ticker; `scripts/restore-drill.sh` restores
+  the newest snapshot into a fresh temp dir and asserts every table opens and
+  its counts are sane (exit non-zero on failure).
+- **S.6 Ingest rate limits (per-IP + per-endpoint)** — `security.js rateLimit()`
+  sliding-window limiter; the public ingest API now 429s a per-IP flood
+  (`XT_RATE_PER_MIN_IP`, default 600/min) and a per-endpoint window
+  (`XT_RATE_PER_MIN_ENDPOINT`, default 300/min), with `Retry-After`.
+- **Tests** — `test/security.js` (AES round-trip + tamper-fail, RFC 6238 TOTP
+  vectors + drift window, rate-limit buckets, client-access rules) and
+  `test/isolation.js` (S.1 proof). `test/sweep.sh` gains S.4/S.5/S.6/S.3 gates.
+- **Bug fixed** — `shared.js adPerformance` scoped path: `meta_adset` has no
+  `client_id` column, so ad scoping now goes through `meta_ad.ad_account_id →
+  meta_ad_account.client_id`; the unscoped all-ads spend fallback no longer
+  runs when a client scope is active (spend could otherwise leak across clients).
+
+## 2026-10-30 (Phase L)
 
 ### Phase L (close): gateway signature specs VERIFIED + 2 real bugs fixed
 - Verified Razorpay + Cashfree signature specs against **official SDK source**

@@ -18,10 +18,18 @@ owner@, arpit@ (media_buyer), rep@ (sales_rep), client@ (client, read-only,
 client 1 only).
 
 **How to test** — `bash test/sweep.sh` asserts: team screens 403 for the client
-role, zero full phone digits visible to the client role, client-1 sees no
-client-2 data on leads/reports/dashboard.
+role, zero full phone/email visible to the client role, client-1 sees no
+client-2 data, CSV exports are masked + audit-logged, ingest returns 429 on
+flood, backup/restore-drill passes, and the 2FA enroll→OTP→session flow works.
+`node test/isolation.js` is the DB-layer isolation proof (S.1); `node
+test/security.js` covers the AES-GCM / TOTP / rate-limit primitives.
 
-**Open (Phase S)** — client isolation is currently enforced at the app layer
-(`WHERE client_id IN (...)` scoping in `screens.js` / `shared.js`); move it to
-database row-level security in Postgres. Secret storage, 2FA, and backup/restore
-drill are still PRD Section 10 items, not wired yet.
+**Phase S (done)** — client isolation enforced at the app data layer
+(`WHERE client_id IN (...)` scoping in `screens.js` / `shared.js`, proven by
+`test/isolation.js`); move to Postgres row-level security in Phase P.
+Secrets at rest: AES-256-GCM via `server/lib/security.js` (master key from
+`XACQORA_SECRET_KEY`; the no-key dev fallback is flagged insecure). 2FA: TOTP
+on team logins (enroll/disable from the Admin screen, `two_factor_enforced`
+setting to mandate it org-wide). Exports: role-masked CSV + audit log.
+Backups: daily `VACUUM INTO` snapshot (keep-7) + monthly restore drill.
+Rate limits: per-IP + per-endpoint sliding windows on the public ingest API.

@@ -4,10 +4,14 @@
 const { open, makeTx } = require('../server/db');
 const { hashPassword, createSession } = require('../server/lib/auth');
 const { DEFAULT_STAGES } = require('../server/lib/shared');
+const sec = require('../server/lib/security');
 const path = require('node:path');
 
 const dbHandle = open();
 const tx = makeTx(dbHandle);
+// S.2: all secrets are encrypted at rest. The demo uses the shared dev master
+// key (flagged insecure); production sets XACQORA_SECRET_KEY.
+const enc = (v) => sec.encryptSecret(v);
 
 function seedAll() {
   const now = new Date().toISOString();
@@ -32,12 +36,13 @@ function seedAll() {
     }
   }
 
-  // meta ad accounts
+  // meta ad accounts (token stored ENCRYPTED; 'MOCK' sentinel stays plain so
+  // the mock path still triggers — meta.js treats a non-MOCK value as live)
   if (!tx.get(`SELECT id FROM meta_ad_account WHERE id=1`)) {
     tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, token, pixel_id, status, last_pull_at) VALUES
-      (1,1,'Coach Ravi — main','ACT-100001','MOCK','PIXEL-1001','connected',?)`, now);
+      (1,1,'Coach Ravi — main','ACT-100001',?,'PIXEL-1001','connected',?)`, enc('MOCK'), now);
     tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, token, pixel_id, status, last_pull_at) VALUES
-      (2,2,'Kaya — workshop','ACT-100002','MOCK','PIXEL-1002','connected',?)`, now);
+      (2,2,'Kaya — workshop','ACT-100002',?,'PIXEL-1002','connected',?)`, enc('MOCK'), now);
   }
 
   // fx rate
@@ -66,12 +71,12 @@ function seedAll() {
       (1, 1, 'PIXEL-1001', ?)`, JSON.stringify(['CompleteRegistration', 'Attended', 'Schedule', 'Purchase']));
   }
 
-  // webhook endpoints
+  // webhook endpoints (secret stored ENCRYPTED; index.js decrypts on read)
   const platforms = ['meta_leadgen', 'razorpay', 'aevent', 'calendly', 'whatsapp'];
   for (const p of platforms) {
     if (!tx.get(`SELECT id FROM webhook_endpoint WHERE platform=? AND client_id=1`, p)) {
       tx.run(`INSERT INTO webhook_endpoint (client_id, platform, url, secret) VALUES (1, ?, ?, ?)`,
-        p, 'https://xacqora.local/api/ingest/' + p, 'sec-' + p);
+        p, 'https://xacqora.local/api/ingest/' + p, enc('sec-' + p));
     }
   }
 

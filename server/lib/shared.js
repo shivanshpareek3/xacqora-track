@@ -55,6 +55,38 @@ function maskPhone(p) {
   if (!n) return p ? String(p) : '';
   return '+91 ••••• ' + n.slice(-4);
 }
+function maskEmail(e) {
+  if (!e) return '';
+  const x = String(e).toLowerCase();
+  const [name, domain] = x.split('@');
+  if (!domain) return x.slice(0, 1) + '•••';
+  const keep = name ? name.slice(0, 2) : '?';
+  return keep + '•••@' + domain;
+}
+// roles that may see unmasked contact data
+function roleSeesFullContacts(role) {
+  return ['owner', 'admin', 'sales_rep'].includes(role);
+}
+// build a CSV string from an array of row objects; value is masked per user role
+function toCsv(rows, { role, mask = [] } = {}) {
+  if (!rows.length) return 'no rows';
+  const keys = Object.keys(rows[0]);
+  const head = keys.join(',');
+  const cell = (v) => {
+    const s = String(v == null ? '' : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const lines = rows.map((r) =>
+    keys.map((k) => {
+      let v = r[k];
+      const m = (mask || [])[k];
+      if (m === 'phone') v = roleSeesFullContacts(role) ? v : maskPhone(v);
+      else if (m === 'email') v = roleSeesFullContacts(role) ? v : maskEmail(v);
+      return cell(v);
+    }).join(',')
+  );
+  return [head, ...lines].join('\n');
+}
 
 // ---------------------------------------------------------------- stages
 const DEFAULT_STAGES = ['New', 'Registered', 'Attended', 'Hot', 'Call Booked', 'Paid', 'Lost'];
@@ -198,13 +230,15 @@ function adPerformance(tx, settings, clientIds) {
   const model = settings.attribution_model || 'last_paid_click';
   const win = Number(settings.attribution_window_days) || 30;
   const inClause = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
-  const accWhere = inClause ? `WHERE a.client_id IN (${inClause})` : '';
+  const accIn = inClause ? `(SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inClause}))` : null;
   const salesWhere = inClause ? `WHERE l.client_id IN (${inClause})` : '';
+  // scoped query filters meta_ad by its ad_account_id (only that account's
+  // client); adset has no client_id column so we scope through the account
   const ads = inClause
     ? tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
        COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
-       JOIN meta_adset a ON a.id=ad.adset_id ${accWhere}
-       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)`)
+       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)
+       WHERE ad.ad_account_id IN ${accIn}`)
     : tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
        COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
        LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)`);
@@ -213,9 +247,13 @@ function adPerformance(tx, settings, clientIds) {
     : tx.all(`SELECT ad_account_id, name FROM meta_ad_account`);
   const accById = {}; for (const a of adAccounts) accById[a.ad_account_id] = a.name;
   const adIdList = ads.map((a) => a.id).map((x) => `'${String(x).replace(/'/g, '')}'`).join(',');
-  const spends = (adIdList && inClause)
-    ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk
-        FROM spend_daily s WHERE s.ad_id IN (${adIdList}) GROUP BY s.ad_id`)
+  // when scoped, the unscoped all-ads fallback must NEVER run (even if the
+  // client has zero ads) — otherwise another client's spend would leak in
+  const spends = inClause
+    ? (adIdList
+      ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk
+          FROM spend_daily s WHERE s.ad_id IN (${adIdList}) GROUP BY s.ad_id`)
+      : [])
     : tx.all(`SELECT ad_id, SUM(spend_inr) spend, SUM(impressions) imp, SUM(clicks) clk FROM spend_daily GROUP BY ad_id`);
   const spendByAd = {}; for (const s of spends) spendByAd[s.ad_id] = s;
 
@@ -275,7 +313,8 @@ function adPerformance(tx, settings, clientIds) {
   tot.roas = tot.spend ? Math.round((tot.revenue / tot.spend) * 100) / 100 : null;
   tot.profit = tot.revenue - tot.spend;
   tot.cpl = tot.leads ? Math.round(tot.spend / tot.leads) : null;
-  const paidLeads = tx.get(`SELECT COUNT(*) c FROM lead l WHERE EXISTS (SELECT 1 FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) ${salesWhereL}`)?.c;
+  const plClient = inClause ? ` AND l.client_id IN (${inClause})` : '';
+  const paidLeads = tx.get(`SELECT COUNT(*) c FROM lead l WHERE EXISTS (SELECT 1 FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL)${plClient}`)?.c;
   tot.cpo = paidLeads ? Math.round(tot.spend / paidLeads) : null;
   return { rows: out, total: tot, model, window_days: win };
 }
@@ -527,7 +566,7 @@ function mockMetaPull(adAccounts) {
 
 module.exports = {
   normPhone, normEmail, sha256, capiHashedPhone, capiHashedEmail,
-  buildCapiEvent, buildCapiPayload, maskPhone,
+  buildCapiEvent, buildCapiPayload, maskPhone, maskEmail, roleSeesFullContacts, toCsv,
   DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
   attributeSale, adClicksInWindow, isWithinRange,
   funnelReport, adPerformance, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary,

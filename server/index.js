@@ -1,5 +1,6 @@
 // Xacqora Track demo server: zero-dependency Node 24 (node:sqlite built in).
 const http = require('node:http');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { open, makeTx } = require('./db');
@@ -10,6 +11,7 @@ const { enqueue, tick } = require('./lib/queue');
 const { ensureCapiLogTable, runMetaPull, pushCapiEvent } = require('./lib/meta');
 const { addEvent, ensureFunnel, getFunnelStages } = require('./lib/events');
 const { recordTouchpoint, getOrCreateLead, findLead, attachVisitorTouchpoints } = require('./lib/identity');
+const sec = require('./lib/security');
 const screens = require('./screens');
 
 const db = open();
@@ -17,6 +19,10 @@ ensureCapiLogTable(db);
 
 const PORT = Number(process.env.PORT || 4100);
 const TX = makeTx(db);
+
+// Phase S: unauthenticated "pending 2FA login" markers (short-lived, rate
+// limited, never grant access by themselves).
+const PENDING = new Map();
 
 // ---------------------------------------------------------------- helpers
 function parseBody(req) {
@@ -41,8 +47,25 @@ function json(res, obj, code = 200) {
   res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj, null, 2));
 }
+function json429(res, msg) {
+  // rate-limit response: one writeHead that carries both the status and the
+  // Retry-After hint, then the JSON body
+  res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+  res.end(JSON.stringify({ ok: false, error: msg }, null, 2));
+}
 function setCookie(res, token) {
   res.setHeader('Set-Cookie', `xt_session=${token}; Path=/; HttpOnly; Max-Age=${30 * 86400}; SameSite=Lax`);
+}
+// short-lived, unauthenticated marker so the /2fa/verify page knows who is
+// mid-login. Never grants access on its own — the session is only created
+// after the OTP check passes.
+function setPending(res, userId) {
+  const p = crypto.randomBytes(16).toString('hex');
+  PENDING.set(p, { at: Date.now(), n: 0, userId });
+  // sweep stale markers (>10 min) so the map cannot grow unbounded
+  for (const [k, v] of PENDING) if (Date.now() - v.at > 600000) PENDING.delete(k);
+  res.setHeader('Set-Cookie', `xt_tfa=${p}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax`);
+  return p;
 }
 
 // ---------------------------------------------------------------- auth
@@ -76,27 +99,43 @@ async function handleIngest(platform, kind, res, bodyJson, raw, req, clientHint)
   const client = tx.get(`SELECT * FROM client WHERE id=?`, client_id);
   if (!client) client_id = 1;
 
-  // secret verification: the endpoint's shared secret must be in the query
+  // secret verification: the endpoint's shared secret must be in the query.
+  // S.2: stored encrypted; decrypt before comparing / passing to the live
+  // gateway signature verifier.
   const secret = (req.url.split('?')[1] || '').match(/secret=([^&]+)/)?.[1];
   const ep = tx.get(`SELECT * FROM webhook_endpoint WHERE platform=? AND client_id=?`, platform, client_id);
-  if (ep && ep.secret && secret !== ep.secret && platform !== 'touchpoint' && platform !== 'form' && platform !== 'xt') {
+  const epSecret = ep ? sec.decryptSecret(ep.secret || '') : '';
+  if (ep && epSecret && secret !== epSecret && platform !== 'touchpoint' && platform !== 'form' && platform !== 'xt') {
     json(res, { ok: false, error: 'bad secret' }, 401);
     logIngest(tx, platform, client_id, 'failed', 'secret mismatch', raw, null, false);
     return;
   }
   // Phase L: in live mode, gateways must present a valid signature before processing
   const live = require('./lib/liveapi');
-  if (live.liveMode() && ep && ep.secret && !['touchpoint', 'form', 'xt'].includes(platform)) {
-    const sig = live.verifyInboundSignature(platform, raw, req.headers, ep.secret);
+  if (live.liveMode() && ep && epSecret && !['touchpoint', 'form', 'xt'].includes(platform)) {
+    const sig = live.verifyInboundSignature(platform, raw, req.headers, epSecret);
     if (!sig.ok) {
       json(res, { ok: false, error: 'bad signature: ' + sig.reason }, 401);
       logIngest(tx, platform, client_id, 'failed', 'signature: ' + sig.reason, raw, null, false);
       return;
     }
   }
-  // rate limit: max 50 / min per client (per platform)
-  const rl = tx.get(`SELECT COUNT(*) c FROM webhook_log WHERE client_id=? AND platform=? AND ingested_at > datetime('now','-60 seconds')`, client_id, platform);
-  if (rl && rl.c > 200 && !ep) { json(res, { ok: false, error: 'rate limited' }, 429); return; }
+  // Phase S: two-tier rate limit — per-endpoint (configured, generous) and
+  // per-IP (global flood guard). A bad actor cannot flood a single endpoint.
+  const ip = req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim()
+    : (req.socket && req.socket.remoteAddress) || 'unknown';
+  const perIp = sec.rateLimit(`ip:${ip}`, Number(process.env.XT_RATE_PER_MIN_IP) || 600, Date.now());
+  if (perIp.limited) {
+    json429(res, 'rate limited (per-IP)');
+    if (ep) logIngest(tx, platform, client_id, 'rate_limited', 'per-IP flood guard', raw, null, false);
+    return;
+  }
+  const perEnd = sec.rateLimit(`ep:${platform}:${client_id}`, Number(process.env.XT_RATE_PER_MIN_ENDPOINT) || 300, Date.now());
+  if (perEnd.limited) {
+    json429(res, 'rate limited (per-endpoint)');
+    logIngest(tx, platform, client_id, 'rate_limited', 'per-endpoint window', raw, null, false);
+    return;
+  }
 
   const map = epMap(tx, client_id, platform);
   const test = kind === 'test' || bodyJson?.__test === true;
@@ -208,6 +247,27 @@ const server = http.createServer(async (req, res) => {
           send(res, 401, S.layout({ title: 'Sign in', nav: [], active: '', user: { name: '', role: '' }, body: '<div class="card"><h1>Sign in</h1><div class="note warn">Wrong email or password.</div></div>' }));
           return;
         }
+        // Phase S: if the account (or the global enforcement flag) requires 2FA,
+        // hold the login in tfa_pending and demand the OTP before issuing a session.
+        // totp_secret is stored ENCRYPTED (S.2); the pending row copies the blob.
+        const sec = require('./lib/security');
+        const plainSecret = sec.decryptSecret(row.totp_secret || '');
+        const force = db.prepare(`SELECT value FROM settings WHERE key='two_factor_enforced'`).get()?.value === '1';
+        const wantsTotp = row.totp_enabled && plainSecret;
+        if (wantsTotp || (force && sec.isTeam(row))) {
+          if (!plainSecret) {
+            // forced but not enrolled: block the team login, point at enrollment
+            send(res, 403, S.layout({ title: '2FA required', nav: [], active: '', user: { name: row.name, role: row.role }, body: '<div class="card"><h1>Two-factor login required</h1><div class="note warn">This account must enroll in 2FA (Admin → Users → 2FA) before signing in.</div></div>' }));
+            audit(db, row, 'auth.2fa_blocked', 'user', String(row.id));
+            return;
+          }
+          db.prepare(`DELETE FROM tfa_pending WHERE user_id=?`).run(row.id);
+          db.prepare(`INSERT OR REPLACE INTO tfa_pending (user_id, totp_secret) VALUES (?,?)`).run(row.id, row.totp_secret);
+          setPending(res, row.id);
+          res.writeHead(302, { Location: '/2fa/verify' });
+          res.end();
+          return;
+        }
         const token = createSession(db, row);
         setCookie(res, token);
         res.writeHead(302, { Location: '/' });
@@ -236,6 +296,53 @@ const server = http.createServer(async (req, res) => {
       }
       res.setHeader('Set-Cookie', 'xt_session=; Path=/; Max-Age=0');
       res.writeHead(302, { Location: '/signin' }); res.end(); return;
+    }
+
+    // ---------- Phase S: two-factor verify (unauthenticated, OTP-gated) ----------
+    if (u.pathname === '/2fa/verify') {
+      const p = (req.headers.cookie || '').match(/xt_tfa=([a-f0-9]+)/)?.[1];
+      const pend = p ? PENDING.get(p) : null;
+      // the pending marker names exactly which user is mid-login
+      const userRow = pend && pend.userId
+        ? db.prepare(`SELECT * FROM user WHERE id=?`).get(pend.userId)
+        : null;
+      if (!userRow) { res.writeHead(302, { Location: '/signin' }); res.end(); return; }
+      if (method === 'GET') {
+        send(res, 200, S.layout({
+          title: 'Two-factor code', nav: [], active: '', user: { name: userRow.email, role: 'auth' },
+          body: `<div class="card" style="max-width:360px;margin:60px auto"><h1>Two-factor code</h1>
+            <div class="note">Enter the 6-digit code from your authenticator app for <b>${S.esc(userRow.email)}</b>.</div>
+            <form method="post" action="/2fa/verify">
+              <input name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" style="width:100%;letter-spacing:4px;font-size:18px;text-align:center">
+              <div style="margin-top:10px"><button class="btn" style="width:100%">Verify</button></div>
+            </form>
+            <a href="/signin" class="small muted">Cancel and sign out</a></div>` }));
+        return;
+      }
+      // POST
+      const { json } = await parseBody(req);
+      const code = String(json.code || '').trim();
+      const tsec = require('./lib/security');
+      // S.2: totp_secret is encrypted at rest; decrypt for verification only
+      const ok = tsec.decryptSecret(userRow.totp_secret || '') &&
+        tsec.totpVerify(tsec.decryptSecret(userRow.totp_secret || ''), code, 1);
+      // lockout: 5 bad attempts in a row wipes the pending row
+      if (!ok) {
+        pend.n = (pend.n || 0) + 1;
+        if (pend.n >= 5) { db.prepare(`DELETE FROM tfa_pending WHERE user_id=?`).run(userRow.id); PENDING.delete(p); }
+        audit(db, userRow, 'auth.2fa_fail', 'user', String(userRow.id));
+        send(res, 401, S.layout({ title: 'Two-factor code', nav: [], active: '', user: { name: '', role: '' }, body: '<div class="card"><h1>Sign in</h1><div class="note warn">Code not accepted.' + (pend.n >= 5 ? ' Pending login cleared after repeated failures.' : '') + '</div></div>' }));
+        return;
+      }
+      db.prepare(`DELETE FROM tfa_pending WHERE user_id=?`).run(userRow.id);
+      PENDING.delete(p);
+      res.setHeader('Set-Cookie', 'xt_tfa=; Path=/; Max-Age=0');
+      audit(db, userRow, 'auth.2fa_ok', 'user', String(userRow.id));
+      const token = createSession(db, userRow);
+      setCookie(res, token);
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
     }
 
     // ---------- protected UI ----------
@@ -293,12 +400,14 @@ const server = http.createServer(async (req, res) => {
         case 'duplicates.html':
           return guard(screens.duplicates(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin']);
         case 'admin.html':
-          return guard(screens.admin(db, user, {}), ['owner', 'admin']);
+          return guard(screens.admin(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin']);
         case 'portal-leads.html':
         case 'portal-reports.html':
           return guard(screens.portal(db, user, {}));
         case 'import':
           return importPage(res, user);
+        case 'export':
+          return exportRoute(res, user, parts, u);
         default:
           send(res, 404, S.layout({ title: '404', nav: S.navFor(user), active: '', user, body: '<div class="card"><h1>Not found</h1></div>' }));
       }
@@ -336,6 +445,31 @@ const server = http.createServer(async (req, res) => {
         }
         audit(db, user, 'settings.update', 'settings');
         res.writeHead(302, { Location: '/admin.html' }); res.end(); return;
+      }
+      // Phase S: 2FA enrollment for the logged-in user
+      if (u.pathname === '/admin/2fa') {
+        if (!['owner', 'admin'].includes(user.role)) { send(res, 403, 'forbidden'); return; }
+        const { json } = await parseBody(req);
+        const sec = require('./lib/security');
+        const me = db.prepare(`SELECT * FROM user WHERE id=?`).get(user.id);
+        if (json.action === 'enroll') {
+          // generate + store an ENCRYPTED totp secret, enable 2FA
+          const secretPlain = sec.totpSecret();
+          db.prepare(`UPDATE user SET totp_secret=?, totp_enabled=1 WHERE id=?`)
+            .run(sec.encryptSecret(secretPlain), me.id);
+          audit(db, user, 'auth.2fa_enroll', 'user', String(me.id));
+          // redirect to a setup card that reveals the secret on-screen (not via URL)
+          res.writeHead(302, { Location: '/admin.html?2fa=setup' });
+          res.end();
+          return;
+        }
+        if (json.action === 'disable') {
+          db.prepare(`UPDATE user SET totp_enabled=0 WHERE id=?`).run(me.id);
+          audit(db, user, 'auth.2fa_disable', 'user', String(me.id));
+        }
+        res.writeHead(302, { Location: '/admin.html' });
+        res.end();
+        return;
       }
       if (u.pathname === '/admin/prune') {
         const { json } = await parseBody(req);
@@ -405,6 +539,61 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------- S.4: CSV exports
+// Every export is role-masked (phone/email for roles without full contact
+// access) and written to the audit log — "exports logged in the audit log".
+function exportRoute(res, user, parts, u) {
+  const kind = parts[1] || '';
+  const tx = makeTx(db);
+  let csv = '', label = '';
+  if (kind === 'leads') {
+    const scope = user.role === 'client'
+      ? Number((user.client_ids || '').split(',')[0] || 0)
+      : Number(u.searchParams.get('client') || 0);
+    const where = scope ? `WHERE l.client_id=?` : '';
+    const args = scope ? [scope] : [];
+    const q = (u.searchParams.get('q') || '').trim();
+    if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
+    const stage = u.searchParams.get('stage');
+    if (stage) { where += ` AND l.stage=?`; args.push(stage); }
+    const rows = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.city, l.stage, l.owner, l.client_id, c.name client,
+      (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid
+      FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 5000`, ...args);
+    csv = S.toCsv(rows.map((r) => ({
+      id: r.id, name: r.name, phone: r.phone, email: r.email, city: r.city,
+      stage: r.stage, owner: r.owner, client: r.client, paid: r.paid,
+    })), { role: user.role, mask: { phone: 'phone', email: 'email' } });
+    label = `leads (${rows.length} rows)`;
+  } else if (kind === 'report') {
+    // ad performance export — same scoping + attribution model as the Reports screen
+    const scope = user.role === 'client'
+      ? (user.client_ids || '').split(',').filter(Boolean)
+      : (u.searchParams.get('client') ? [u.searchParams.get('client')] : null);
+    const settings = {
+      attribution_model: u.searchParams.get('model') || 'last_paid_click',
+      attribution_window_days: u.searchParams.get('window') || '30',
+      wasted_spend_threshold: '0',
+    };
+    const ap = S.adPerformance(tx, settings, scope);
+    csv = S.toCsv(ap.rows.map((r) => ({
+      ad_id: r.ad_id, ad: r.name, campaign: r.campaign, account: r.account, status: r.status,
+      spend: r.spend, impressions: r.impressions, clicks: r.clicks,
+      cpm: r.cpm, leads: r.leads, revenue: r.revenue, roas: r.roas, profit: r.profit,
+      wasted: r.wasted ? 'yes' : 'no', model: r.model,
+    })), { role: user.role });
+    label = `report/ad-performance (${ap.rows.length} rows, ${settings.attribution_model})`;
+  } else {
+    send(res, 404, S.layout({ title: '404', nav: S.navFor(user), active: '', user, body: '<div class="card"><h1>Unknown export</h1></div>' }));
+    return;
+  }
+  audit(db, user, 'export.csv', kind, label);
+  res.writeHead(200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="xacqora-${kind}-${new Date().toISOString().slice(0, 10)}.csv"`,
+  });
+  res.end(csv);
+}
+
 // parse a simple comma-separated CSV (no quotes in the demo layout)
 function parseCsvText(text) {
   const lines = String(text || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -448,9 +637,22 @@ setInterval(async () => {
     const due = tx.all(`SELECT * FROM meta_ad_account WHERE auto_pull=1 AND status='connected'
       AND (last_pull_at IS NULL OR last_pull_at < datetime('now', '-3 hours'))`);
     for (const a of due) enqueue(db, 'meta_pull', { ad_account_id: a.ad_account_id });
-    // weekly summary: Monday 9am IST (Asia/Kolkata is +5:30; 03:30 UTC)
+    // daily backup: once per IST calendar day (PRD §10: daily DB backup)
     const now = new Date();
     const ist = new Date(now.getTime() + 5.5 * 3600000);
+    const istDay = ist.toISOString().slice(0, 10);
+    const lastBackup = tx.get(`SELECT value FROM settings WHERE key='last_backup_date'`)?.value;
+    if (lastBackup !== istDay && ist.getUTCHours() >= 0) {
+      try {
+        const { runBackup } = require('./lib/backup');
+        const file = runBackup(db);
+        tx.run(`INSERT INTO settings (key, value) VALUES ('last_backup_date',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, istDay);
+        audit(db, null, 'backup.daily', 'backup', file);
+      } catch (e) {
+        console.error('[backup]', e.message);
+      }
+    }
+    // weekly summary: Monday 9am IST (Asia/Kolkata is +5:30; 03:30 UTC)
     if (ist.getDay() === 1 && ist.getUTCHours() === 3 && now.getUTCMinutes() < 60) {
       // generate + store the weekly summary
       const settings = {

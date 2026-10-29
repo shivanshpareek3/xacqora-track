@@ -68,8 +68,15 @@ Sign in, Meta spend, Weekly summary.
 ```bash
 npm test        # replays each sample payload through the live ingest API on a throwaway DB
 npm run tracker # demo landing page target
-bash test/sweep.sh   # all 14 screens + client isolation + masking + xt.js size gate
-node test/xt-queue.js # xt.js survives the API being down (nothing lost)
+bash test/sweep.sh     # all 14 screens + isolation + masking + 2FA + export + rate-limit + backup gates
+node test/security.js  # AES-GCM secrets, RFC 6238 TOTP vectors, rate limit, client-access rules
+node test/isolation.js # DB-layer client-isolation proof: canary renders + query-dump audit
+node test/xt-queue.js  # xt.js survives the API being down (nothing lost)
+node test/liveapi.js   # Razorpay/Cashfree gateway signatures (verified spec)
+
+# backups (Phase S / PRD §10)
+node scripts/backup.js      # WAL-safe VACUUM INTO snapshot -> backups/ (keep 7)
+bash scripts/restore-drill.sh  # restore newest snapshot to a fresh dir, assert table counts
 ```
 
 `test-samples/*.json` are saved sample payloads (fake data — never real client data).

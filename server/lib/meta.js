@@ -5,10 +5,15 @@
 const { makeTx } = require('../db');
 const { mockMetaPull, capiHashedPhone, capiHashedEmail, buildCapiPayload, sha256 } = require('./shared');
 const live = require('./liveapi');
+const sec = require('./security');
 
 function getFxRate(tx, date, currency) {
   const r = tx.get(`SELECT inr_per_unit FROM fx_rate WHERE date=? AND currency=?`, date, currency);
   return r ? r.inr_per_unit : 1;
+}
+// S.2: meta tokens are encrypted at rest; decrypt for use only.
+function plainToken(stored) {
+  return sec.decryptSecret(stored || '');
 }
 
 // Run a Meta pull for one ad account. In production this calls
@@ -18,7 +23,8 @@ async function runMetaPull(tx, payload) {
   const acc = tx.get(`SELECT * FROM meta_ad_account WHERE ad_account_id=?`, ad_account_id);
   if (!acc) return;
   const now = new Date().toISOString();
-  const useMock = !live.liveMode() || !acc.token || acc.token === 'MOCK';
+  const token = plainToken(acc.token);
+  const useMock = !live.liveMode() || !token || token === 'MOCK';
 
   if (useMock) {
     const data = mockMetaPull([{ ad_account_id, name: acc.name }]);
@@ -32,7 +38,7 @@ async function runMetaPull(tx, payload) {
   try {
     const to = new Date(now);
     const from = new Date(Date.now() - 6 * 86400000);
-    const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token: acc.token });
+    const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token });
     upsertEntities(tx, ad_account_id, data);
     upsertSpend(tx, ad_account_id, data.spend);
     tx.run(`UPDATE meta_ad_account SET last_pull_at=?, last_error=NULL WHERE ad_account_id=?`, now, ad_account_id);
@@ -99,7 +105,8 @@ async function pushCapiEvent(tx, payload) {
   });
   const accRow = tx.get(`SELECT * FROM meta_ad_account WHERE client_id=? AND status='connected' ORDER BY id LIMIT 1`, client_id);
   const pixelId = accRow ? (tx.get(`SELECT pixel_id FROM meta_ad_account WHERE ad_account_id=?`, accRow.ad_account_id)?.pixel_id) : 'PIXEL-1';
-  const dryRunFinal = dryRun || !live.liveMode() || !accRow || !accRow.token || accRow.token === 'MOCK';
+  const capiToken = accRow ? plainToken(accRow.token) : '';
+  const dryRunFinal = dryRun || !live.liveMode() || !capiToken || capiToken === 'MOCK';
   const log = {
     event_row_id: ev.id, event_name: eventName, pixel_id: pixelId,
     dry_run: dryRunFinal, payload: JSON.stringify(payloadObj),
@@ -114,7 +121,7 @@ async function pushCapiEvent(tx, payload) {
   // live CAPI POST (real token required); PRD rules already enforced above:
   // never sent twice (event_id), Purchase suppressed for refunded payments.
   try {
-    const resp = await live.runLiveCapi({ pixelId, accessToken: accRow.token, payload: payloadObj });
+    const resp = await live.runLiveCapi({ pixelId, accessToken: capiToken, payload: payloadObj });
     // record Meta's real match quality when it returns one
     const mq = resp && resp.events_received && resp.events_received[0] ? resp.events_received[0].event_time : null;
     if (mq) tx.run(`UPDATE capi_log SET match_quality=? WHERE event_row_id=?`, mq, ev.id);

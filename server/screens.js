@@ -7,11 +7,16 @@ const H = {
 };
 
 function userHasPhone(u) {
-  return ['owner', 'admin', 'sales_rep'].includes(u.role);
+  return S.roleSeesFullContacts(u.role);
 }
 function phoneOf(u, lead) {
   if (!lead) return '';
   return userHasPhone(u) ? (lead.phone || '') : S.maskPhone(lead.phone);
+}
+// S.4: emails are masked for every role that does not see full contacts
+function emailOf(u, lead) {
+  if (!lead || !lead.email) return '—';
+  return userHasPhone(u) ? lead.email : S.maskEmail(lead.email);
 }
 
 // ---------------------------------------------------------------- Dashboard
@@ -27,10 +32,12 @@ function dashboard(db, user, p) {
   const fp = S.funnelReport(tx, null, settings, scopeIds);
   const ap = S.adPerformance(tx, settings, scopeIds);
   const mix = S.sourceMix(tx, scopeIds);
-  const leadWhere = scopeIds ? `WHERE l.client_id IN (${scopeIds.map((n) => Number(n)).join(',')})` : '';
-  const totalLeads = tx.get(`SELECT COUNT(*) c FROM lead ${leadWhere}`)?.c || 0;
+  const totalLeads = scopeIds
+    ? tx.get(`SELECT COUNT(*) c FROM lead WHERE client_id IN (${scopeIds.map((n) => Number(n)).join(',')})`)?.c || 0
+    : tx.get(`SELECT COUNT(*) c FROM lead`)?.c || 0;
+  const recentWhere = scopeIds ? `WHERE l.client_id IN (${scopeIds.map((n) => Number(n)).join(',')})` : '';
   const recent = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
-    FROM lead l LEFT JOIN client c ON c.id=l.client_id ${leadWhere} ORDER BY l.id DESC LIMIT 8`);
+    FROM lead l LEFT JOIN client c ON c.id=l.client_id ${recentWhere} ORDER BY l.id DESC LIMIT 8`);
 
   const funnelSteps = [
     { l: 'Leads', v: fp.leads, max: fp.leads || 1, c: 'b' },
@@ -112,7 +119,7 @@ function leads(db, user, p) {
     <td><a href="/lead/${r.id}">${S.esc(r.name || '—')} ${r.source_unknown ? '<span class="pill m">unknown source</span>' : ''}</a></td>
     <td class="small muted">${S.esc(r.client_name || '')}</td>
     <td class="small">${phoneOf(user, r)}</td>
-    <td class="small muted">${S.esc(r.email || '—')}</td>
+    <td class="small muted">${S.esc(emailOf(user, r))}</td>
     <td><span class="pill ${stagePillClass(r.stage)}">${S.esc(r.stage)}</span></td>
     <td class="small">${S.esc(r.owner || '—')}</td>
     <td class="small">${S.fmtINR(r.paid)}</td>
@@ -145,6 +152,10 @@ function leadTimeline(db, user, p) {
   const tx = makeTx(db);
   const lead = tx.get(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.id=?`, p.id);
   if (!lead) return notFound(user);
+  // PRD §10: row-level isolation at the route too. A client login may only
+  // view leads of its own client_ids; everyone else gets a not-found.
+  const sec = require('./lib/security');
+  if (!sec.canAccessClient(user, lead.client_id)) return notFound(user);
   const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, lead.id);
   const events = tx.all(`SELECT * FROM event WHERE lead_id=? ORDER BY ts DESC`, lead.id);
   const deals = tx.all(`SELECT * FROM deal WHERE lead_id=?`, lead.id);
@@ -191,7 +202,7 @@ function leadTimeline(db, user, p) {
     <div class="row" style="justify-content:space-between">
       <div>
         <h1 style="margin:0">${S.esc(lead.name || 'Unnamed lead')}</h1>
-        <div class="small muted">${S.esc(lead.client_name || '')} · ${phoneOf(user, lead)} · ${S.esc(lead.email || '—')} · ${S.esc(lead.city || '')}</div>
+        <div class="small muted">${S.esc(lead.client_name || '')} · ${phoneOf(user, lead)} · ${S.esc(emailOf(user, lead))} · ${S.esc(lead.city || '')}</div>
       </div>
       <div style="text-align:right">
         <span class="pill ${stagePillClass(lead.stage)}">${S.esc(lead.stage)}</span>
@@ -225,7 +236,10 @@ function leadTimeline(db, user, p) {
 // ---------------------------------------------------------------- Pipeline kanban
 function pipeline(db, user, p) {
   const tx = makeTx(db);
-  const client = p.client || '';
+  const sec = require('./lib/security');
+  // a client login is locked to its own clients; the ?client= filter cannot widen it
+  let client = p.client || '';
+  if (user.role === 'client') client = String((user.client_ids || '').split(',')[0] || '');
   const stages = S.DEFAULT_STAGES;
   const where = client ? `AND l.client_id=?` : '';
   const args = client ? [client] : [];
@@ -235,7 +249,9 @@ function pipeline(db, user, p) {
       <div class="small muted">${S.esc(r.client_name || '')} · ${phoneOf(user, r)}</div></div>`).join('');
     return `<div class="kcol"><h3>${s} <span class="badge">${rows.length}</span></h3>${cards || '<div class="muted small">empty</div>'}</div>`;
   }).join('');
-  const clients = tx.all(`SELECT id, name FROM client`);
+  const clients = user.role === 'client'
+    ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
+    : tx.all(`SELECT id, name FROM client`);
   const body = `
   <div class="card">
     <div class="row" style="justify-content:space-between">
@@ -463,10 +479,21 @@ function duplicates(db, user, p) {
 // ---------------------------------------------------------------- Admin
 function admin(db, user, p) {
   const tx = makeTx(db);
-  const users = tx.all(`SELECT id, email, name, role, client_ids FROM user`);
+  const sec = require('./lib/security');
+  // after enrolling, ?2fa=setup shows the current user's secret for the app
+  const setupCard = (p && p['2fa'] === 'setup' && user.totp_enabled) ? (() => {
+    const secret = sec.decryptSecret((tx.get(`SELECT totp_secret FROM user WHERE id=?`, user.id)?.totp_secret) || '');
+    return `<div class="card" style="border-color:var(--green)"><h2>Set up your authenticator</h2>
+      <div class="note">Scan this in Google Authenticator / 1Password, or enter the secret manually:</div>
+      <div class="log" style="max-height:60px">${S.esc(secret)}</div>
+      <div class="small muted" style="margin-top:6px">otpauth://totp/XacqoraTrack:${S.esc(user.email)}?secret=${S.esc(secret)} · Once set up, sign-in will ask for the 6-digit code.</div>
+    </div>`;
+  })() : '';
+  const users = tx.all(`SELECT id, email, name, role, client_ids, totp_enabled FROM user`);
   const audit = tx.all(`SELECT * FROM audit_log ORDER BY id DESC LIMIT 30`);
   const userRows = users.map((u) => `<tr><td>${S.esc(u.name)}</td><td class="small muted">${S.esc(u.email)}</td>
-    <td><span class="pill b">${S.esc(u.role)}</span></td><td class="small muted">${S.esc(u.client_ids || 'all')}</td></tr>`).join('');
+    <td><span class="pill b">${S.esc(u.role)}</span></td><td class="small muted">${S.esc(u.client_ids || 'all')}</td>
+    <td>${u.totp_enabled ? '<span class="pill g">2FA on</span>' : '<span class="pill m">2FA off</span>'}</td></tr>`).join('');
   const auditRows = audit.map((a) => `<tr><td class="small muted">${S.fmtDT(a.ts)}</td><td>${S.esc(a.user_email || 'system')}</td>
     <td><span class="pill m">${S.esc(a.action)}</span></td><td class="small muted">${S.esc(a.entity || '')} ${S.esc(a.entity_id || '')}</td></tr>`).join('');
   const settings = {
@@ -476,9 +503,10 @@ function admin(db, user, p) {
     capi: tx.get(`SELECT value FROM settings WHERE key='capi'`)?.value || 'dry',
   };
   const body = `
+  ${setupCard}
   <div class="grid g2">
     <div class="card"><h2>Users & roles <span class="badge">Owner · Admin · Media Buyer · Sales Rep · Viewer · Client</span></h2>
-      <div class="tabwrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Clients</th></tr></thead>
+      <div class="tabwrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Clients</th><th>2FA</th></tr></thead>
       <tbody>${userRows}</tbody></table></div></div>
     <div class="card"><h2>Settings</h2>
       <form class="inline" method="post" action="/admin/settings">
@@ -493,6 +521,15 @@ function admin(db, user, p) {
         <div><label>Delete a lead (privacy request)</label><input name="lead_id" placeholder="lead id" style="width:120px"></div>
         <button class="btn sec danger">Delete lead + stop CAPI</button>
       </form>
+      <div style="margin-top:14px" class="note">
+        <b>Two-factor login (TOTP)</b> for your account (owner@xacqora.local · ${user.name ? 'you' : ''}).
+        ${user.totp_enabled ? '2FA is <b>enabled</b>.' : '2FA is <b>off</b>.'}
+        <form class="inline" method="post" action="/admin/2fa" style="margin-top:8px">
+          <input type="hidden" name="action" value="${user.totp_enabled ? 'disable' : 'enroll'}">
+          <button class="btn sec sm">${user.totp_enabled ? 'Disable 2FA' : 'Enroll in 2FA'}</button>
+        </form>
+        ${user.totp_enabled ? '' : '<div class="small muted" style="margin-top:6px">Enrolling gives you an authenticator-app code; sign-in then requires the 6-digit code.</div>'}
+      </div>
     </div>
   </div>
   <div class="card"><h2>Audit log <span class="badge">who viewed / exported / changed what</span></h2>

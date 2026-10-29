@@ -15,6 +15,21 @@ function open() {
     id INTEGER PRIMARY KEY, event_row_id INTEGER NOT NULL, event_name TEXT, pixel_id TEXT,
     dry_run INTEGER DEFAULT 1, payload TEXT, event_id TEXT, match_quality INTEGER, sent_at TEXT
   )`);
+  // ----------------------------------------------------------------
+  // Idempotent migrations for databases created before Phase S.
+  // ADD COLUMN fails if the column exists; wrap in try so re-runs are no-ops.
+  const cols = (table) => db
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .map((r) => r.name);
+  const u = cols('user');
+  if (!u.includes('totp_secret')) db.exec(`ALTER TABLE user ADD COLUMN totp_secret TEXT`);
+  if (!u.includes('totp_enabled')) db.exec(`ALTER TABLE user ADD COLUMN totp_enabled INTEGER DEFAULT 0`);
+  db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
+    user_id INTEGER PRIMARY KEY REFERENCES user(id),
+    totp_secret TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`);
   return db;
 }
 

@@ -115,11 +115,19 @@ CREATE TABLE IF NOT EXISTS webhook_log (
 CREATE INDEX IF NOT EXISTS idx_whl_status ON webhook_log(status, ingested_at);
 CREATE TABLE IF NOT EXISTS user (
   id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT, password_hash TEXT,
-  role TEXT DEFAULT 'viewer', client_ids TEXT, created_at TEXT DEFAULT (datetime('now'))
+  role TEXT DEFAULT 'viewer', client_ids TEXT,
+  totp_secret TEXT, totp_enabled INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS session_token (
   token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES user(id),
   created_at TEXT DEFAULT (datetime('now')), expires_at TEXT
+);
+-- one-row-per-user pending two-factor login (password OK, waiting on the OTP)
+CREATE TABLE IF NOT EXISTS tfa_pending (
+  user_id INTEGER PRIMARY KEY REFERENCES user(id),
+  totp_secret TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY, user_email TEXT, action TEXT NOT NULL,
