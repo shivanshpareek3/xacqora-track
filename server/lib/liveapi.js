@@ -2,10 +2,12 @@
 // the app runs in mock/dry-run mode unless XACQORA_LIVE=1 is set.
 // MOCK=1 forces mock even if credentials exist (dev default).
 //
-// Real gateway webhook specs (Razorpay/Cashfree header names + exact HMAC)
-// must be confirmed in week 1 against the live docs before relying on them;
-// the algorithms below use the widely-documented defaults and are clearly
-// parameterised so a spec mismatch is a one-line change.
+// Gateway signature specs are VERIFIED against the official SDK source
+// (see docs/adapter-verification.md for the exact URLs + dates):
+//   Razorpay: X-Razorpay-Signature = HMAC-SHA256(rawBody, webhookSecret), hex
+//             source: razorpay/razorpay-node lib/utils/razorpay-utils.js
+//   Cashfree: X-Cf-Signature        = HMAC-SHA256(rawBody, clientSecret), hex
+//             source: cashfree/cashfree-sdk-nodejs lib/payouts/services/verifySignature.js
 const crypto = require('node:crypto');
 
 function liveMode() {
@@ -22,20 +24,21 @@ function verifyInboundSignature(platform, rawBody, headers, secret) {
   if (!secret) return { ok: true, reason: 'no secret configured; rely on endpoint secret' };
 
   switch (platform) {
-    // Razorpay: x-razorpay-signature = HMAC-SHA512(rawBody, webhookSecret), hex
+    // Razorpay (VERIFIED): X-Razorpay-Signature = HMAC-SHA256(rawBody, webhookSecret), hex.
+    // Source: razorpay-node validateWebhookSignature.
     case 'razorpay': {
       const provided = h['x-razorpay-signature'];
-      if (!provided) return { ok: false, reason: 'missing x-razorpay-signature' };
-      const expect = hmacSha512hex(raw, secret);
-      return { ok: timingSafeEqual(provided, expect), reason: 'razorpay HMAC-SHA512' };
+      if (!provided) return { ok: false, reason: 'missing X-Razorpay-Signature' };
+      const expect = hmacSha256hex(raw, secret);
+      return { ok: timingSafeEqual(provided, expect), reason: 'razorpay HMAC-SHA256 (verified)' };
     }
-    // Cashfree: x-cashfree-signature (HMAC-SHA512 over raw body, key = webhook secret)
-    // NOTE: confirm exact key (webhook secret vs client_id) + hex/base64 in week 1.
+    // Cashfree (VERIFIED): X-Cf-Signature = HMAC-SHA256(rawBody, clientSecret), hex.
+    // Source: cashfree-sdk-nodejs verifySignature.
     case 'cashfree': {
-      const provided = h['x-cashfree-signature'];
-      if (!provided) return { ok: false, reason: 'missing x-cashfree-signature' };
-      const expect = hmacSha512hex(raw, secret);
-      return { ok: timingSafeEqual(provided, expect), reason: 'cashfree HMAC-SHA512 (confirm key in week 1)' };
+      const provided = h['x-cf-signature'];
+      if (!provided) return { ok: false, reason: 'missing X-Cf-Signature' };
+      const expect = hmacSha256hex(raw, secret);
+      return { ok: timingSafeEqual(provided, expect), reason: 'cashfree HMAC-SHA256 (verified)' };
     }
     // Everything else: a shared secret echoed in a header
     default: {
@@ -50,8 +53,9 @@ function lowerHeaders(headers) {
   for (const [k, v] of Object.entries(headers || {})) out[k.toLowerCase()] = v;
   return out;
 }
-function hmacSha512hex(body, key) {
-  return crypto.createHmac('sha512', key).update(body, 'utf8').digest('hex');
+// Both verified gateways use HMAC-SHA256 over the raw body, hex-encoded.
+function hmacSha256hex(body, key) {
+  return crypto.createHmac('sha256', key).update(body, 'utf8').digest('hex');
 }
 function timingSafeEqual(a, b) {
   if (!a || !b || a.length !== b.length) return false;

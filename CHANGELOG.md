@@ -2,6 +2,28 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-10-30
+
+### Phase L (close): gateway signature specs VERIFIED + 2 real bugs fixed
+- Verified Razorpay + Cashfree signature specs against **official SDK source**
+  (not just docs): both use **HMAC-SHA256** over the raw body, hex-encoded.
+  - Razorpay: header `X-Razorpay-Signature`, key = webhook secret
+    (`razorpay/razorpay-node` → `validateWebhookSignature`).
+  - Cashfree: header `X-Cf-Signature`, key = client secret
+    (`cashfree/cashfree-sdk-nodejs` → `verifySignature`).
+- **Bug 1 (would have broken all live gateway deliveries):** `liveapi.js` used
+  HMAC-SHA512; now SHA256, matching both SDKs.
+- **Bug 2:** Cashfree header read as `x-cashfree-signature`; the real header is
+  `X-Cf-Signature`.
+- `test/liveapi.js` now uses a **real sample-signed payload** per gateway +
+  negative cases (tampered body, wrong secret, missing header) + regression
+  guards (SHA512 must be rejected; legacy Cashfree header ignored).
+- `docs/adapter-verification.md`: VERIFIED vs UNVERIFIED log with source URLs +
+  dates. UNVERIFIED (docs not reachable/SPA): Aevent, Zoom, Calendly, Pabbly,
+  FlexiFunnels — each with a retry date. They stay on the shared-secret
+  endpoint check until wired.
+- Scratch probe `test/spec-research.js` kept for re-running the week-1 check.
+
 ## 2026-10-29 (later)
 
 ### Phase L — opt-in live integration layer
