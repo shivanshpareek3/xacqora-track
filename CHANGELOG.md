@@ -2,6 +2,21 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-10-29 (later)
+
+### Phase L — opt-in live integration layer
+- Added `server/lib/liveapi.js`: `MOCK=1` (dev default) forces mock;
+  `XACQORA_LIVE=1` opts into real API calls. Inbound gateway signature check
+  (Razorpay/Cashfree HMAC-SHA512, shared-secret for the rest), batched Meta
+  Marketing API pull, and a real CAPI POST.
+- `runMetaPull` / `pushCapiEvent` now take the live path only when a real
+  (non-MOCK) token is configured; failures alert + back off instead of dropping
+  the queue (PRD risk rule).
+- Ingest rejects unsigned gateway payloads at the edge in live mode.
+- New test `test/liveapi.js` (3 checks) — mock skips signatures, live validates
+  a correct HMAC and rejects invalid/missing.
+- Wrote the 6 module READMEs under `docs/` so the next session has context.
+
 ## 2026-10-29
 
 ### Verification gate (phase-0 skeleton verified)

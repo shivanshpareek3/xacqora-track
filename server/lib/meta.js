@@ -1,8 +1,10 @@
 // Meta: scheduled ad account pull (spend + entities) and CAPI push with dedup.
 // Live Meta API calls happen here; when no token / no network, the mock
 // generator in shared.js stands in so the demo end-to-end still works.
+// Mock vs live is decided by lib/liveapi.liveMode() (MOCK=1 forces mock).
 const { makeTx } = require('../db');
 const { mockMetaPull, capiHashedPhone, capiHashedEmail, buildCapiPayload, sha256 } = require('./shared');
+const live = require('./liveapi');
 
 function getFxRate(tx, date, currency) {
   const r = tx.get(`SELECT inr_per_unit FROM fx_rate WHERE date=? AND currency=?`, date, currency);
@@ -12,21 +14,33 @@ function getFxRate(tx, date, currency) {
 // Run a Meta pull for one ad account. In production this calls
 // /act/{id}/insights with extended_result set; the mock returns synthetic rows.
 async function runMetaPull(tx, payload) {
-  const { ad_account_id, mock = true } = payload;
+  const { ad_account_id } = payload;
   const acc = tx.get(`SELECT * FROM meta_ad_account WHERE ad_account_id=?`, ad_account_id);
   if (!acc) return;
   const now = new Date().toISOString();
-  if (mock) {
+  const useMock = !live.liveMode() || !acc.token || acc.token === 'MOCK';
+
+  if (useMock) {
     const data = mockMetaPull([{ ad_account_id, name: acc.name }]);
     upsertEntities(tx, ad_account_id, data);
     upsertSpend(tx, ad_account_id, data.spend);
     tx.run(`UPDATE meta_ad_account SET last_pull_at=? WHERE ad_account_id=?`, now, ad_account_id);
     return;
   }
-  // Live pull (sketch): fetch with token, batch by 20 days
-  // const url = `https://graph.facebook.com/v19.0/${ad_account_id}/insights?fields=...&access_token=${acc.token}`
-  // For the demo build we always mock; wire fetch() here when a token is configured.
-  console.log('[meta] live pull not configured; skipped', ad_account_id);
+
+  // live: batched Marketing API pull over the last 7 days
+  try {
+    const to = new Date(now);
+    const from = new Date(Date.now() - 6 * 86400000);
+    const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token: acc.token });
+    upsertEntities(tx, ad_account_id, data);
+    upsertSpend(tx, ad_account_id, data.spend);
+    tx.run(`UPDATE meta_ad_account SET last_pull_at=?, last_error=NULL WHERE ad_account_id=?`, now, ad_account_id);
+  } catch (e) {
+    // PRD risk rule: alert on failures
+    console.error('[meta] live pull failed for', ad_account_id, e.message);
+    tx.run(`UPDATE meta_ad_account SET last_error=? WHERE ad_account_id=?`, String(e.message).slice(0, 300), ad_account_id);
+  }
 }
 
 function upsertEntities(tx, adAccount, data) {
@@ -83,21 +97,31 @@ async function pushCapiEvent(tx, payload) {
     fbc, fbp, externalId,
     eventId,
   });
-  const row = tx.get(`SELECT ad_account_id FROM meta_ad_account WHERE client_id=? AND status='connected' ORDER BY id LIMIT 1`, client_id);
-  const pixelId = row ? (tx.get(`SELECT pixel_id FROM meta_ad_account WHERE ad_account_id=?`, row.ad_account_id)?.pixel_id) : 'PIXEL-1';
+  const accRow = tx.get(`SELECT * FROM meta_ad_account WHERE client_id=? AND status='connected' ORDER BY id LIMIT 1`, client_id);
+  const pixelId = accRow ? (tx.get(`SELECT pixel_id FROM meta_ad_account WHERE ad_account_id=?`, accRow.ad_account_id)?.pixel_id) : 'PIXEL-1';
+  const dryRunFinal = dryRun || !live.liveMode() || !accRow || !accRow.token || accRow.token === 'MOCK';
   const log = {
     event_row_id: ev.id, event_name: eventName, pixel_id: pixelId,
-    dry_run: dryRun, payload: JSON.stringify(payloadObj),
+    dry_run: dryRunFinal, payload: JSON.stringify(payloadObj),
     event_id: eventId,
-    match_quality: (lead.phone ? 8 : 4) + (lead.email ? 1 : 0), // mock: 7-9 when phone+email
+    match_quality: (lead.phone ? 8 : 4) + (lead.email ? 1 : 0), // mock estimate: 7-9 when phone+email
     sent_at: new Date().toISOString(),
   };
   tx.run(`INSERT INTO capi_log (event_row_id, event_name, pixel_id, dry_run, payload, event_id, match_quality, sent_at) VALUES (?,?,?,?,?,?,?,?)`,
-    ev.id, eventName, pixelId, dryRun ? 1 : 0, log.payload, eventId, log.match_quality, log.sent_at);
+    ev.id, eventName, pixelId, dryRunFinal ? 1 : 0, log.payload, eventId, log.match_quality, log.sent_at);
   tx.run(`UPDATE event SET sent_to_meta=1, meta_event_id=?, meta_match_quality=? WHERE id=?`, eventId, log.match_quality, ev.id);
-  if (!dryRun) {
-    // live: POST to https://graph.facebook.com/v19.0/{pixel_id}/events with access token
-    // fetch(...)  — kept out of the demo build so no token is ever required.
+  if (dryRunFinal) return;
+  // live CAPI POST (real token required); PRD rules already enforced above:
+  // never sent twice (event_id), Purchase suppressed for refunded payments.
+  try {
+    const resp = await live.runLiveCapi({ pixelId, accessToken: accRow.token, payload: payloadObj });
+    // record Meta's real match quality when it returns one
+    const mq = resp && resp.events_received && resp.events_received[0] ? resp.events_received[0].event_time : null;
+    if (mq) tx.run(`UPDATE capi_log SET match_quality=? WHERE event_row_id=?`, mq, ev.id);
+  } catch (e) {
+    console.error('[capi] live push failed:', e.message);
+    // keep the event enqueued for retry by marking it unsent
+    tx.run(`UPDATE event SET sent_to_meta=0 WHERE id=?`, ev.id);
   }
 }
 

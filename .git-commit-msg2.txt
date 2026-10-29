@@ -1,0 +1,16 @@
+Phase L: opt-in live integration layer (MOCK=1 default, no credentials needed)
+
+- server/lib/liveapi.js: live-mode switch (XACQORA_LIVE=1, MOCK=1 forces mock),
+  inbound gateway signature verification (Razorpay/Cashfree HMAC-SHA512,
+  shared-secret for the rest), batched Meta Marketing API pull, real CAPI POST.
+- server/lib/meta.js: runMetaPull/pushCapiEvent now take the live path when a
+  real token is configured; failures alert + back off without dropping the queue.
+- server/index.js ingest: in live mode unsigned gateway payloads are rejected at
+  the edge (401) before processing.
+- test/liveapi.js: proves mock-mode skips signatures and live-mode validates
+  valid/invalid/missing HMAC-SHA512.
+- docs/: module READMEs (identity, webhooks-adapters, meta-spend-capi,
+  reports-attribution, tracking-script, auth-security) + CHANGELOG — the context
+  contract for every future AI session.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

@@ -84,6 +84,16 @@ async function handleIngest(platform, kind, res, bodyJson, raw, req, clientHint)
     logIngest(tx, platform, client_id, 'failed', 'secret mismatch', raw, null, false);
     return;
   }
+  // Phase L: in live mode, gateways must present a valid signature before processing
+  const live = require('./lib/liveapi');
+  if (live.liveMode() && ep && ep.secret && !['touchpoint', 'form', 'xt'].includes(platform)) {
+    const sig = live.verifyInboundSignature(platform, raw, req.headers, ep.secret);
+    if (!sig.ok) {
+      json(res, { ok: false, error: 'bad signature: ' + sig.reason }, 401);
+      logIngest(tx, platform, client_id, 'failed', 'signature: ' + sig.reason, raw, null, false);
+      return;
+    }
+  }
   // rate limit: max 50 / min per client (per platform)
   const rl = tx.get(`SELECT COUNT(*) c FROM webhook_log WHERE client_id=? AND platform=? AND ingested_at > datetime('now','-60 seconds')`, client_id, platform);
   if (rl && rl.c > 200 && !ep) { json(res, { ok: false, error: 'rate limited' }, 429); return; }
