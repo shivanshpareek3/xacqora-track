@@ -640,11 +640,104 @@ function portal(db, user, p) {
   return S.layout({ title: 'Portal', nav: S.navFor(user), active: 'dashboard.html', user, body });
 }
 
+// Phase G — pilot gates tooling screen (team-only). Runs the gate assertion
+// suite live, the ad URL checker, and the accuracy checkers' log forms.
+const P = require('./lib/pilot');
+function pilot(db, user, p) {
+  const tx = makeTx(db, user);
+  const clients = tx.all(`SELECT id, name FROM client ORDER BY id`);
+  const g = P.runGates(tx);
+  const checked = p.url ? P.checkAdUrl(decodeURIComponent(p.url)) : null;
+  const timing = P.weeklyTiming(tx);
+  // last accuracy-check run (from the audit log) so ?accuracy=1 shows the result
+  const lastAcc = tx.get(`SELECT detail FROM audit_log WHERE action='pilot.accuracy' ORDER BY id DESC LIMIT 1`);
+  const gateRows = g.gates.map((x) =>
+    `<tr><td><span class="pill ${x.pass ? 'g' : 'r'}">${x.pass ? 'PASS' : 'FAIL'}</span></td>
+     <td><b>${S.esc(x.id)}</b> ${S.esc(x.name)}</td><td class="small">${S.esc(x.detail)}</td></tr>`).join('');
+  const fieldSel = (f) => `<div class="row" style="gap:8px"><label style="width:110px">${S.esc(f)}</label>
+    <input name="map.${f}" placeholder="source column (or leave blank)"></div>`;
+  const urlResult = checked ? `
+    <div class="card" style="margin-top:12px"><h2>URL check · ${S.esc(checked.host || checked.url)}</h2>
+      <div class="tabwrap"><table><thead><tr><th>Token / param</th><th>Present</th><th>Note</th></tr></thead><tbody>
+      ${checked.findings.map((f) => `<tr><td>${S.esc(f.item)}</td>
+        <td><span class="pill ${f.present ? 'g' : (f.severity === 'info' ? 'm' : 'r')}">${f.present ? 'yes' : 'missing'}</span></td>
+        <td class="small">${S.esc(f.note)}</td></tr>`).join('')}
+      </tbody></table></div>
+      ${checked.utm_missing.length ? `<div class="small muted" style="margin-top:8px">Missing UTM params: ${checked.utm_missing.map(S.esc).join(', ')} (recommended for non-Meta channels).</div>` : ''}
+    </div>` : '';
+  const body = `
+  <h1>Pilot gates tooling <span class="badge">Phase G</span></h1>
+  <div class="note">Run against the pilot-mock / seeded data on either engine. The gate suite is a live state
+    check (read-only); the accuracy checkers are pasted-in comparisons you run each week of the pilot.
+    <a href="/import">CSV import of old leads →</a> · <a href="/pilot-live-checklist">live checklist</a></div>
+
+  <div class="card"><h2>Gate assertion suite</h2>
+    <div class="tabwrap"><table><thead><tr><th></th><th>Gate</th><th>Detail</th></tr></thead>
+    <tbody>${gateRows || '<tr><td class="muted">no gates</td></tr>'}</tbody></table></div>
+    <div class="small muted" style="margin-top:8px">All pass: <b>${g.pass ? '✅' : '❌'}</b> — a gate fails when the pilot data violates the threshold.</div>
+  </div>
+
+  <div class="card"><h2>Ad URL checker</h2>
+    <div class="note">Paste a pilot ad destination URL. We report where <code>{{ad.id}}</code>/<code>{{adset.id}}</code>/<code>{{campaign.id}}</code>/fbclid are missing —
+    a missing ad token means leads from that ad land with no ad_id and the G1 gate will fail for them.</div>
+    <form method="get" action="/pilot">
+      <label>Destination URL</label>
+      <input type="text" name="url" style="width:100%" placeholder="https://your-landing.com?utm_source=facebook&amp;utm_medium=paid{{adset.id}}={{adset.id}}{{campaign.id}}={{campaign.id}}">
+      <button class="btn" type="submit">Check URL</button>
+    </form>
+  </div>
+  ${urlResult}
+
+  <div class="card"><h2>CSV import of old leads (column mapping)</h2>
+    <div class="note">Paste an old-leads CSV (with header row) and map the source columns to Xacqora fields.
+      Phones normalise to E.164 (+91), existing leads match by phone-then-email (duplicates are skipped, never double-counted),
+      and a paid amount backfills a deal + payment_success. Idempotent — re-import the same file any time.</div>
+    <form method="post" action="/pilot/import">
+      <label>Client</label><select name="client_id">${clients.map((c) => `<option value="${c.id}">${S.esc(c.name)}</option>`).join('')}</select>
+      <label style="margin-top:10px">Paste CSV</label>
+      <textarea name="csv" rows="4" style="width:100%">Full Name,Mobile,Email,City,Status,Amount,Registered,Attended
+John,+919810000001,john@example.com,Mumbai,Paid,4999,1,1</textarea>
+      <div class="small muted" style="margin-top:8px">Map each source column (leave blank = unused):</div>
+      <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        ${['name','phone','email','city','stage','amount','registered','attended','paid_at','refund'].map(fieldSel).join('')}
+      </div>
+      <div style="margin-top:10px"><button class="btn">Import + run import audit</button></div>
+    </form>
+  </div>
+
+  <div class="card"><h2>Accuracy checkers (pilot month)</h2>
+    <div class="note">Run each week: paste the gateway settlement total and the Meta Ads Manager spend export,
+      we compare to the system's count and flag any breach of the thresholds.</div>
+    <form method="post" action="/pilot/accuracy">
+      <div class="grid g4" style="grid-template-columns:repeat(2,1fr)">
+        <div><label>Our week revenue vs gateways (₹, external settlement total)</label><input type="number" name="rev_ext" step="0.01" style="width:100%"></div>
+        <div><label>Our week spend vs Meta Ads Manager (₹, external total)</label><input type="number" name="spend_ext" step="0.01" style="width:100%"></div>
+      </div>
+      <div style="margin-top:10px"><button class="btn">Run checkers</button></div>
+    </form>
+    ${p.accuracy === '1' && lastAcc ? `<div class="note ${lastAcc.detail.includes('FAIL') ? 'warn' : ''}" style="margin-top:10px">Last check: ${S.esc(lastAcc.detail)}</div>` : ''}
+    <div style="margin-top:12px"><h2>Weekly report time (before/after log)</h2>
+      <form method="post" action="/pilot/timing">
+        <div class="row" style="gap:12px">
+          <div><label>Before (minutes to produce the weekly report)</label><input type="number" step="0.01" name="before_min" style="width:160px"></div>
+          <div><label>After (minutes using the auto summary)</label><input type="number" step="0.01" name="after_min" style="width:160px"></div>
+        </div>
+        <button class="btn" type="submit">Log timing</button>
+      </form>
+      <div class="small muted" style="margin-top:8px">${timing.before_min != null
+        ? `Last logged: before ${timing.before_min} min → after ${timing.after_min ?? '—'} min${timing.improvement_pct != null ? ` (${timing.improvement_pct}% faster)` : ''}`
+        : 'No timing logged yet.'}</div>
+    </div>
+  </div>
+  `;
+  return S.layout({ title: 'Pilot gates', nav: S.navFor(user), active: 'pilot', user, body });
+}
+
 function notFound(user) {
   return S.layout({ title: 'Not found', nav: S.navFor(user), active: '', user, body: '<div class="card"><h1>Not found</h1><div class="muted">That lead does not exist.</div></div>' });
 }
 
 module.exports = {
-  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, duplicates, admin, portal,
+  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, duplicates, admin, portal, pilot,
   stagePillClass, notFound,
 };

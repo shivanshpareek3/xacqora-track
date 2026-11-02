@@ -2,6 +2,67 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-03 (Phase G — pilot gates tooling)
+
+Pilot-ready self-verification on fake/pilot-mock data, green on BOTH engines
+(SQLite + Postgres; `test/gates.js` new, sweep extended with `/pilot` 200/403).
+
+### 1. CSV import of old leads (`server/lib/pilot.js` → `importOldLeads`)
+- **Column-mapping screen + endpoint** — `/pilot` → CSV import (maps source
+  columns to name/phone/email/city/stage/amount/registered/attended/paid_at/
+  refund); `/import/csv` now accepts a `csv` string → mapped import. An explicit
+  mapping wins; otherwise the header row is **inferred** (`inferMapping`:
+  "Full Name"→name, "Mobile"→phone, "Status"→stage, "Paid At"→paid_at, …).
+- **E.164 normalisation** — +91 981… / 0981… / bare 10-digit all → `+91…`
+  (reuses `shared.normPhone`); unnormalisable numbers kept raw, never dropped.
+- **Duplicate skip** — phone-then-email identity match; re-import of the same
+  file adds 0 new leads and 0 duplicate deals (idempotent, proven in test).
+- **Backfill** — amount → `deal` (gateway `csv`); refund flag → deal created
+  then marked refunded (surfaces in the funnel's refunded bucket, net 0);
+  registered/attended → events. All audit-logged (`import.csv` with the
+  `+imported/matched/skipped/deals` counts).
+- **Fixture** — `samples/old-leads.csv` (6 rows covering every path incl. a
+  refund).
+
+### 2. Ad URL checker (`pilot.checkAdUrl`)
+- Paste a pilot ad destination URL → per-token report: where `{{ad.id}}`
+  (error — leads land with NO ad_id ⇒ G1 fails for that ad), `{{adset.id}}`,
+  `{{campaign.id}}` (warnings), `fbclid` (info) are missing + missing UTM
+  params. Served at `/pilot` → Ad URL checker.
+
+### 3. Gate assertion suite (`pilot.runGates` + `test/gates.js`)
+- **G1** Instant Form leads land with an ad_id within 1 min (100% of
+  `meta_leadgen` leads + no webhook job stuck pending >1 min).
+- **G2** landing leads ad_id/UTM coverage ≥ 95%.
+- **G3** same person two forms = one lead (0 phone-duplicate leads).
+- **G4** webhook log: 0 unprocessed events > 10 min — keyed off the
+  `job.next_run_at` **epoch** column, which `enqueue()` sets identically on
+  both engines (webhook timestamps are display-format and differ per engine).
+- `test/gates.js` asserts all four on a pilot-mock dataset on both engines;
+  also proves CSV import E.164/dup-skip/refund, URL checker, and the accuracy
+  checkers. Swept into `test/sweep.sh` (`/pilot` → 200 owner / 403 client).
+
+### 4. Accuracy checkers (pilot month — "paste the export in")
+- `revenueVsGateways` — net-of-refunds `deal` total vs gateway settlement,
+  **≤ 2%** diff.
+- `spendVsMeta` — `spend_daily` total vs Meta Ads Manager export, **≤ 1%** diff.
+- `capiQuality` — avg `match_quality` on Purchase ≥ 7 (% ≥7 surfaced).
+- `weeklyTiming` — before/after minutes logged to `settings`
+  (`weekly_report_time_before_min` / `..._after_min`) + improvement %.
+- Routes `/pilot/accuracy` + `/pilot/timing` (team-only, 403 for client role),
+  each audit-logged; last accuracy run re-shown on the screen.
+
+### 5. Live checklist (`docs/pilot-live-checklist.md`)
+- Step-by-step live-run instructions (who does what, where to check,
+  pass/fail criteria): entry conditions (Arpit §6), per-client setup
+  (webhooks/secrets/ad URLs/old-lead backfill), the G1–G4 gate run, and the
+  weekly accuracy cadence (3.1–3.4). Served in-app at `/pilot-live-checklist`.
+- Module README: `docs/pilot-tooling.md`.
+
+**Done criteria met:** gate suite green on the pilot-mock dataset on both
+engines + checklist doc committed. Next session per the fast-track:
+Phase H (production hosting prep).
+
 ## 2026-11-02 (Phase R + Task 1 close)
 
 ### Task 1 — gateway-signature close-out

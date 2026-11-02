@@ -1,0 +1,7 @@
+Full Name,Mobile,Email,City,Status,Amount,Registered,Attended,Paid At,Refund
+John,+91 98100 00001,john@example.com,Mumbai,Paid,4999,1,1,2026-10-02T09:00:00Z,
+Jane,+91-98100-00002,jane@example.com,Delhi,Attended,,1,1,,
+Ravi,+919822233344,ravi@example.com,Bangalore,Paid,4999,1,1,2026-10-05T11:00:00Z,
+Meera,09811000003,meera@example.com,Chennai,Registered,,1,,,
+Amit,+919833333334,amit@example.com,Pune,Call Booked,,,1,,
+Deepa,9844444445,deepa@example.com,Coimbatore,Refunded,2999,,,,1

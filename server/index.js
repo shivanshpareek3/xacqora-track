@@ -430,6 +430,9 @@ const server = http.createServer(async (req, res) => {
           return guard(screens.portal(db, user, {}));
         case 'import':
           return importPage(res, user);
+        case 'pilot':
+          // Phase G: pilot gates tooling — team-only (pilot ops is not client work)
+          return guard(screens.pilot(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin', 'media_buyer']);
         case 'export':
           return exportRoute(res, user, parts, u);
         default:
@@ -513,6 +516,20 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/import/csv') {
         const { json } = await parseBody(req);
         const tx2 = makeTx(db, user); // import lands in the importer's own scope
+        // Phase G: a JSON body with a column mapping -> canonical old-leads
+        // import (duplicate skip + E.164 + backfill). Otherwise fall back to
+        // the legacy 9-column paste (rows arrive as CSV text or a JSON array).
+        // Phase G: a CSV string -> canonical old-leads import (duplicate skip +
+        // E.164 + backfill). Use the picked mapping, or infer it from the header row.
+        if (json && typeof json.csv === 'string') {
+          const pilot = require('./lib/pilot');
+          // importOldLeads infers the mapping from the header when none is given
+          const pRes = pilot.importOldLeads(tx2, Number(json.client_id) || 1,
+            { csv: json.csv, mapping: json.mapping });
+          audit(db, user, 'import.csv', 'lead',
+            `mapped: +${pRes.imported} imported, ${pRes.matched} matched, ${pRes.skipped} skipped, ${pRes.deals} deals`);
+          res.writeHead(302, { Location: '/leads' }); res.end(); return;
+        }
         // rows may arrive as a JSON array (file upload) or CSV text (the form)
         let parsedRows = json.rows;
         if (typeof parsedRows === 'string') parsedRows = parseCsvText(parsedRows);
@@ -533,6 +550,46 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(302, { Location: '/leads' }); res.end(); return;
       }
 
+      // Phase G: pilot tooling — mapped CSV import, accuracy checkers, timing log
+      // (team-only screen; mirror the /pilot GET guard so a client role cannot post here)
+      if (u.pathname.startsWith('/pilot/') && !['owner', 'admin', 'media_buyer'].includes(user.role)) {
+        send(res, 403, 'forbidden'); return;
+      }
+      if (u.pathname === '/pilot/import') {
+        const pilot = require('./lib/pilot');
+        const pRes = pilot.importOldLeads(tx, Number(json.client_id) || 1,
+          { csv: json.csv || '', mapping: collectMapParam(json) });
+        audit(db, user, 'pilot.import.csv', 'lead',
+          `+${pRes.imported} imported, ${pRes.matched} matched, ${pRes.skipped} skipped, ${pRes.deals} deals`);
+        res.writeHead(302, { Location: '/pilot' }); res.end(); return;
+      }
+      if (u.pathname === '/pilot/accuracy') {
+        const pilot = require('./lib/pilot');
+        const rev = Number(json.rev_ext || 0);
+        const sp = Number(json.spend_ext || 0);
+        const tx2 = makeTx(db, user);
+        const results = {
+          revenue: rev ? pilot.revenueVsGateways(tx2, { externalTotal: rev }) : null,
+          spend: sp ? pilot.spendVsMeta(tx2, { externalTotal: sp }) : null,
+          capi: pilot.capiQuality(tx2),
+        };
+        audit(db, user, 'pilot.accuracy', 'report',
+          `revenue ${results.revenue ? (results.revenue.pass ? 'PASS ' : 'FAIL ') + results.revenue.diff_pct + '% diff' : '—'}, ` +
+          `spend ${results.spend ? (results.spend.pass ? 'PASS ' : 'FAIL ') + results.spend.diff_pct + '% diff' : '—'}, ` +
+          `CAPI MQ ${results.capi.avg_mq} (${results.capi.pct_good}% ≥7)`);
+        res.writeHead(302, { Location: '/pilot?accuracy=1' }); res.end(); return;
+      }
+      if (u.pathname === '/pilot/timing') {
+        const pilot = require('./lib/pilot');
+        pilot.weeklyTiming(tx, {
+          beforeMin: json.before_min != null ? Number(json.before_min) : null,
+          afterMin: json.after_min != null ? Number(json.after_min) : null,
+        });
+        audit(db, user, 'pilot.weekly_timing', 'report',
+          `before ${json.before_min ?? '—'} min, after ${json.after_min ?? '—'} min`);
+        res.writeHead(302, { Location: '/pilot' }); res.end(); return;
+      }
+
       // fallthrough: treat unknown POST as error
       send(res, 400, 'bad route');
       return;
@@ -540,6 +597,16 @@ const server = http.createServer(async (req, res) => {
 
     // ---------- GET actions ----------
     if (method === 'GET' && user) {
+      if (u.pathname === '/pilot-live-checklist') {
+        // Phase G: serve docs/pilot-live-checklist.md inside the app chrome
+        const md = fs.existsSync(path.join(__dirname, '..', 'docs', 'pilot-live-checklist.md'))
+          ? fs.readFileSync(path.join(__dirname, '..', 'docs', 'pilot-live-checklist.md'), 'utf8')
+          : 'docs/pilot-live-checklist.md not found.';
+        send(res, 200, S.layout({ title: 'Pilot live checklist', nav: S.navFor(user), active: 'pilot', user,
+          body: `<div class="card" style="max-width:900px"><h1>Pilot live checklist</h1>
+            <pre style="white-space:pre-wrap;font-size:13px;line-height:1.5;font-family:inherit">${S.esc(md)}</pre></div>` }));
+        return;
+      }
       if (u.pathname === '/meta/pull') {
         const id = Number(u.searchParams.get('acc')) || 1;
         const acc = db.prepare(`SELECT * FROM meta_ad_account WHERE id=?`).get(id);
@@ -742,6 +809,18 @@ function parseCsvText(text) {
     header.forEach((h, i) => { row[h] = vals[i] != null ? vals[i].trim() : null; });
     return row;
   });
+}
+
+// Phase G: the pilot screen's CSV form posts map.<field> inputs (form-encoded).
+// The input VALUE is the client's source column header, the SUFFIX is the Xacqora
+// target field -> collapse into the { <source-header>: target-field } shape
+// pilot.importOldLeads wants (empty inputs are ignored by normMapping).
+function collectMapParam(json) {
+  const m = {};
+  for (const [k, v] of Object.entries(json || {})) {
+    if (k.startsWith('map.') && v) m[String(v).trim()] = k.slice(4);
+  }
+  return m;
 }
 
 // ---------------------------------------------------------------- import page

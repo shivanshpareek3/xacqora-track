@@ -19,6 +19,7 @@ xacqora.sqlite3.bak
 .DS_Store
 node_modules/
 tmp/
+git/
 backups/
 xacqora-isolation.sqlite3*
 .pgdata/

@@ -79,6 +79,7 @@ node test/security.js  # AES-GCM secrets, RFC 6238 TOTP vectors, rate limit, cli
 node test/isolation.js # DB-layer client-isolation proof: canary renders + query-dump audit
 node test/xt-queue.js  # xt.js survives the API being down (nothing lost)
 node test/liveapi.js   # Razorpay/Cashfree gateway signatures (verified spec)
+node test/gates.js     # Phase G pilot tooling: CSV import, URL checker, G1–G4, accuracy checkers
 
 # backups (Phase S / PRD §10)
 node scripts/backup.js      # WAL-safe VACUUM INTO snapshot -> backups/ (keep 7)
