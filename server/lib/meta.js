@@ -50,8 +50,8 @@ async function runMetaPull(tx, payload) {
 }
 
 function upsertEntities(tx, adAccount, data) {
-  for (const c of data.campaigns) tx.run(`INSERT OR IGNORE INTO meta_campaign (id, ad_account_id, name, status) VALUES (?,?,?,?)`, c.id, adAccount, c.name, c.status);
-  for (const a of data.adsets) tx.run(`INSERT OR IGNORE INTO meta_adset (id, ad_account_id, campaign_id, name, status) VALUES (?,?,?,?,?)`, a.id, adAccount, a.campaign_id, a.name, 'ACTIVE');
+  for (const c of data.campaigns) tx.run(`INSERT INTO meta_campaign (id, ad_account_id, name, status) VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING`, c.id, adAccount, c.name, c.status);
+  for (const a of data.adsets) tx.run(`INSERT INTO meta_adset (id, ad_account_id, campaign_id, name, status) VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING`, a.id, adAccount, a.campaign_id, a.name, 'ACTIVE');
   for (const ad of data.ads) tx.run(`INSERT INTO meta_ad (id, ad_account_id, adset_id, name, status, creative_img) VALUES (?,?,?,?,?,?)
      ON CONFLICT(id) DO UPDATE SET name=excluded.name, status=excluded.status, creative_img=excluded.creative_img`,
     ad.id, adAccount, ad.adset_id, ad.name, ad.status, ad.creative_img || null);
@@ -132,8 +132,10 @@ async function pushCapiEvent(tx, payload) {
   }
 }
 
-// add capi_log table (created lazily)
+// add capi_log table (created lazily). SQLite only — on Postgres the table
+// ships in schema.pg.sql and the PG DDL is not valid SQLite, and vice-versa.
 function ensureCapiLogTable(db) {
+  if (db.engine === 'pg') return;
   db.exec(`CREATE TABLE IF NOT EXISTS capi_log (
     id INTEGER PRIMARY KEY, event_row_id INTEGER NOT NULL, event_name TEXT, pixel_id TEXT,
     dry_run INTEGER DEFAULT 1, payload TEXT, event_id TEXT, match_quality INTEGER, sent_at TEXT

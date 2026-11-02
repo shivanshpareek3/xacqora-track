@@ -1,10 +1,67 @@
-// Minimal SQLite wrapper around node:sqlite (Node 24 built-in).
-// node:sqlite binds positional params as spread arguments, not as an array.
-const { DatabaseSync } = require('node:sqlite');
+// Storage layer. Two engines, one API:
+//   * SQLite (default, zero-dep) — node:sqlite built into Node 24. Used for
+//     local dev + tests.
+//   * Postgres (live) — when DATABASE_URL is set, the synchronous pg facade
+//     (server/pg.js, backed by pg-native/libpq) is used instead, so the whole
+//     app stays synchronous on either engine. Postgres adds ROW LEVEL SECURITY
+//     on every client_id-bearing table (schema.pg.sql) as a DB-level backstop
+//     to the JS scoping the app already does.
+//
+// The handle returned by open() exposes .prepare/.exec (node:sqlite shape);
+// makeTx(db) returns { db, run, get, all } where run() -> { changes,
+// lastInsertRowid } — the sync shape every call site was written against.
 const fs = require('node:fs');
 const path = require('node:path');
 
+function engine() {
+  return process.env.DATABASE_URL ? 'pg' : 'sqlite';
+}
+
 function open() {
+  if (process.env.DATABASE_URL) {
+    // Live engine: Postgres. Load the PG DDL + RLS DDL on a system connection
+    // (unrestricted scope), and hand back a handle. The app role must be a
+    // non-superuser, or RLS is bypassed entirely.
+    //
+    // handle structure:
+    //   .prepare / .exec  — the SYSTEM connection (team roles, ingest, queue,
+    //                       backup). One shared libpq connection; the app is
+    //                       single-process so shared sync state is safe.
+    //   .scoped(user)    — a dedicated connection pinned to that user's RLS
+    //                       scope (client role -> its own client_ids; team ->
+    //                       unrestricted). Cached per scope signature so
+    //                       concurrent requests never share a client's session.
+    //   .close()
+    const { PgConn, setScope, userScope } = require('./pg');
+    const sys = new PgConn(process.env.DATABASE_URL);
+    sys.exec(fs.readFileSync(path.join(__dirname, 'schema.pg.sql'), 'utf8'));
+    setScope(sys, null); // system default: see every row
+
+    const scopedCache = new Map();
+    const sigOf = (user) => {
+      const s = userScope(user);
+      return s.unrestricted ? '*' : ('c:' + (s.clientIds || []).join(','));
+    };
+    return {
+      engine: 'pg',
+      prepare: (sql) => sys.prepare(sql),
+      exec: (sql) => sys.exec(sql),
+      scoped(user) {
+        const sig = sigOf(user);
+        if (!scopedCache.has(sig)) {
+          const c = new PgConn(process.env.DATABASE_URL);
+          setScope(c, user);
+          scopedCache.set(sig, c);
+        }
+        return scopedCache.get(sig);
+      },
+      close() { sys.close(); for (const c of scopedCache.values()) c.close(); },
+      _systemConn: sys,
+    };
+  }
+
+  // Local dev / tests: zero-dependency SQLite.
+  const { DatabaseSync } = require('node:sqlite');
   const dbFile = process.env.XACQORA_DB_FILE || path.join(__dirname, '..', 'xacqora.sqlite3');
   fs.mkdirSync(path.dirname(dbFile), { recursive: true });
   const db = new DatabaseSync(dbFile);
@@ -33,24 +90,63 @@ function open() {
   return db;
 }
 
-function makeTx(db) {
-  // node:sqlite is synchronous; "transaction" simply means run statements in order.
-  // run() returns { changes, lastInsertRowid } like node:sqlite's stmt.run().
+// makeTx(db, user)
+//   user undefined -> use the handle's SYSTEM connection as-is (do not touch
+//     its RLS scope; for system/ticker/queue work that should already be
+//     unrestricted).
+//   user null      -> SYSTEM connection, explicitly unrestricted.
+//   user (object)  -> a dedicated connection pinned to that user's RLS scope:
+//     the client role is locked to its own client_ids, team roles are
+//     unrestricted. Concurrent requests for different users never share a
+//     session, so their scopes cannot bleed.
+// SQLite ignores `user` (no RLS; the app's own query scoping applies).
+function makeTx(db, user) {
+  let conn = db;
+  if (db && db.engine === 'pg') {
+    if (user === null) { conn = db._systemConn; }
+    else if (user !== undefined) { conn = db.scoped(user); }
+  }
+  // node:sqlite / pg are both synchronous; "transaction" = run in order.
+  // run() returns { changes, lastInsertRowid } (lastInsertRowid populated from
+  // the statement's RETURNING id when present — see the RETURNING appends).
   return {
-    db,
+    db: conn,
     run(sql, ...args) {
-      const stmt = db.prepare(sql);
+      const stmt = conn.prepare(sql);
       return args.length ? stmt.run(...args) : stmt.run();
     },
     get(sql, ...args) {
-      const stmt = db.prepare(sql);
+      const stmt = conn.prepare(sql);
       return args.length ? stmt.get(...args) : stmt.get();
     },
     all(sql, ...args) {
-      const stmt = db.prepare(sql);
+      const stmt = conn.prepare(sql);
       return args.length ? stmt.all(...args) : stmt.all();
     },
   };
 }
 
-module.exports = { open, makeTx };
+// Postgres only: re-point every *_id_seq to its MAX(id) (setval with
+// is_called=true so nextval() yields max+1). Explicit-id bulk loads (the seed,
+// test fixtures) never advance SERIAL sequences, so without this the next
+// auto-id INSERT collides with the last explicit id (the deal_pkey duplicate
+// the replay's razorpay job hit). No-op on SQLite (INTEGER PKs self-manage).
+// Idempotent, cheap; run it after any explicit-id load.
+const PG_ALIGN_SEQUENCES = `DO $$
+DECLARE
+  s TEXT; tbl TEXT;
+BEGIN
+  FOR s IN
+    SELECT relname FROM pg_class
+    WHERE relnamespace = 'public'::regnamespace AND relkind = 'S' AND relname LIKE '%\\_id_seq' ESCAPE '\\'
+  LOOP
+    tbl := regexp_replace(s, '_id_seq$', '');
+    EXECUTE format('SELECT setval(%L, COALESCE((SELECT MAX(id) FROM %I), 1), true)', s, tbl);
+  END LOOP;
+END $$;`;
+
+function alignSequences(handle) {
+  if (handle && handle.engine === 'pg') handle.exec(PG_ALIGN_SEQUENCES);
+}
+
+module.exports = { open, makeTx, engine, alignSequences };

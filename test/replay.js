@@ -5,11 +5,38 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 
+// Engine-aware (Phase P): Postgres when DATABASE_URL is set, else a throwaway
+// SQLite file. On Postgres a throwaway scratch database is used so the strict
+// counts run against a clean schema (the app role has CREATEDB for this).
 const DB = path.join(__dirname, '..', 'xacqora-test.sqlite3');
 for (const f of [DB, DB + '-wal', DB + '-shm']) { try { fs.unlinkSync(f); } catch {} }
 
 process.env.PORT = '4177';
-process.env.XACQORA_DB_FILE = DB;
+
+function pgTestDb() {
+  const { execSync } = require('node:child_process');
+  const m = /^postgres(?:ql)?:\/\/([^:]+)(?::([^@]*))?@([^:]+):(\d+)\/(.+)$/.exec(process.env.DATABASE_URL);
+  const env = { ...process.env };
+  if (m) { env.PGUSER = m[1]; env.PGHOST = m[3]; env.PGPORT = m[4]; env.PGDATABASE = 'postgres'; if (m[2] != null) env.PGPASSWORD = m[2]; }
+  const iso = 'xacqora_test';
+  // force-drop so a stale prior test run (still holding the db open, or owned
+  // by the dropped role) cannot block recreation
+  try { execSync(`psql -h ${m[3]} -p ${m[4]} -U ${m[1]} -d postgres -Atc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${iso}' AND pid<>pg_backend_pid();" >/dev/null 2>&1`, { env }); } catch { /* ignore */ }
+  try { execSync(`psql -h ${m[3]} -p ${m[4]} -U ${m[1]} -d ${iso} -Atc "DROP OWNED BY ${m[1]};" >/dev/null 2>&1`, { env }); } catch { /* ignore */ }
+  try { execSync(`dropdb -h ${m[3]} -p ${m[4]} -U ${m[1]} --force --if-exists ${iso} >/dev/null 2>&1`, { env }); } catch { /* ignore */ }
+  execSync(`createdb -h ${m[3]} -p ${m[4]} -U ${m[1]} ${iso}`, { env });
+  return `postgres://${m[1]}${m[2] != null ? ':' + m[2] : ''}@${m[3]}:${m[4]}/${iso}`;
+}
+
+if (process.env.DATABASE_URL) {
+  process.env.DATABASE_URL = pgTestDb();
+  // The server's daily-backup ticker runs pg_dump; under FORCE RLS that must
+  // run as the superuser backup role (superusers bypass RLS) or Postgres
+  // refuses the export. Default it so the spawned server's ticker is clean.
+  process.env.PG_BACKUP_USER = process.env.PG_BACKUP_USER || 'xacq_backup';
+} else {
+  process.env.XACQORA_DB_FILE = DB;
+}
 
 function startServer() {
   const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
@@ -76,9 +103,18 @@ function get(pathname) {
   // two ticker cycles: webhook jobs first, then the CAPI jobs they enqueue (ticker = 5s)
   await new Promise((r) => setTimeout(r, 12000));
 
-  const { DatabaseSync } = require('node:sqlite');
-  const db = new DatabaseSync(DB);
-  const count = (sql, ...a) => (db.prepare(sql).get(...a)?.c || 0);
+  // Engine-aware count reader: SQLite via node:sqlite; Postgres via dbq.js
+  // (psql), which reads the DATABASE_URL the app process used.
+  const count = (sql, ...a) => {
+    if (process.env.DATABASE_URL) {
+      const out = execSync(`node ${JSON.stringify(path.join(__dirname, '..', 'scripts', 'dbq.js'))} ${JSON.stringify(sql)}`,
+        { stdio: 'pipe', env: { ...process.env } }).toString();
+      return Number((out.split('\n').filter(Boolean).pop() || '0').trim());
+    }
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(DB);
+    return db.prepare(sql).get(...a)?.c || 0;
+  };
   const checks = [
     ['meta lead created (phone +919812345678)', `SELECT COUNT(*) c FROM lead WHERE phone='+919812345678'`, 1],
     ['meta_form_lead event', `SELECT COUNT(*) c FROM event WHERE type='meta_form_lead'`, 1],

@@ -21,3 +21,4 @@ node_modules/
 tmp/
 backups/
 xacqora-isolation.sqlite3*
+.pgdata/

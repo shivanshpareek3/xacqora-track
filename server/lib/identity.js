@@ -23,7 +23,7 @@ function getOrCreateLead(tx, clientId, { phone, email, name, city, source_unknow
     : null;
   if (!lead && e) lead = tx.get(`SELECT * FROM lead WHERE client_id=? AND email=?`, clientId, e);
   if (!lead) {
-    const info = tx.run(`INSERT INTO lead (client_id, phone, email, name, city, owner, source_unknown) VALUES (?,?,?,?,?,?,?)`,
+    const info = tx.run(`INSERT INTO lead (client_id, phone, email, name, city, owner, source_unknown) VALUES (?,?,?,?,?,?,?) RETURNING id`,
       clientId, p, e, name || null, city || null, null, source_unknown ? 1 : 0);
     lead = tx.get(`SELECT * FROM lead WHERE id=?`, Number(info.lastInsertRowid));
   }
@@ -42,11 +42,11 @@ function getOrCreateLead(tx, clientId, { phone, email, name, city, source_unknow
   if (city && !lead.city) tx.run(`UPDATE lead SET city=? WHERE id=?`, city, lead.id);
   if (p && !lead.phone) {
     tx.run(`UPDATE lead SET phone=? WHERE id=?`, p, lead.id);
-    tx.run(`INSERT OR IGNORE INTO lead_identity (link_type, link_key, lead_id) VALUES ('phone', ?, ?)`, p, lead.id);
+    tx.run(`INSERT INTO lead_identity (link_type, link_key, lead_id) VALUES ('phone', ?, ?) ON CONFLICT(link_type, link_key) DO NOTHING`, p, lead.id);
   }
   if (e && !lead.email) {
     tx.run(`UPDATE lead SET email=? WHERE id=?`, e, lead.id);
-    tx.run(`INSERT OR IGNORE INTO lead_identity (link_type, link_key, lead_id) VALUES ('email', ?, ?)`, e, lead.id);
+    tx.run(`INSERT INTO lead_identity (link_type, link_key, lead_id) VALUES ('email', ?, ?) ON CONFLICT(link_type, link_key) DO NOTHING`, e, lead.id);
   }
   return tx.get(`SELECT * FROM lead WHERE id=?`, lead.id);
 }
@@ -76,7 +76,7 @@ function recordTouchpoint(tx, row) {
   //        landing_url, referrer, device, ip, ua, ts, meta_reported_conversions? }
   const ts = row.ts || new Date().toISOString();
   if (row.visitor_id) {
-    tx.run(`INSERT OR IGNORE INTO visitor (id, fbp, first_seen, last_seen) VALUES (?, ?, ?, ?)`, row.visitor_id, row.fbp || null, ts, ts);
+    tx.run(`INSERT INTO visitor (id, fbp, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, row.visitor_id, row.fbp || null, ts, ts);
     try {
       tx.run(`UPDATE visitor SET last_seen=?, fbp=COALESCE(?, fbp) WHERE id=?`, ts, row.fbp || null, row.visitor_id);
     } catch { /* ok */ }
@@ -87,7 +87,7 @@ function recordTouchpoint(tx, row) {
     info = tx.run(`INSERT INTO touchpoint
       (lead_id, visitor_id, utm_source, utm_medium, utm_campaign, utm_content, utm_term,
        campaign_id, adset_id, ad_id, fbclid, fbc, landing_url, referrer, device, ip, ua, meta_reported_conversions, ts)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
       row.lead_id, row.visitor_id || null, row.utm_source || null, row.utm_medium || null, row.utm_campaign || null,
       row.utm_content || null, row.utm_term || null, row.campaign_id || null, row.adset_id || null,
       row.ad_id || null, row.fbclid || null, row.fbc || null, row.landing_url || null, row.referrer || null,
@@ -96,7 +96,7 @@ function recordTouchpoint(tx, row) {
     info = tx.run(`INSERT INTO touchpoint
       (visitor_id, utm_source, utm_medium, utm_campaign, utm_content, utm_term,
        campaign_id, adset_id, ad_id, fbclid, fbc, landing_url, referrer, device, ip, ua, meta_reported_conversions, ts)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
       row.visitor_id, row.utm_source || null, row.utm_medium || null, row.utm_campaign || null,
       row.utm_content || null, row.utm_term || null, row.campaign_id || null, row.adset_id || null,
       row.ad_id || null, row.fbclid || null, row.fbc || null, row.landing_url || null, row.referrer || null,
@@ -142,7 +142,7 @@ function mergeLeads(tx, keepId, dropId, keepPhone) {
   for (const c of tx.all(`SELECT id FROM call_log WHERE lead_id=?`, dropId))
     tx.run(`UPDATE call_log SET lead_id=? WHERE id=?`, keepId, c.id);
   try {
-    tx.run(`INSERT OR IGNORE INTO lead_identity (link_type, link_key, lead_id) VALUES ('phone', ?, ?)`, keepPhone, keepId);
+    tx.run(`INSERT INTO lead_identity (link_type, link_key, lead_id) VALUES ('phone', ?, ?) ON CONFLICT(link_type, link_key) DO NOTHING`, keepPhone, keepId);
   } catch { /* ok */ }
   tx.run(`DELETE FROM lead WHERE id=?`, dropId);
   const keep = tx.get(`SELECT * FROM lead WHERE id=?`, keepId);

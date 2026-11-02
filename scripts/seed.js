@@ -1,7 +1,7 @@
 // Seed demo data: 2 clients, ad accounts, campaigns, a few leads,
 // deals, and events so every screen has something to show.
 // Real payloads are NOT included (privacy rule: never paste client data).
-const { open, makeTx } = require('../server/db');
+const { open, makeTx, alignSequences } = require('../server/db');
 const { hashPassword, createSession } = require('../server/lib/auth');
 const { DEFAULT_STAGES } = require('../server/lib/shared');
 const sec = require('../server/lib/security');
@@ -30,7 +30,7 @@ function seedAll() {
   // funnels + stages
   for (const cid of [1, 2]) {
     if (!tx.get(`SELECT id FROM funnel WHERE client_id=?`, cid)) {
-      const info = tx.run(`INSERT INTO funnel (client_id, name, type) VALUES (?,?,?)`, cid, cid === 1 ? 'Main webinar' : 'Workshop', 'webinar');
+      const info = tx.run(`INSERT INTO funnel (client_id, name, type) VALUES (?,?,?) RETURNING id`, cid, cid === 1 ? 'Main webinar' : 'Workshop', 'webinar');
       const fid = Number(info.lastInsertRowid);
       DEFAULT_STAGES.forEach((s, i) => tx.run(`INSERT INTO funnel_stage (funnel_id, name, sort_order) VALUES (?,?,?)`, fid, s, i));
     }
@@ -162,4 +162,8 @@ function seedAll() {
 }
 
 seedAll();
+// Postgres: the seed used explicit ids, so re-point every SERIAL sequence
+// past its max(id) — the first auto-id insert (a webhook deal) must continue
+// after them, not collide with deal_pkey. No-op on SQLite.
+alignSequences(dbHandle);
 console.log('Done. UI: ' + (process.env.PORT ? 'http://localhost:' + process.env.PORT : 'http://localhost:4100') + '/signin');

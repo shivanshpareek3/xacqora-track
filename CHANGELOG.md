@@ -2,6 +2,52 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-02 (Phase P)
+
+### Phase P — Postgres live engine + DB-level client isolation (RLS)
+- **Engine switch on `DATABASE_URL`** — new `server/pg.js` (synchronous `pg-native`/libpq
+  facade exposing the same `prepare().get/all/run` + `exec` shape as `node:sqlite`, so the
+  ~150 sync call sites stay untouched). `server/db.js` picks: `DATABASE_URL` set -> Postgres
+  (live), else SQLite (zero-dep default, still fully green). SQL translation: `?`->`$n`,
+  auto-quoting of the reserved `"user"` table, JS-bound ISO-8601 timestamps (no
+  `datetime('now')`), `RETURNING id` for `lastInsertRowid`, INT8->Number so `COUNT(*)`
+  compares like the SQLite engine.
+- **`server/schema.pg.sql`** — full DDL port + RLS on every client-bearing table
+  (`ENABLE` + `FORCE ROW LEVEL SECURITY` so it binds the owning role too; the app connects
+  as the non-superuser `xacq_app` so the policies actually apply). Default-OPEN model:
+  an unscoped/system connection (ticker, queue, pg_dump, bare psql) sees all rows; a
+  connection carrying the `app.client_ids` / `app.unrestricted` GUCs is locked to that
+  client. Child tables (`event`,`touchpoint`,`task`,`note`,`call_log`) scope via
+  `EXISTS(lead WHERE id=lead_id)`; `funnel_stage` via `funnel`.
+- **`makeTx(db, user)` RLS backstop** — a client role gets a dedicated connection pinned
+  to its own `client_ids`; team roles run unrestricted. Concurrent requests for different
+  users never share a session, so their scopes can't bleed. Webhook ingest + the daily
+  ticker/queue run system-scoped (`makeTx(db, null)`).
+- **Sequence re-alignment** — `alignSequences(db)` (in `server/db.js`) re-points every
+  `*_id_seq` to `MAX(id)` after explicit-id bulk loads; the seed and the isolation fixtures
+  both call it, so the first auto-id INSERT continues after the last explicit id instead
+  of colliding on `deal_pkey` (the bug that broke the razorpay deal row on Postgres).
+- **Backup under FORCE RLS** — `pg_dump` by the RLS-bound app role is structurally refused
+  ("query would be affected by row-level security policy"), so a dedicated superuser backup
+  role `xacq_backup` handles dump/restore (superusers bypass RLS). `scripts/pg-dev.sh` +
+  `pg-provision.sh` create it; `server/lib/backup.js` runs `pg_dump` + a restore-verify into
+  a scratch db, and the whole backup/restore path honours `PG_BACKUP_USER` (default
+  `xacq_backup`). Engine-aware `scripts/backup.js` + `scripts/restore-drill.sh` (SQLite =
+  `VACUUM INTO`; Postgres = `pg_dump`/`pg_restore`).
+- **Cluster scripts** — `scripts/pg-dev.sh` (fresh dev cluster on 127.0.0.1:5433, run from a
+  real terminal: initdb's bootstrap postmaster needs SysV shared memory the app sandbox
+  blocks), `scripts/pg-provision.sh` (role/DB/schema/grants + RLS scoping verify),
+  `scripts/dbq.js` (engine-aware one-line query runner), `scripts/pg-smoke.js`
+  (facade + RLS smoke).
+- **Tests green on both engines** — Postgres: `test/replay.js` all pass, `test/isolation.js`
+  all pass including the new RLS-enforcement section (bare scans under a client-2 scope
+  return only client-2 rows; a cross-client write is rejected by the DB), `test/sweep.sh`
+  reports 0 failures, backup/restore-drill restores all six tables with matching counts.
+  SQLite (no `DATABASE_URL`): the same suite + `test/security.js` + `test/liveapi.js` all
+  stay green.
+- **New deps** — `pg` + `pg-native` (libpq, used only on the Postgres path); the SQLite
+  default remains zero-dependency.
+
 ## 2026-10-30 (Phase S)
 
 ### Phase S — Security checklist (PRD §10)

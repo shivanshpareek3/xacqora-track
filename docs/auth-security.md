@@ -26,10 +26,22 @@ test/security.js` covers the AES-GCM / TOTP / rate-limit primitives.
 
 **Phase S (done)** — client isolation enforced at the app data layer
 (`WHERE client_id IN (...)` scoping in `screens.js` / `shared.js`, proven by
-`test/isolation.js`); move to Postgres row-level security in Phase P.
-Secrets at rest: AES-256-GCM via `server/lib/security.js` (master key from
-`XACQORA_SECRET_KEY`; the no-key dev fallback is flagged insecure). 2FA: TOTP
-on team logins (enroll/disable from the Admin screen, `two_factor_enforced`
-setting to mandate it org-wide). Exports: role-masked CSV + audit log.
-Backups: daily `VACUUM INTO` snapshot (keep-7) + monthly restore drill.
-Rate limits: per-IP + per-endpoint sliding windows on the public ingest API.
+`test/isolation.js`). Secrets at rest: AES-256-GCM via `server/lib/security.js`
+(master key from `XACQORA_SECRET_KEY`; the no-key dev fallback is flagged
+insecure). 2FA: TOTP on team logins (enroll/disable from the Admin screen,
+`two_factor_enforced` setting to mandate it org-wide). Exports: role-masked CSV
++ audit log. Backups: daily `VACUUM INTO` snapshot (keep-7) + monthly restore
+drill (Postgres path: `pg_dump`/`pg_restore` as `xacq_backup`). Rate limits:
+per-IP + per-endpoint sliding windows on the public ingest API.
+
+**Phase P (done) — DB-level backstop: Postgres row-level security.** On the
+Postgres engine (`DATABASE_URL` set) every client-bearing table carries
+`ENABLE` + `FORCE ROW LEVEL SECURITY` policies keyed on two session GUCs
+(`app.unrestricted`, `app.client_ids`); `makeTx(db, user)` pins each client
+role to its own `client_ids` on a dedicated connection so the database itself
+hides other clients' rows even from a bare `SELECT`. The default-open model
+keeps unscoped system connections (ticker, queue, `pg_dump`, bare `psql`)
+seeing all rows. `test/isolation.js` proves it on Postgres: a bare scan under
+a client-2 scope returns only client-2 rows and a cross-client write is
+rejected by the DB. See `server/pg.js`, `server/schema.pg.sql`,
+`docs/auth-security.md` RLS note, and `CHANGELOG.md` (Phase P).

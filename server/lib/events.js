@@ -15,7 +15,7 @@ function ensureFunnel(db, clientId, name, type) {
   const tx = makeTx(db);
   let f = tx.get(`SELECT * FROM funnel WHERE client_id=? ORDER BY id LIMIT 1`, clientId);
   if (!f) {
-    const info = tx.run(`INSERT INTO funnel (client_id, name, type) VALUES (?,?,?)`, clientId, name || 'Main funnel', type || 'webinar');
+    const info = tx.run(`INSERT INTO funnel (client_id, name, type) VALUES (?,?,?) RETURNING id`, clientId, name || 'Main funnel', type || 'webinar');
     f = tx.get(`SELECT * FROM funnel WHERE id=?`, Number(info.lastInsertRowid));
     for (const [i, s] of DEFAULT_STAGES.entries()) {
       tx.run(`INSERT INTO funnel_stage (funnel_id, name, sort_order) VALUES (?,?,?)`, f.id, s, i);
@@ -36,7 +36,7 @@ function addEvent(tx, { lead, type, source_platform, source_ref, value, currency
     const dup = tx.get(`SELECT id FROM event WHERE lead_id=? AND type=? AND source_ref=? ORDER BY id DESC LIMIT 1`, lead.id, type, dedup_key);
     if (dup) return { skipped: true, event: dup };
   }
-  const info = tx.run(`INSERT INTO event (lead_id, type, source_platform, source_ref, value, currency, raw_payload, ts) VALUES (?,?,?,?,?,?,?,?)`,
+  const info = tx.run(`INSERT INTO event (lead_id, type, source_platform, source_ref, value, currency, raw_payload, ts) VALUES (?,?,?,?,?,?,?,?) RETURNING id`,
     lead.id, type, source_platform || null, source_ref || dedup_key || null, value ?? null, currency || 'INR', raw_payload || null, ts || new Date().toISOString());
   const eventId = Number(info.lastInsertRowid);
   // auto stage move

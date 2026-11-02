@@ -15,7 +15,7 @@ async function processJob(db, id, fn) {
   job.attempts = job.attempts + 1;
   try {
     await fn(tx, JSON.parse(job.payload));
-    tx.run(`UPDATE job SET status='done', finished_at=datetime('now') WHERE id=?`, id);
+    tx.run(`UPDATE job SET status='done', finished_at=? WHERE id=?`, new Date().toISOString(), id);
     return true;
   } catch (e) {
     const backoff = Math.min(300, 30 * Math.pow(2, job.attempts));

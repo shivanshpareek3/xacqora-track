@@ -10,6 +10,8 @@ O="$BASE_DIR/tmp/xt-$PORT.txt"; C="$BASE_DIR/tmp/xt-$PORT-c.txt"; rm -rf "$BASE_
 # start a dedicated server on PORT (low rate limits so the S.6 429 test is quick)
 EXIST_ON_PORT=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/signin" 2>/dev/null)
 if [ "$EXIST_ON_PORT" != "200" ] && [ "$EXIST_ON_PORT" != "302" ]; then
+  # Phase P: on Postgres the dev db must be seeded first (users/leads/deals)
+  [ -n "${DATABASE_URL:-}" ] && node scripts/seed.js >/dev/null 2>&1
   ( PORT="$PORT" XT_RATE_PER_MIN_IP=10 XT_RATE_PER_MIN_ENDPOINT=1000 node server/index.js &>/tmp/xt-$PORT.log & )
   sleep 2
 fi
@@ -72,7 +74,11 @@ echo "client export full-email leak: $fullInClientExport (expect 0)"
 [ "$fullInClientExport" != "0" ] && { echo "FAIL client CSV export leaks full emails"; FAILS=$((FAILS+1)); }
 # every export writes an audit_log row
 sleep 0.2
-auditCount=$(node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('xacqora.sqlite3');console.log(d.prepare(\"SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'\").get().c);" 2>/dev/null)
+if [ -n "${DATABASE_URL:-}" ]; then
+  auditCount=$(node scripts/dbq.js "SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'" | tail -1 | tr -d '\r ')
+else
+  auditCount=$(node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('xacqora.sqlite3');console.log(d.prepare(\"SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'\").get().c);" 2>/dev/null)
+fi
 echo "audit_log export.csv rows: $auditCount (expect >0)"
 [ "${auditCount:-0}" = "0" ] && { echo "FAIL exports not written to audit log"; FAILS=$((FAILS+1)); }
 
@@ -87,6 +93,10 @@ echo "rate-limited after request #$rl429"
 [ -z "$rl429" ] && { echo "FAIL per-IP limit never returned 429 in 40 reqs"; FAILS=$((FAILS+1)); }
 
 echo '--- S.5: backup + restore drill ---'
+# FORCE RLS makes pg_dump refuse an export by the RLS-bound app role; on a
+# Postgres cluster the backup/restore path runs as the superuser backup role
+# (created by scripts/pg-dev.sh + pg-provision.sh). Override with PG_BACKUP_USER.
+[ -n "${DATABASE_URL:-}" ] && export PG_BACKUP_USER="${PG_BACKUP_USER:-xacq_backup}"
 bkout=$(node scripts/backup.js 2>&1); bk="${bkout##*$'\n'}"
 echo "backup: $bk"
 echo "$bkout" | grep -q "backup OK" || { echo "FAIL backup.js did not report OK"; echo "$bkout"; FAILS=$((FAILS+1)); }
@@ -96,7 +106,7 @@ echo "$rd" | grep -q "PASSED" || { echo "FAIL restore-drill did not pass"; FAILS
 echo '--- S.3: 2FA flow (enroll -> OTP verify -> session; wrong code denied) ---'
 T="$BASE_DIR"/tmp/xt-$PORT-tfa.txt
 setup=$(curl -s -b "$O" -c "$O" -X POST -d "action=enroll" "$BASE/admin/2fa" -o /dev/null -w "%{redirect_url}")
-secret=$(node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('xacqora.sqlite3');const s=d.prepare(\"SELECT totp_secret FROM user WHERE lower(email)='owner@xacqora.local'\").get().totp_secret;const sec=require('./server/lib/security');console.log(sec.decryptSecret(s));")
+secret=$(node scripts/dbq.js "SELECT totp_secret FROM \"user\" WHERE lower(email)='owner@xacqora.local'" 2>/dev/null | tail -1 | tr -d '\r' | node -e "const s=require('fs').readFileSync(0,'utf8').trim();const sec=require('./server/lib/security');console.log(sec.decryptSecret(s));")
 [ -z "$secret" ] && { echo "FAIL could not read enrolled 2FA secret"; FAILS=$((FAILS+1)); }
 # sign out, sign back in with a FRESH jar so the xt_tfa pending cookie is captured
 rm -f "$T"

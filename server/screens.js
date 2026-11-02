@@ -21,7 +21,7 @@ function emailOf(u, lead) {
 
 // ---------------------------------------------------------------- Dashboard
 function dashboard(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const settings = {
     attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
     attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
@@ -94,7 +94,7 @@ function stagePillClass(s) {
 
 // ---------------------------------------------------------------- Lead list
 function leads(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const q = (p.q || '').trim();
   const stage = p.stage || '';
   // client logins only ever see their own client; team roles can filter
@@ -149,7 +149,7 @@ function leads(db, user, p) {
 
 // ---------------------------------------------------------------- Lead timeline
 function leadTimeline(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const lead = tx.get(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.id=?`, p.id);
   if (!lead) return notFound(user);
   // PRD §10: row-level isolation at the route too. A client login may only
@@ -235,7 +235,7 @@ function leadTimeline(db, user, p) {
 
 // ---------------------------------------------------------------- Pipeline kanban
 function pipeline(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const sec = require('./lib/security');
   // a client login is locked to its own clients; the ?client= filter cannot widen it
   let client = p.client || '';
@@ -267,7 +267,7 @@ function pipeline(db, user, p) {
 
 // ---------------------------------------------------------------- Reports
 function reports(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const settings = {
     attribution_model: p.model || tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
     attribution_window_days: p.window || tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
@@ -357,7 +357,7 @@ function reports(db, user, p) {
 
 // ---------------------------------------------------------------- Meta hub
 function meta(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id`);
   const accRows = accounts.map((a) => `<tr>
     <td>${S.esc(a.name)} <span class="small muted">(${S.esc(a.client_name || '')})</span></td>
@@ -392,7 +392,7 @@ function meta(db, user, p) {
 
 // ---------------------------------------------------------------- Integrations
 function integrations(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const PLATFORMS = [
     ['meta_leadgen', 'Meta Lead Forms', 'Instant Form leads with ad IDs'],
     ['tagmango', 'TagMango', 'Course / workshop purchases'],
@@ -451,7 +451,7 @@ function integrations(db, user, p) {
 
 // ---------------------------------------------------------------- Duplicates
 function duplicates(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const { likelyDuplicates } = require('./lib/identity');
   const clients = tx.all(`SELECT id, name FROM client`);
   const cid = p.client || clients[0]?.id;
@@ -478,7 +478,7 @@ function duplicates(db, user, p) {
 
 // ---------------------------------------------------------------- Admin
 function admin(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const sec = require('./lib/security');
   // after enrolling, ?2fa=setup shows the current user's secret for the app
   const setupCard = (p && p['2fa'] === 'setup' && user.totp_enabled) ? (() => {
@@ -540,7 +540,7 @@ function admin(db, user, p) {
 
 // ---------------------------------------------------------------- Client portal
 function portal(db, user, p) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   // client role: only their own client
   const myClients = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : [];
   const cid = myClients[0];

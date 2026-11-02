@@ -9,6 +9,12 @@ from the "Xacqora Track: Product Requirements" doc. Every module in Section 5 of
 has a working implementation; the Meta spend pull and CAPI push run in a mock/dry-run
 mode so no live tokens are needed. Wire in the real Meta + gateway calls where marked.
 
+Storage is dual-engine (Phase P): **SQLite** (Node built-in, the zero-dependency default
+for local dev + tests) and **Postgres** (`DATABASE_URL` set) with row-level security on
+every client-bearing table. On Postgres the dump/restore path runs as the superuser
+`xacq_backup` role (`PG_BACKUP_USER`) because RLS-forced tables can't be dumped by the
+non-superuser app role. See `CHANGELOG.md` (Phase P) and `docs/auth-security.md`.
+
 ## Run it
 
 ```bash
@@ -85,5 +91,5 @@ bash scripts/restore-drill.sh  # restore newest snapshot to a fresh dir, assert 
 
 - Final product name, pilot accounts, product owner / lead dev names, hosting budget,
   attribution default, and whether client sales reps log calls are still Arpit's calls.
-- Postgres + row-level security, and the real Meta/gateway SDK calls, are the production
-  next step; this build stands in with SQLite + mocks.
+- The real Meta/gateway SDK calls still run behind the mock/dry-run layer (opt-in live,
+  Phase L); Postgres + row-level security is done (Phase P).

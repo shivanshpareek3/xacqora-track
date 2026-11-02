@@ -1,12 +1,29 @@
-// Daily database backup (PRD §10): copy the SQLite file to backups/ with a
-// timestamp, keep the last 7, and verify the copy opens cleanly.
-//   node scripts/backup.js [dbPath]
-// XACQORA_DB_FILE env var is honoured; default is the app's xacqora.sqlite3.
+// Daily database backup (PRD §10). Engine-aware (Phase P):
+//   * Postgres (DATABASE_URL set)  — pg_dump via the shared runBackup().
+//   * SQLite (default)             — VACUUM INTO a single-file snapshot, keep
+//                                    the newest 7, verify the copy opens.
+//   node scripts/backup.js
+// Honours DATABASE_URL / XACQORA_DB_FILE.
 const fs = require('node:fs');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
 
-const dbFile = process.argv[2] || process.env.XACQORA_DB_FILE || path.join(__dirname, '..', 'xacqora.sqlite3');
+if (process.env.DATABASE_URL) {
+  // Postgres: delegate to the engine-aware runner (pg_dump + restore verify).
+  // Under FORCE RLS a pg_dump by the RLS-bound app role is refused; the backup
+  // path runs as the dedicated superuser role (created by pg-dev.sh /
+  // pg-provision.sh). Default to it; override with PG_BACKUP_USER.
+  process.env.PG_BACKUP_USER = process.env.PG_BACKUP_USER || 'xacq_backup';
+  const { open } = require('../server/db');
+  const { runBackup } = require('../server/lib/backup');
+  const db = open();
+  const line = runBackup(db);
+  console.log('backup OK: ' + line);
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------- SQLite path
+const { DatabaseSync } = require('node:sqlite');
+const dbFile = process.env.XACQORA_DB_FILE || path.join(__dirname, '..', 'xacqora.sqlite3');
 if (!fs.existsSync(dbFile)) {
   console.error('backup: no database at', dbFile);
   process.exit(1);

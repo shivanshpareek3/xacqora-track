@@ -18,7 +18,6 @@ const db = open();
 ensureCapiLogTable(db);
 
 const PORT = Number(process.env.PORT || 4100);
-const TX = makeTx(db);
 
 // Phase S: unauthenticated "pending 2FA login" markers (short-lived, rate
 // limited, never grant access by themselves).
@@ -88,7 +87,7 @@ function requireUser(res, user, roles) {
 // /api/webhook/:platform — per-platform inbound webhooks (secret-checked)
 // /api/ingest/:platform — test / queued ingest
 async function handleIngest(platform, kind, res, bodyJson, raw, req, clientHint) {
-  const tx = makeTx(db);
+  const tx = makeTx(db, null); // system scope: webhooks enqueue across clients
   // resolve the client: from body.client, the ?c= param, or the endpoint row
   let client_id = Number(bodyJson?.client ?? bodyJson?.client_id ?? clientHint ?? 0);
   if (!client_id) {
@@ -262,7 +261,7 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           db.prepare(`DELETE FROM tfa_pending WHERE user_id=?`).run(row.id);
-          db.prepare(`INSERT OR REPLACE INTO tfa_pending (user_id, totp_secret) VALUES (?,?)`).run(row.id, row.totp_secret);
+          db.prepare(`INSERT INTO tfa_pending (user_id, totp_secret) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET totp_secret=excluded.totp_secret`).run(row.id, row.totp_secret);
           setPending(res, row.id);
           res.writeHead(302, { Location: '/2fa/verify' });
           res.end();
@@ -376,14 +375,16 @@ const server = http.createServer(async (req, res) => {
         case 'reports.html':
           return guard(screens.reports(db, user, Object.fromEntries(u.searchParams.entries())));
         case 'meta.html':
-          return guard(screens.meta(db, user, {}));
+          // team-only: ad accounts / spend / CAPI log cross clients by design
+          return guard(screens.meta(db, user, {}), ['owner', 'admin', 'media_buyer']);
         case 'meta':
           if (parts[1] === 'pull') {
+            if (!sec.isTeam(user)) { send(res, 403, 'team-only'); res.end(); return; }
             const id = Number(u.searchParams.get('acc')) || 1;
             const acc = db.prepare(`SELECT * FROM meta_ad_account WHERE id=?`).get(id);
             if (acc) {
               const metaLib = require('./lib/meta');
-              const tx = makeTx(db);
+              const tx = makeTx(db, user); // RLS backstop: the pull lands in the user's scope
               metaLib.runMetaPull(tx, { ad_account_id: acc.ad_account_id }).then(() => {
                 audit(db, user, 'meta.pull', 'ad_account', String(acc.id), acc.ad_account_id);
               }).catch((e) => {
@@ -416,7 +417,7 @@ const server = http.createServer(async (req, res) => {
 
     // ---------- protected POST actions ----------
     if (method === 'POST' && user) {
-      const tx = makeTx(db);
+      const tx = makeTx(db, user); // Phase P: this user's RLS scope on Postgres
       if (u.pathname.startsWith('/lead/') && u.pathname.endsWith('/update')) {
         const id = Number(u.pathname.split('/')[2]);
         const { json } = await parseBody(req);
@@ -488,7 +489,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (u.pathname === '/import/csv') {
         const { json } = await parseBody(req);
-        const tx2 = makeTx(db);
+        const tx2 = makeTx(db, user); // import lands in the importer's own scope
         // rows may arrive as a JSON array (file upload) or CSV text (the form)
         let parsedRows = json.rows;
         if (typeof parsedRows === 'string') parsedRows = parseCsvText(parsedRows);
@@ -544,7 +545,7 @@ const server = http.createServer(async (req, res) => {
 // access) and written to the audit log — "exports logged in the audit log".
 function exportRoute(res, user, parts, u) {
   const kind = parts[1] || '';
-  const tx = makeTx(db);
+  const tx = makeTx(db, user); // export rows bounded by the user's RLS scope
   let csv = '', label = '';
   if (kind === 'leads') {
     const scope = user.role === 'client'
@@ -631,11 +632,12 @@ Ravi,+919812345678,ravi@example.com,Mumbai,Paid,9999,1,1,2026-10-20T00:00:00Z"><
 // ---------------------------------------------------------------- background ticker
 setInterval(async () => {
   try {
-    const tx = makeTx(db);
+    const tx = makeTx(db, null); // system ticker: queue + scheduled pulls
     await tick(db, { handleWebhook }, 30);
     // scheduled Meta pull: every ad account whose last_pull is older than 3h
+    const threeHoursAgo = new Date(Date.now() - 3 * 3600000).toISOString();
     const due = tx.all(`SELECT * FROM meta_ad_account WHERE auto_pull=1 AND status='connected'
-      AND (last_pull_at IS NULL OR last_pull_at < datetime('now', '-3 hours'))`);
+      AND (last_pull_at IS NULL OR last_pull_at < ?)`, threeHoursAgo);
     for (const a of due) enqueue(db, 'meta_pull', { ad_account_id: a.ad_account_id });
     // daily backup: once per IST calendar day (PRD §10: daily DB backup)
     const now = new Date();
