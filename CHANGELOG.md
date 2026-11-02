@@ -2,6 +2,57 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-02 (Phase R + Task 1 close)
+
+### Task 1 — gateway-signature close-out
+- **Razorpay + Cashfree re-verified against current official SDK source (2026-11-02):**
+  Razorpay `X-Razorpay-Signature` = HMAC-SHA256(rawBody, webhookSecret) hex;
+  Cashfree `X-Cf-Signature` = HMAC-SHA256(rawBody, clientSecret) hex. Both match
+  `server/lib/liveapi.js` exactly — **no code change**; the two earlier "pending"
+  markers are gone. Zero pending items for either gateway.
+- **5-platform verification batch attempted live, logged UNVERIFIED by policy**
+  (`docs/adapter-verification.md`): Aevent / Zoom / Calendly / Pabbly /
+  FlexiFunnels docs are unreachable from this environment (JS SPA shells that
+  render no body to a plain fetch, 404s on the canonical paths, auth-gated, or a
+  hostname that does not resolve; `web_search` returned nothing usable). Each row
+  carries the exact reason + a bumped retry date; they fall back to the
+  per-endpoint shared-secret check until their native verification is wired.
+
+### Phase R — Reports finish
+- **CSV + Excel export on every report** — `/export/<funnel|report|source-mix|
+  new-vs-old|meta-vs-track|weekly-summary>` with `?fmt=csv` (default) or
+  `?fmt=excel`. Excel is a hand-written zero-dep SpreadsheetML ".xls" writer
+  (`server/lib/shared.js` → `toExcel`), not a SheetJS dependency; CSV reuses
+  `toCsv`. Both are role-masked (phone/email) for the leads export and every
+  export writes an `audit_log` row (`export.csv` / `export.xls`).
+- **Every number links to the leads behind it** — the report KPIs, ad-row
+  "Leads"/"Revenue" cells, and source-mix chips deep-link to `/leads?ids=…`
+  (numeric-only, RLS-safe). `funnelReport` / `adPerformance` / `sourceMix`
+  now return `lead_ids` lists; `/leads` accepts `?ids=` as an extra filter with a
+  "showing N leads behind a report number" banner.
+- **Net-of-refunds revenue everywhere** — `funnelReport` computes a
+  `refunded` count and a net revenue (SUM only `status='success' AND
+  refunded_at IS NULL`), surfaced as a KPI and in the weekly summary + PDF.
+  Regression test in `test/reports.js`: a fully-refunded lead contributes ₹0.
+- **Auto weekly client summary (Monday 9 AM IST, zero manual)** — the
+  `server/index.js` ticker now writes, in addition to the all-client JSON: one
+  PDF per client under `reports/summary-<date>-client<N>.pdf` (zero-dep PDF 1.4
+  writer in `server/lib/pdf.js`) and records the path in `settings`; the client
+  portal shows the latest weekly-summary card + a `/weekly.pdf` download link.
+- **Meta vs Xacqora Track (conversions, per ad + delta)** — the Meta pull
+  (`server/lib/liveapi.js`) now requests `conversions,quality_conversions`;
+  `server/lib/meta.js` stores them in a new `spend_daily.conversions` column
+  (added to both `schema.sql` + `schema.pg.sql` with an idempotent `ADD COLUMN`
+  migration in `db.js`); the mock pull synthesizes a plausible value.
+  `metaVsTracker` returns per-ad Meta-vs-ours rows with a delta column, rendered
+  as a table on the Reports screen and exported via `/export/meta-vs-track`.
+- **Tests green on both engines** — `node test/reports.js` (net-of-refunds,
+  drill-down lead-id lists, Meta-vs-Track delta, weekly PDF bytes, CSV/Excel
+  export shapes) passes on SQLite *and* Postgres (scratch db). Full
+  `replay`/`isolation`/`sweep` suites re-run green on Postgres after a clean
+  re-provision (sweep 0 failures). `docs/reports-attribution.md` +
+  `docs/adapter-verification.md` updated.
+
 ## 2026-11-02 (Phase P)
 
 ### Phase P — Postgres live engine + DB-level client isolation (RLS)

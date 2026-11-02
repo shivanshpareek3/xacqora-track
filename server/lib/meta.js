@@ -61,12 +61,13 @@ function upsertSpend(tx, adAccount, rows) {
   for (const r of rows) {
     const fx = getFxRate(tx, r.date, 'INR');
     const inr = (r.spend || 0) * fx;
-    tx.run(`INSERT INTO spend_daily (ad_id, date, ad_account_id, spend, spend_inr, impressions, reach, clicks, currency)
-      VALUES (?,?,?,?,?,?,?,?,?)
+    tx.run(`INSERT INTO spend_daily (ad_id, date, ad_account_id, spend, spend_inr, impressions, reach, clicks, conversions, currency)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(ad_id, date, ad_account_id) DO UPDATE SET
         spend=excluded.spend, spend_inr=excluded.spend_inr,
-        impressions=excluded.impressions, reach=excluded.reach, clicks=excluded.clicks`,
-      r.ad_id, r.date, adAccount, r.spend || 0, inr, r.impressions || 0, r.reach || 0, r.clicks || 0, 'INR');
+        impressions=excluded.impressions, reach=excluded.reach, clicks=excluded.clicks,
+        conversions=excluded.conversions`,
+      r.ad_id, r.date, adAccount, r.spend || 0, inr, r.impressions || 0, r.reach || 0, r.clicks || 0, r.conversions || 0, 'INR');
   }
 }
 

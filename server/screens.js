@@ -105,11 +105,19 @@ function leads(db, user, p) {
   if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
   if (stage) { where += ` AND l.stage = ?`; args.push(stage); }
   if (client) { where += ` AND l.client_id = ?`; args.push(client); }
+  // PRD "every number links to the leads behind it": report KPIs / ad rows /
+  // source-mix chips deep-link here with ?ids=1,2,3. Numeric-only, so no SQLi.
+  const ids = String(p.ids || '').split(',').map((s) => s.trim()).filter((s) => /^\d+$/.test(s));
+  let idsBanner = '';
+  if (ids.length) {
+    where += ` AND l.id IN (${ids.join(',')})`;
+    idsBanner = `<div class="note" style="margin-top:12px">Showing <b>${ids.length}</b> leads behind a report number. <a href="/leads">Clear</a></div>`;
+  }
   const rows = tx.all(`SELECT l.*, c.name client_name,
       (SELECT COUNT(*) FROM event e WHERE e.lead_id=l.id) ev,
       (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid
     FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE ${where}
-    ORDER BY l.id DESC LIMIT 200`, ...args);
+    ORDER BY l.id DESC LIMIT 500`, ...args);
   const stages = S.DEFAULT_STAGES;
   // a client login only sees its own client in the filter; team roles see all
   const clients = user.role === 'client'
@@ -137,6 +145,7 @@ function leads(db, user, p) {
       <div><label>Client</label><select name="client"><option value="">All</option>${clients.map((c) => `<option value="${c.id}" ${String(c.id) === client ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></div>
       <button class="btn" type="submit">Filter</button>
     </form>
+    ${idsBanner}
   </div>
   <div class="card">
     <div class="tabwrap"><table>
@@ -284,38 +293,77 @@ function reports(db, user, p) {
   const fp = S.funnelReport(tx, null, settings, scopeIds);
   const waste = S.wastedSpend(ap);
   const mix = S.sourceMix(tx, scopeIds);
+  const mvt = S.metaVsTracker(tx, settings, scopeIds); // PRD §5.7 Meta vs Track
   const models = ['last_paid_click', 'first_click', 'linear', 'lead_source'];
   const modelNames = { last_paid_click: 'Last paid click (default)', first_click: 'First click', linear: 'Linear', lead_source: 'Lead source' };
 
+  // PRD "every number links to the leads behind it": deep-link a value to the
+  // list of leads that make it up (numeric ids, so RLS-safe on the leads screen).
+  const drill = (ids, label, title = '') => {
+    const list = (ids || []).join(',');
+    if (!list) return `<span class="muted">${S.esc(label)}</span>`;
+    const href = `/leads?ids=${encodeURIComponent(list)}${clientFilter ? `&client=${clientFilter}` : ''}`;
+    return `<a href="${href}" title="${S.esc(title || ('open ' + list.length + ' leads'))}">${S.esc(label)}</a>`;
+  };
+  const drillNum = (ids, value) => {
+    const list = (ids || []).join(',');
+    if (!list) return S.esc(value);
+    return `<a href="/leads?ids=${encodeURIComponent(list)}${clientFilter ? `&client=${clientFilter}` : ''}">${S.esc(value)}</a>`;
+  };
+  // export URL preserving the current filters (so CSV/Excel match what's shown)
+  const expQ = `?client=${clientFilter}&model=${settings.attribution_model}&window=${settings.attribution_window_days}&from=${settings.report_from || ''}&to=${settings.report_to || ''}`;
+
   const adRows = ap.rows.map((r) => `<tr>
     <td><img class="lead-img" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='52' height='52'><rect width='52' height='52' rx='8' fill='%23252c40'/></svg>" style="width:34px;height:34px">
-      <a href="/lead-ads?ad=${r.ad_id}"><b>${S.esc(r.name)}</b></a>
-      <div class="small muted">${S.esc(r.campaign)} · ${S.esc(r.account || '')}</div></td>
+      <b>${S.esc(r.name)}</b>
+      <div class="small muted">${S.esc(r.campaign)} · ${S.esc(r.account || '')} · ${S.esc(r.ad_id)}</div></td>
     <td>${S.esc(r.status)}</td>
     <td>${S.fmtINR(r.spend)}</td>
     <td class="small">${S.fmtN(r.impressions)}</td>
     <td class="small">${S.fmtN(r.clicks)}</td>
     <td>${r.cpm != null ? S.fmtINR(r.cpm) : '—'}</td>
-    <td>${S.fmtN(r.leads)}</td>
-    <td>${S.fmtINR(r.revenue)}</td>
+    <td>${drill(r.lead_ids, S.fmtN(r.leads), r.leads + ' leads behind this ad')}</td>
+    <td>${drill(r.lead_ids, S.fmtINR(r.revenue), 'revenue attributed to this ad')}</td>
     <td>${r.roas != null ? r.roas : '—'}</td>
     <td>${S.fmtINR(r.profit)} ${r.wasted ? '<span class="pill r">wasted</span>' : ''}</td>
+    <td class="small">${r.meta_conv > 0 ? `${r.meta_conv} Meta · ${r.our_conv} ours · ${r.conv_delta >= 0 ? '+' : ''}${r.conv_delta}` : '—'}</td>
   </tr>`).join('');
 
   const wasteRows = waste.map((r) => `<tr><td>${S.esc(r.name)}</td><td>${S.fmtINR(r.spend)}</td><td class="muted">${S.fmtN(r.impressions)} imp</td>
     <td>${r.leads} leads</td><td><span class="pill r">0 sales</span></td></tr>`).join('');
 
+  // KPIs: the count numbers link to the leads behind them (fp.lead_ids).
+  const L = fp.lead_ids || {};
   const fv = [
-    ['Ad spend', S.fmtINR(fp.spend)], ['Leads', S.fmtN(fp.leads)],
-    ['CPL', fp.cpl != null ? S.fmtINR(fp.cpl) : '—'], ['Registered', S.fmtN(fp.registered)],
-    ['Attended', S.fmtN(fp.attended)], ['Show-up rate', S.fmtPct(fp.show_up_rate)],
-    ['Calls', S.fmtN(fp.calls)], ['Sales (net)', S.fmtN(fp.paid)], ['Revenue', S.fmtINR(fp.revenue)],
+    ['Leads', drillNum(L.leads, S.fmtN(fp.leads))],
+    ['Registered', drillNum(L.registered, S.fmtN(fp.registered))],
+    ['Attended', drillNum(L.attended, S.fmtN(fp.attended))],
+    ['Calls', drillNum(L.calls, S.fmtN(fp.calls))],
+    ['Sales (net)', drillNum(L.paid, S.fmtN(fp.paid))],
+    ['Revenue (net)', drillNum(L.revenue, S.fmtINR(fp.revenue))],
+    ['Refunded', drillNum(L.refunded, S.fmtN(fp.refunded || 0))],
+    ['Ad spend', S.fmtINR(fp.spend)],
+    ['CPL', fp.cpl != null ? S.fmtINR(fp.cpl) : '—'],
+    ['Show-up rate', S.fmtPct(fp.show_up_rate)],
+    ['Close rate', S.fmtPct(fp.close_rate)],
     ['Cost per sale', fp.cost_per_sale != null ? S.fmtINR(fp.cost_per_sale) : '—'],
-    ['Close rate', S.fmtPct(fp.close_rate)], ['ROAS', ap.total.roas != null ? ap.total.roas : '—'],
+    ['ROAS', ap.total.roas != null ? ap.total.roas : '—'],
   ].map((x) => `<div class="kpi"><div class="l">${x[0]}</div><div class="v" style="font-size:18px">${x[1]}</div></div>`).join('');
 
-  const mixChips = mix.map((m) => `<span class="chip"><b>${S.esc(m.src)}</b> ${m.c}</span>`).join('');
+  const mixChips = mix.map((m) => `<a class="chip" href="/leads?ids=${encodeURIComponent((m.lead_ids || []).join(','))}${clientFilter ? `&client=${clientFilter}` : ''}" title="open ${m.c} leads">${'<b>' + S.esc(m.src) + '</b> ' + m.c}</a>`).join('');
   const attr = fp.attribution;
+  // Meta vs Track table (PRD §5.7): Meta-reported conversions vs our counted leads, per ad + delta.
+  const mvtRows = (mvt.rows || []).map((r) => `<tr>
+    <td><b>${S.esc(r.ad)}</b><div class="small muted">${S.esc(r.campaign || '')}</div></td>
+    <td>${r.meta_conv}</td><td>${r.our_conv}</td>
+    <td class="small">${r.delta > 0 ? '+' + r.delta : r.delta} ${r.delta > 0 ? '<span class="pill m">Meta over</span>' : r.delta < 0 ? '<span class="pill b">Meta under</span>' : '<span class="pill">match</span>'}</td>
+  </tr>`).join('');
+  const exportBtns = (kind, label) => {
+    const q = expQ;
+    return `<div class="row" style="gap:8px;margin-top:8px">
+      <a class="btn sm" href="/export/${kind}${q}&fmt=csv">${label} · CSV</a>
+      <a class="btn sm sec" href="/export/${kind}${q}&fmt=excel">${label} · Excel</a></div>`;
+  };
   const body = `
   <div class="card">
     <div class="row" style="justify-content:space-between">
@@ -332,12 +380,12 @@ function reports(db, user, p) {
     <div class="note">Every sale is credited to one ad by this fixed rule and the report states which rule it used. Sales with no ad click in the window go to <b>Organic / unknown</b>. Every number links to the leads behind it; revenue is net of refunds. ${user.role === 'client' ? '<b>This report is limited to your own client data.</b>' : ''}</div>
   </div>
 
-  <div class="card"><h2>Funnel ${user.role === 'client' ? '(your client)' : clientFilter ? '(selected client)' : '(all clients)'}</h2><div class="grid g4" style="grid-template-columns:repeat(4,1fr)">${fv}</div>
+  <div class="card"><h2>Funnel ${user.role === 'client' ? '(your client)' : clientFilter ? '(selected client)' : '(all clients)'} ${exportBtns('funnel', 'Export funnel')}</h2><div class="grid g4" style="grid-template-columns:repeat(4,1fr)">${fv}</div>
     <div class="small muted" style="margin-top:8px">Attribution buckets: <span class="pill b">${attr.attributed} attributed</span>
       <span class="pill m">${attr.organic} organic/unknown</span> <span class="badge">${settings.attribution_model}</span></div></div>
 
-  <div class="card"><h2>Ad performance</h2>
-    <div class="tabwrap"><table><thead><tr><th>Ad</th><th>Status</th><th>Spend</th><th>Impr.</th><th>Clicks</th><th>CPM</th><th>Leads</th><th>Revenue</th><th>ROAS</th><th>Profit</th></tr></thead>
+  <div class="card"><h2>Ad performance ${exportBtns('report', 'Export ad performance')}</h2>
+    <div class="tabwrap"><table><thead><tr><th>Ad</th><th>Status</th><th>Spend</th><th>Impr.</th><th>Clicks</th><th>CPM</th><th>Leads</th><th>Revenue</th><th>ROAS</th><th>Profit</th><th>Meta vs ours</th></tr></thead>
     <tbody>${adRows || '<tr><td class="muted">No ads pulled yet (Meta pull pending)</td></tr>'}</tbody></table></div>
     <div class="small muted" style="margin-top:8px">Total: spend ${S.fmtINR(ap.total.spend)} · revenue ${S.fmtINR(ap.total.revenue)} · leads ${ap.total.leads} · ROAS ${ap.total.roas ?? '—'} · wasted ads ${ap.total.wasted_ads}</div>
   </div>
@@ -346,10 +394,12 @@ function reports(db, user, p) {
     <div class="card"><h2>Wasted spend <span class="badge">≥ ${settings.wasted_spend_threshold} spend, 0 sales</span></h2>
       <div class="tabwrap"><table><thead><tr><th>Ad</th><th>Spend</th><th>Impr.</th><th>Leads</th><th></th></tr></thead>
       <tbody>${wasteRows || '<tr><td class="muted">No wasted spend</td></tr>'}</tbody></table></div></div>
-    <div class="card"><h2>Lead source mix</h2>${mixChips || '<span class="muted">—</span>'}
-      <h2 style="margin-top:14px">Meta vs Xacqora Track</h2>
-      <div class="small muted">Meta-reported lead events: <b>${fp.attribution.sales_count ?? ''}</b> sales in funnel vs ${attr.organic} unattributed.
-      Compare Meta Ads Manager "Conversions" column against the Ad performance table; the delta is where Meta over/under-reports. (Person-level data never comes back from Meta.)</div>
+    <div class="card"><h2>Lead source mix ${exportBtns('source-mix', 'Export mix')}</h2>${mixChips || '<span class="muted">—</span>'}
+      <h2 style="margin-top:14px">Meta vs Xacqora Track ${exportBtns('meta-vs-track', 'Export')}</h2>
+      ${mvtRows
+        ? `<div class="tabwrap"><table><thead><tr><th>Ad</th><th>Meta conv</th><th>Our leads</th><th>Delta</th></tr></thead><tbody>${mvtRows}</tbody></table></div>
+          <div class="small muted">Meta conversions total <b>${mvt.meta_conv_total}</b> vs our counted leads <b>${mvt.our_conv_total}</b> (delta ${mvt.delta >= 0 ? '+' + mvt.delta : mvt.delta}). ${S.esc(mvt.note)}</div>`
+        : '<div class="small muted">No Meta conversion data yet — run a Meta pull to populate per-ad "Conversions".</div>'}
       </div>
   </div>`;
   return S.layout({ title: 'Reports', nav: S.navFor(user), active: 'reports.html', user, body });
@@ -549,9 +599,41 @@ function portal(db, user, p) {
   const leadsRows = leads.map((r) => `<tr><td><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a></td>
     <td class="small muted">${S.esc(r.client_name || '')}</td><td class="small">${phoneOf(user, r)}</td>
     <td><span class="pill ${stagePillClass(r.stage)}">${S.esc(r.stage)}</span></td></tr>`).join('');
+
+  // R.4: latest auto weekly client summary (generated Monday 9 AM IST by the
+  // ticker) — one page here + a PDF download, zero manual.
+  let weeklyCard = '';
+  if (cid) {
+    const ws = S.weeklySummary(tx, {
+      attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
+      attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
+    }, [cid]);
+    const hasPdf = !!tx.get(`SELECT 1 FROM settings WHERE key=?`, 'weekly_pdf_client_' + cid)?.value;
+    const k = (l, v) => `<div class="kpi"><div class="l">${S.esc(l)}</div><div class="v" style="font-size:16px">${S.esc(v)}</div></div>`;
+    weeklyCard = `
+  <div class="card"><h2>Weekly client summary <span class="badge">auto · every Monday 9 AM IST</span></h2>
+    <div class="grid g4" style="grid-template-columns:repeat(4,1fr)">
+      ${k('Leads', ws.funnel.leads)}
+      ${k('Attended', ws.funnel.attended)}
+      ${k('Paid (net)', ws.funnel.paid)}
+      ${k('Revenue (net of refunds)', S.fmtINR(ws.funnel.revenue))}
+      ${k('Ad spend', S.fmtINR(ws.total.spend))}
+      ${k('ROAS', ws.total.roas != null ? ws.total.roas : '—')}
+      ${k('Profit', S.fmtINR(ws.total.profit))}
+      ${k('Model', ws.settings.model || '—')}
+    </div>
+    <div class="small muted">Top ads: ${ws.ad_top.map((r) => S.esc(r.name)).join(', ') || '—'}</div>
+    ${hasPdf ? `<div style="margin-top:8px"><a class="btn sm" href="/weekly.pdf${user.role === 'client' ? '' : '?client=' + cid}">Download PDF</a>
+      <a class="btn sm sec" href="/export/weekly-summary?client=${cid}&fmt=csv">CSV</a>
+      <a class="btn sm sec" href="/export/weekly-summary?client=${cid}&fmt=excel">Excel</a></div>`
+      : '<div class="small muted">No PDF generated yet (the Monday 9 AM IST job will create it).</div>'}
+  </div>`;
+  }
+
   const body = `
   <h1>Client portal ${user.role === 'client' ? `· ${S.esc(myClients.join(','))}` : ''}</h1>
   <div class="note ${user.role === 'client' ? 'warn' : ''}">${user.role === 'client' ? 'You are in read-only client view. Only your own leads, funnels and reports are visible; export is logged to the audit trail.' : 'Switch to a client role (e.g. arpit@xacqora.local) to preview the client portal.'}</div>
+  ${weeklyCard}
   <div class="card"><h2>My leads</h2><div class="tabwrap"><table>
     <thead><tr><th>Name</th><th>Client</th><th>Phone</th><th>Stage</th></tr></thead>
     <tbody>${leadsRows || '<tr><td class="muted">No leads</td></tr>'}</tbody></table></div></div>`;

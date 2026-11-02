@@ -68,6 +68,40 @@ function roleSeesFullContacts(role) {
   return ['owner', 'admin', 'sales_rep'].includes(role);
 }
 // build a CSV string from an array of row objects; value is masked per user role
+// ---------------------------------------------------------------- Excel export
+// Zero-dep: hand-written SpreadsheetML (the "Excel 2003 XML" format) that
+// Excel / Numbers / LibreOffice all open natively as .xls. PRD §8 "boring tools,
+// by hand" — no SheetJS. Same role-masking as toCsv.
+function toExcel(rows, { sheetName = 'report', role, mask = [] } = {}) {
+  const head = rows.length ? rows[0] : {};
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const cellFor = (v) => {
+    let val = v;
+    const s = String(val == null ? '' : val);
+    const looksNumeric = s !== '' && !isNaN(Number(s)) && isFinite(Number(s)) && /^-?[\d.]+$/.test(s);
+    const numAttr = looksNumeric ? ' DataType="Number"' : '';
+    return `<Cell${numAttr}><Data ss:Type="${looksNumeric ? 'Number' : 'String'}">${esc(val)}</Data></Cell>`;
+  };
+  const dataRows = rows.length
+    ? rows.map((r) => `<Row>${Object.keys(head).map((k) => {
+        let v = r[k];
+        const m = (mask || [])[k];
+        if (m === 'phone') v = roleSeesFullContacts(role) ? v : maskPhone(v);
+        else if (m === 'email') v = roleSeesFullContacts(role) ? v : maskEmail(v);
+        return cellFor(v);
+      }).join('')}</Row>`).join('')
+    : '<Row><Cell><Data ss:Type="String">no rows</Data></Cell></Row>';
+  return `<xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="urn:schemas-microsoft-com:office:office" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet" xmlns:x="urn:schemas-microsoft-com:office:excel">
+</Types>
+<Workbook ss:PrReader="0" xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+<Worksheet ss:Name="${esc(sheetName)}"><Table>
+${Object.keys(head).map((k) => `<Row><Cell ss:StyleID="s62"><Data ss:Type="String">${esc(k)}</Data></Cell></Row>`).join('')}
+${dataRows}
+</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><ProtectObjects>False</ProtectObjects></WorksheetOptions></Worksheet>
+</Workbook>`;
+}
 function toCsv(rows, { role, mask = [] } = {}) {
   if (!rows.length) return 'no rows';
   const keys = Object.keys(rows[0]);
@@ -209,12 +243,24 @@ function funnelReport(tx, clientId, settings, clientIds) {
   const attended = st('Attended') + st('Hot') + st('Call Booked') + st('Paid');
   const calls = st('Call Booked') + st('Paid');
   const paidLeads = st('Paid');
+  const refundedCount = rows.filter((r) => r.refunded_at).length;
   const totalNet = Object.values(rev).reduce((a, b) => a + b, 0);
   const pct = (num, den) => (den ? Math.round((num / den) * 1000) / 10 : null);
   const money = (n) => n ? Math.round(n).toLocaleString('en-IN') : '0';
+  // PRD "every number links to the leads behind it": lead-id lists per bucket.
+  const idsOf = (stages) => rows.filter((r) => stages.includes(r.stage)).map((r) => r.id);
+  const leadIds = {
+    leads: rows.map((r) => r.id),
+    registered: idsOf(['Registered', 'Attended', 'Hot', 'Call Booked', 'Paid', 'Lost']),
+    attended: idsOf(['Attended', 'Hot', 'Call Booked', 'Paid']),
+    calls: idsOf(['Call Booked', 'Paid']),
+    paid: idsOf(['Paid']),
+    revenue: Object.keys(rev),
+    refunded: rows.filter((r) => r.refunded_at).map((r) => r.id),
+  };
   return {
     leads: leadsCount,
-    registered, attended, calls, paid: paidLeads,
+    registered, attended, calls, paid: paidLeads, refunded: refundedCount,
     show_up_rate: pct(attended, registered || 0),
     close_rate: pct(paidLeads, registered || 0),
     spend, cpl: leadsCount ? Math.round(spend / leadsCount) : null,
@@ -222,6 +268,7 @@ function funnelReport(tx, clientId, settings, clientIds) {
     revenue: totalNet,
     cost_per_sale: paidLeads ? Math.round(spend / paidLeads) : null,
     attribution: { attributed, organic, linear_split: linearSplit, sales_count: sales.length },
+    lead_ids: leadIds,
   };
 }
 
@@ -249,12 +296,16 @@ function adPerformance(tx, settings, clientIds) {
   const adIdList = ads.map((a) => a.id).map((x) => `'${String(x).replace(/'/g, '')}'`).join(',');
   // when scoped, the unscoped all-ads fallback must NEVER run (even if the
   // client has zero ads) — otherwise another client's spend would leak in
+  // conv = SUM(s.conversions) = Meta-reported conversions for that ad (PRD §5.7
+  // Meta-vs-Track: compare Meta's number against our counted sales/leads).
   const spends = inClause
     ? (adIdList
-      ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk
+      ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk,
+              COALESCE(SUM(s.conversions),0) conv
           FROM spend_daily s WHERE s.ad_id IN (${adIdList}) GROUP BY s.ad_id`)
       : [])
-    : tx.all(`SELECT ad_id, SUM(spend_inr) spend, SUM(impressions) imp, SUM(clicks) clk FROM spend_daily GROUP BY ad_id`);
+    : tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk,
+              COALESCE(SUM(s.conversions),0) conv FROM spend_daily s GROUP BY s.ad_id`);
   const spendByAd = {}; for (const s of spends) spendByAd[s.ad_id] = s;
 
   // revenue attribution per ad
@@ -287,11 +338,27 @@ function adPerformance(tx, settings, clientIds) {
   for (const tp of leadsTps) {
     if (tp.ad_id) leadsByAd[tp.ad_id] = (leadsByAd[tp.ad_id] || 0) + tp.c;
   }
+  // which leads are attributed to each ad (PRD "every number links to the leads behind it")
+  const leadsIdsByAd = {};
+  for (const s of sales) {
+    if (!s.amount) continue;
+    const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, s.lead_id);
+    const a = attributeSale({ ...s, paid_at: s.paid_at || null, refunded_at: null }, '', settings, tps);
+    let ids;
+    if (a.model === 'linear' && a.bucket === 'Linear (split)') {
+      ids = adClicksInWindow(tps, s.paid_at, win).map((x) => x.ad_id).filter((x) => x && x !== 'unknown');
+    } else if (a.attributed_ad_id && a.attributed_ad_id !== 'unknown') {
+      ids = [a.attributed_ad_id];
+    } else ids = [];
+    for (const id of ids) (leadsIdsByAd[id] = leadsIdsByAd[id] || new Set()).add(s.lead_id);
+  }
+
   const out = [];
   for (const ad of ads) {
-    const sp = spendByAd[ad.id] || { spend: 0, imp: 0, clk: 0 };
+    const sp = spendByAd[ad.id] || { spend: 0, imp: 0, clk: 0, conv: 0 };
     const rev = Math.round(revByAd[ad.id] || 0);
     const leads = leadsByAd[ad.id] || 0;
+    const conv = sp.conv || 0; // Meta-reported conversions for this ad
     const wasted = sp.spend >= Number(settings.wasted_spend_threshold || 0) && rev === 0;
     out.push({
       ad_id: ad.id, name: ad.name, adset: ad.adset_id, campaign: ad.campaign_name,
@@ -301,6 +368,9 @@ function adPerformance(tx, settings, clientIds) {
       cpc: sp.clk ? Math.round(sp.spend / sp.clk) : null, cpm: sp.imp ? Math.round((sp.spend / sp.imp) * 1000) : null,
       leads, revenue: rev, roas: sp.spend ? Math.round((rev / sp.spend) * 100) / 100 : null,
       profit: sp.spend ? rev - sp.spend : null, wasted,
+      // Meta-vs-Track: Meta-reported conversions vs our counted leads, with delta.
+      meta_conv: conv, our_conv: leads, conv_delta: conv - leads,
+      lead_ids: leadsIdsByAd[ad.id] ? [...leadsIdsByAd[ad.id]] : [],
       model,
     });
   }
@@ -338,27 +408,42 @@ function newVsOld(tx, settings, clientIds) {
   };
 }
 function metaVsTracker(tx, settings, clientIds) {
-  // per ad: ad clicks vs our counted conversions (sales attributed)
+  // PRD §5.7 Meta-vs-Track: per ad, Meta-reported conversions (from the spend
+  // pull) vs our counted leads, with a delta column so we see where Meta
+  // over/under-reports. Person-level data never comes back from Meta.
   const ap = adPerformance(tx, settings || {}, clientIds);
-  const inClause = clientIds && clientIds.length ? `WHERE e.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
-  const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id ${inClause} AND e.type='meta_form_lead'`)?.c || 0;
+  // scope through the lead (event has no client_id of its own)
+  const scope = clientIds && clientIds.length ? `l.client_id IN (${clientIds.map((n) => Number(n)).join(',')}) AND` : '';
+  const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id WHERE ${scope} e.type='meta_form_lead'`)?.c || 0;
+  const rows = ap.rows
+    .filter((r) => r.meta_conv > 0 || r.leads > 0)
+    .map((r) => ({
+      ad_id: r.ad_id, ad: r.name, campaign: r.campaign,
+      meta_conv: r.meta_conv, our_conv: r.our_conv, delta: r.conv_delta,
+    }));
+  const tot = rows.reduce((a, r) => { a.meta += r.meta_conv; a.ours += r.our_conv; return a; }, { meta: 0, ours: 0 });
   return {
+    rows,
+    meta_conv_total: tot.meta, our_conv_total: tot.ours, delta: tot.meta - tot.ours,
     meta_lead_total: metaLeadTotal,
     attributed_sales: ap.rows.filter((r) => r.revenue > 0).length,
-    organic: ap.total ? ap.rows.filter((r) => r.bucket === 'Organic / unknown').length : 0,
-    note: 'Compare Meta Ads Manager "Conversions" column against this table; delta = Meta over/under reporting.',
+    organic: ap.rows.filter((r) => r.lead_ids.length === 0 && r.leads > 0).length,
+    note: 'Meta "Conversions" (from the spend pull) vs our counted leads, per ad. delta = Meta − ours; a positive delta means Meta is over-reporting. Person-level data never comes back from Meta.',
   };
 }
 function sourceMix(tx, clientIds) {
   const inClause = clientIds && clientIds.length ? `WHERE l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
-  const rows = tx.all(`
-    SELECT
-      CASE
-        WHEN EXISTS(SELECT 1 FROM event e WHERE e.lead_id=l.id AND e.type='meta_form_lead') THEN 'Meta Instant Form'
-        WHEN l.phone IS NOT NULL OR l.email IS NOT NULL THEN 'Landing page form'
-        ELSE 'Organic / unknown'
-      END src, COUNT(*) c
-    FROM lead l ${inClause} GROUP BY src`);
+  const srcExpr = `CASE
+    WHEN EXISTS(SELECT 1 FROM event e WHERE e.lead_id=l.id AND e.type='meta_form_lead') THEN 'Meta Instant Form'
+    WHEN l.phone IS NOT NULL OR l.email IS NOT NULL THEN 'Landing page form'
+    ELSE 'Organic / unknown'
+  END`;
+  const rows = tx.all(`SELECT ${srcExpr} src, COUNT(*) c FROM lead l ${inClause} GROUP BY src`);
+  // PRD "every number links to the leads behind it": attach the lead-id list
+  // for each source bucket so the mix chips can drill into /leads?ids=…
+  const bySrc = {};
+  for (const r of tx.all(`SELECT l.id, ${srcExpr} src FROM lead l ${inClause}`)) (bySrc[r.src] = bySrc[r.src] || []).push(r.id);
+  for (const r of rows) r.lead_ids = bySrc[r.src] || [];
   return rows;
 }
 function weeklySummary(tx, settings, clientIds) {
@@ -373,6 +458,34 @@ function weeklySummary(tx, settings, clientIds) {
     ad_worst: waste.slice(0, 5),
     total: ap.total,
     note: 'Auto-generated weekly summary. Revenue is net of refunds. Spend matches Meta Ads Manager within 1% when the Meta pull is up to date.',
+  };
+}
+
+// Flatten a weekly summary into { title, sections } for the PDF writer
+// (server/lib/pdf.js) and the portal's "latest weekly summary" card.
+function weeklyPdfLines(ws, clientName = '') {
+  const fp = ws.funnel, ap = ws.total;
+  const money = (n) => (n ? '₹' + Math.round(n).toLocaleString('en-IN') : '₹0');
+  const sec = (heading, lines) => ({ heading, lines });
+  return {
+    title: 'Xacqora Track — Weekly Client Summary' + (clientName ? ' · ' + clientName : ''),
+    sections: [
+      sec('Period / model', [
+        'Generated ' + (ws.generated_at ? ws.generated_at.slice(0, 10) : ''),
+        'Attribution: ' + (ws.settings.model || 'last_paid_click') + ' (' + (ws.settings.window || 30) + 'd window)',
+      ]),
+      sec('Funnel', [
+        'Leads: ' + fp.leads + '   Registered: ' + fp.registered + '   Attended: ' + fp.attended,
+        'Calls: ' + fp.calls + '   Paid: ' + fp.paid + '   Refunded: ' + (fp.refunded || 0),
+        'Revenue (net of refunds): ' + money(fp.revenue),
+        'Spend: ' + money(fp.spend) + '   ROAS: ' + (ap.roas != null ? ap.roas : '—') + '   Profit: ' + money(ap.profit),
+      ]),
+      sec('Top ads by spend', (ws.ad_top || []).map((r) =>
+        `${r.name} — ${money(r.spend)} spend, ${r.leads} leads, ${money(r.revenue)} rev, ROAS ${r.roas ?? '—'}`)),
+      sec('Wasted spend', (ws.ad_worst || []).map((r) =>
+        `${r.name} — ${money(r.spend)} spend, 0 sales`) || ['None']),
+      sec('Note', [ws.note]),
+    ],
   };
 }
 
@@ -557,6 +670,9 @@ function mockMetaPull(adAccounts) {
           impressions: Math.round(rng(3000, 14000) * share * 100) / 100,
           reach: Math.round(rng(2000, 9000) * share * 100) / 100,
           clicks: rng(40, 300),
+          // Meta-reported conversions (synthetic): a fraction of clicks, jittered
+          // a touch so the Meta-vs-Track delta column has something to show.
+          conversions: Math.max(0, Math.round(rng(40, 300) * share * (0.35 + Math.random() * 0.4))),
         });
       }
     }
@@ -566,10 +682,10 @@ function mockMetaPull(adAccounts) {
 
 module.exports = {
   normPhone, normEmail, sha256, capiHashedPhone, capiHashedEmail,
-  buildCapiEvent, buildCapiPayload, maskPhone, maskEmail, roleSeesFullContacts, toCsv,
+  buildCapiEvent, buildCapiPayload, maskPhone, maskEmail, roleSeesFullContacts, toCsv, toExcel,
   DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
   attributeSale, adClicksInWindow, isWithinRange,
-  funnelReport, adPerformance, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary,
+  funnelReport, adPerformance, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary, weeklyPdfLines,
   allowedClients,
   esc, fmtINR, fmtN, fmtPct, fmtDT, layout, NAV, navFor, mockMetaPull,
 };

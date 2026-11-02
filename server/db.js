@@ -35,6 +35,11 @@ function open() {
     const { PgConn, setScope, userScope } = require('./pg');
     const sys = new PgConn(process.env.DATABASE_URL);
     sys.exec(fs.readFileSync(path.join(__dirname, 'schema.pg.sql'), 'utf8'));
+    // Phase R: Meta-reported conversions for the Meta-vs-Track report.
+    // schema.pg.sql already declares the column; this ADD COLUMN IF NOT EXISTS
+    // covers a live db created before it. (DDL is not subject to the FORCE RLS
+    // row policies, so the owner role can alter its own table.)
+    sys.exec(`ALTER TABLE spend_daily ADD COLUMN IF NOT EXISTS conversions INTEGER DEFAULT 0`);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -82,6 +87,9 @@ function open() {
   const u = cols('user');
   if (!u.includes('totp_secret')) db.exec(`ALTER TABLE user ADD COLUMN totp_secret TEXT`);
   if (!u.includes('totp_enabled')) db.exec(`ALTER TABLE user ADD COLUMN totp_enabled INTEGER DEFAULT 0`);
+  // Phase R: Meta-reported conversions for the Meta-vs-Track report.
+  const sd = cols('spend_daily');
+  if (!sd.includes('conversions')) db.exec(`ALTER TABLE spend_daily ADD COLUMN conversions INTEGER DEFAULT 0`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,

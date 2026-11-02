@@ -68,7 +68,9 @@ function timingSafeEqual(a, b) {
 // the ad account row (system-user token preferred).
 async function runLiveMetaPull(acc, { from, to, token, signal }) {
   const acct = acc.ad_account_id;
-  const fields = 'spend,impressions,reach,clicks,link_clicks,video_views,actions';
+  // PRD §5.7 Meta-vs-Track: pull conversions + quality_conversions alongside
+  // spend so the report can compare Meta's self-reported numbers against ours.
+  const fields = 'spend,impressions,reach,clicks,link_clicks,video_views,actions,conversions,quality_conversions';
   const base = `https://graph.facebook.com/v19.0/${acct}/insights`;
   const jobs = [];
   // split the range into <=20-day batches

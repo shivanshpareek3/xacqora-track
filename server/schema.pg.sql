@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS spend_daily (
   ad_id TEXT NOT NULL, date TEXT NOT NULL, ad_account_id TEXT,
   spend DOUBLE PRECISION DEFAULT 0, spend_inr DOUBLE PRECISION DEFAULT 0,
   impressions INTEGER DEFAULT 0, reach INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0,
+  conversions INTEGER DEFAULT 0,
   currency TEXT DEFAULT 'INR',
   PRIMARY KEY (ad_id, date, ad_account_id)
 );
