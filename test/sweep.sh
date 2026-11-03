@@ -23,17 +23,25 @@ curl -s -c "$C" -o /dev/null -X POST -d "email=client@xacqora.local&password=xac
 
 FAILS=0
 echo '--- owner sweep (14 screens + demo + xt.js) ---'
-for p in dashboard.html leads lead/101 pipeline.html "reports.html?model=last_paid_click" "reports.html?model=first_click" "reports.html?model=linear" "reports.html?model=lead_source" meta.html integrations.html duplicates.html admin.html import pilot demo xt.js; do
+for p in dashboard.html leads lead/101 pipeline.html "reports.html?model=last_paid_click" "reports.html?model=first_click" "reports.html?model=linear" "reports.html?model=lead_source" meta.html integrations.html duplicates.html admin.html import pilot alerts.html demo xt.js; do
   code=$(curl -s -b "$O" -o /dev/null -w "%{http_code}" "$BASE/$p")
   [ "$code" != "200" ] && { echo "FAIL owner $p -> $code"; FAILS=$((FAILS+1)); }
 done
 [ "$FAILS" -eq 0 ] && echo "all owner pages -> 200"
 
 echo '--- client must be DENIED team-only screens ---'
-for p in admin.html integrations.html duplicates.html pilot; do
+for p in admin.html integrations.html duplicates.html pilot alerts.html; do
   code=$(curl -s -b "$C" -o /dev/null -w "%{http_code}" "$BASE/$p")
   if [ "$code" = "200" ]; then echo "FAIL client $p is 200 (should be 403)"; FAILS=$((FAILS+1)); else echo "ok client $p -> $code (denied)"; fi
 done
+
+echo '--- Phase H: /health JSON + alerts screen ---'
+HCODE=$(curl -s -b "$O" -o /tmp/xt-health.json -w "%{http_code}" "$BASE/health")
+echo "/health -> $HCODE"; [ "$HCODE" = "200" ] || { echo "FAIL /health not 200"; FAILS=$((FAILS+1)); }
+grep -qE '"ok":[[:space:]]*true' /tmp/xt-health.json && echo "ok /health reports ok:true" || { echo "FAIL /health missing ok"; FAILS=$((FAILS+1)); }
+grep -q '"webhook_failures"' /tmp/xt-health.json && echo "ok /health carries the 5 alert signals" || { echo "FAIL /health missing alert signals"; FAILS=$((FAILS+1)); }
+ACODE=$(curl -s -b "$O" -o /dev/null -w "%{http_code}" "$BASE/alerts.html")
+echo "alerts.html owner -> $ACODE"; [ "$ACODE" = "200" ] || { echo "FAIL owner alerts.html not 200"; FAILS=$((FAILS+1)); }
 
 echo '--- phone masking: client role must never see full phone digits ---'
 M=$(curl -s -b "$C" "$BASE/leads" | grep -cE "9812345678|9822233344|9777788899")

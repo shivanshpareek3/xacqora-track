@@ -205,12 +205,27 @@ function processTrackerEvent(tx, kind, b, client_id) {
 function windowHref() { return null; } // server-side; landing_url from the client is preferred
 
 // ---------------------------------------------------------------- route table
-const server = http.createServer(async (req, res) => {
+// Phase H: the handler is a plain function so a Vercel serverless function can
+// reuse it directly (api/index.js) — Vercel provides req/res in the same
+// node:http shape. `http.createServer`/`listen` only happen when this file is
+// run directly (self-hosted `npm start`), never when imported by the platform.
+async function handleRequest(req, res) {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const parts = u.pathname.replace(/^\/+/, '').split('/').filter(Boolean);
   const user = userFromCookie(db, req.headers.cookie);
   const method = req.method;
   try {
+    // ---------- public /health JSON (monitoring poll, no auth) ----------
+    // Phase H: the alerts screen (/alerts.html, team-only) and any external
+    // uptime dashboard both read the same system-scoped signal snapshot.
+    if (u.pathname === '/health' && method === 'GET') {
+      const tx = makeTx(db, null);
+      const H = require('./lib/health');
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(H.health(tx, db), null, 2));
+      return;
+    }
+
     // ---------- static: xt.js, demo page ----------
     if (u.pathname === '/xt.js' || u.pathname === '/public/xt.js') {
       res.writeHead(200, { 'Content-Type': 'text/javascript', 'Access-Control-Allow-Origin': '*' });
@@ -243,6 +258,12 @@ const server = http.createServer(async (req, res) => {
         'Content-Disposition': `attachment; filename="${path.basename(target)}"`,
       });
       res.end(fs.readFileSync(target));
+      return;
+    }
+
+    // ---------- Phase H: serverless cron tick (token-gated queue drain) ----------
+    if (u.pathname === '/admin/tick' && method === 'POST') {
+      tickEndpoint(res, req);
       return;
     }
 
@@ -433,6 +454,9 @@ const server = http.createServer(async (req, res) => {
         case 'pilot':
           // Phase G: pilot gates tooling — team-only (pilot ops is not client work)
           return guard(screens.pilot(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin', 'media_buyer']);
+        case 'alerts.html':
+          // Phase H: monitoring + prod toggles — team-only ops screen
+          return guard(screens.alerts(db, user, {}), ['owner', 'admin', 'media_buyer']);
         case 'export':
           return exportRoute(res, user, parts, u);
         default:
@@ -590,6 +614,24 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(302, { Location: '/pilot' }); res.end(); return;
       }
 
+      // Phase H: prod toggles from the alerts screen (team-only)
+      if (u.pathname === '/alerts/meta-verify') {
+        if (!['owner', 'admin', 'media_buyer'].includes(user.role)) { send(res, 403, 'forbidden'); return; }
+        const cur = tx.get(`SELECT value FROM settings WHERE key='meta_business_verified'`)?.value;
+        const on = cur !== '1';
+        tx.run(`INSERT INTO settings (key,value) VALUES ('meta_business_verified',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, on ? '1' : '0');
+        audit(db, user, 'alerts.meta_business_verify', 'settings', on ? 'verified' : 'unverified');
+        res.writeHead(302, { Location: '/alerts.html' }); res.end(); return;
+      }
+      if (u.pathname === '/alerts/capi') {
+        if (!['owner', 'admin', 'media_buyer'].includes(user.role)) { send(res, 403, 'forbidden'); return; }
+        const cur = tx.get(`SELECT value FROM settings WHERE key='capi'`)?.value || 'dry';
+        const next = cur === 'live' ? 'dry' : 'live';
+        tx.run(`INSERT INTO settings (key,value) VALUES ('capi',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, next);
+        audit(db, user, 'alerts.capi_toggle', 'settings', `capi -> ${next}`);
+        res.writeHead(302, { Location: '/alerts.html' }); res.end(); return;
+      }
+
       // fallthrough: treat unknown POST as error
       send(res, 400, 'bad route');
       return;
@@ -628,7 +670,11 @@ const server = http.createServer(async (req, res) => {
     console.error('[server]', e);
     try { send(res, 500, 'Internal error: ' + e.message, { 'Content-Type': 'text/plain' }); } catch {}
   }
-});
+}
+
+// The Vercel serverless entry (api/index.js) imports handleRequest directly.
+// Self-hosted `npm start` wires it to a node:http server and listens below.
+const server = http.createServer(handleRequest);
 
 // ---------------------------------------------------------------- S.4: CSV exports
 // Every export is role-masked (phone/email for roles without full contact
@@ -845,7 +891,14 @@ Ravi,+919812345678,ravi@example.com,Mumbai,Paid,9999,1,1,2026-10-20T00:00:00Z"><
 }
 
 // ---------------------------------------------------------------- background ticker
-setInterval(async () => {
+// Phase H: on a Vercel/serverless host the process can scale to zero, so the
+// in-process setInterval is unreliable. Set XT_DISABLE_TICKER=1 there and drive
+// queue drains + scheduled pulls from Vercel Cron hitting POST /admin/tick
+// (gated by the XACQORA_TICK_SECRET header). Plain self-hosted runs keep the
+// interval and never need the endpoint.
+const DISABLE_TICKER = process.env.XT_DISABLE_TICKER === '1';
+async function tickerCycle() {
+  // (body below) — runs either on the interval or via POST /admin/tick
   try {
     const tx = makeTx(db, null); // system ticker: queue + scheduled pulls
     await tick(db, { handleWebhook }, 30);
@@ -904,11 +957,36 @@ setInterval(async () => {
   } catch (e) {
     console.error('[ticker]', e.message);
   }
-}, 5000);
+}
 
-server.listen(PORT, () => {
-  console.log('Xacqora Track demo running on http://localhost:' + PORT);
-  console.log('  UI:        http://localhost:' + PORT + '/signin');
-  console.log('  demo page: http://localhost:' + PORT + '/demo');
-  console.log('  xt.js:     http://localhost:' + PORT + '/xt.js');
-});
+// self-hosted: run the cycle on a 5s interval. serverless: XT_DISABLE_TICKER=1
+// turns the interval off and Vercel Cron POSTs to /admin/tick instead.
+if (!DISABLE_TICKER) setInterval(tickerCycle, 5000);
+
+// Phase H: cron-driven tick for serverless (Vercel). Gated by a shared secret so
+// the queue drain / scheduled pulls can be triggered on demand.
+function tickEndpoint(res, req) {
+  const secret = process.env.XACQORA_TICK_SECRET;
+  if (!secret) { res.writeHead(503, { 'Content-Type': 'text/plain' }); res.end('XACQORA_TICK_SECRET not set'); return; }
+  const provided = req.headers['x-xacqora-tick-secret'] || '';
+  const want = secret;
+  const a = Buffer.from(String(provided)); const b = Buffer.from(want);
+  const ok = (a.length === b.length) && (crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : (provided === want));
+  if (!ok) { res.writeHead(401, { 'Content-Type': 'text/plain' }); res.end('bad tick secret'); return; }
+  tickerCycle().then(() => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); })
+    .catch((e) => { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end(String(e.message || e)); });
+}
+
+// Listen only when this file is the entry point (self-hosted `npm start`),
+// not when it is required by the Vercel serverless function (api/index.js).
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log('Xacqora Track demo running on http://localhost:' + PORT);
+    console.log('  UI:        http://localhost:' + PORT + '/signin');
+    console.log('  demo page: http://localhost:' + PORT + '/demo');
+    console.log('  xt.js:     http://localhost:' + PORT + '/xt.js');
+    if (DISABLE_TICKER) console.log('  ticker: DISABLED (serverless) — drive via POST /admin/tick');
+  });
+}
+
+module.exports = { handleRequest, server, runTickerCycle: tickerCycle };

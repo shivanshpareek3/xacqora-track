@@ -733,11 +733,63 @@ John,+919810000001,john@example.com,Mumbai,Paid,4999,1,1</textarea>
   return S.layout({ title: 'Pilot gates', nav: S.navFor(user), active: 'pilot', user, body });
 }
 
+// Phase H — production alerts/monitoring screen (team-only). Surfaces the
+// five PRD §11 signals from lib/health.js so ops can triage webhook, queue,
+// Meta-pull, CAPI, and backup health at a glance.
+const HLT = require('./lib/health');
+function alerts(db, user, p) {
+  const tx = makeTx(db, null); // operational view: system-scoped (no RLS filter)
+  const h = HLT.health(tx, db);
+  const A = h.alerts;
+  const on = (b) => `<span class="pill ${b ? 'r' : 'g'}">${b ? 'ALERT' : 'ok'}</span>`;
+  const rows = [
+    ['Webhook failures (24h)', on(A.webhook_failures), h.db.webhook_failures_24h + ' failed delivery(ies)'],
+    ['Queue age > 10 min', on(A.queue_age_over_10min), h.db.queue.stale_over_10min + ' stale job(s), ' + h.db.queue.pending + ' pending, oldest due ' + h.db.queue.age_min + 'm ago'],
+    ['Meta pull failures', on(A.meta_pull_failures), h.db.meta_pull_failures.length ? h.db.meta_pull_failures.map((m) => m.ad_account + ': ' + m.error).join('; ') : 'no errors recorded'],
+    ['CAPI send failures', on(A.capi_send_failures), h.db.capi_stuck_unsent + ' event(s) still unsent (' + h.db.capi_suppressed_refund + ' suppressed for refunds)'],
+    ['Backup (daily)', on(!A.backup_not_recorded), h.db.backup.last_date ? 'last ' + h.db.backup.last_date + ' · ' + (h.db.backup.latest_file || '') : 'no daily backup recorded yet'],
+  ];
+  const m = h.mode;
+  const modePills = [
+    ['live mode', m.live ? 'ON' : 'OFF', m.live],
+    ['CAPI', m.capi === 'live' ? 'live' : 'dry', m.capi === 'live'],
+    ['secrets key', m.secret_key_set ? 'set' : 'INSECURE DEV KEY', m.secret_key_set],
+    ['Meta business', m.meta_business_verified ? 'verified' : 'not verified', m.meta_business_verified],
+  ].map((x) => `<span class="badge ${x[2] ? 'g' : 'm'}">${S.esc(x[0])}: ${S.esc(x[1])}</span>`).join(' ');
+  const body = `
+  <h1>Monitoring & alerts <span class="badge">Phase H</span></h1>
+  <div class="note">Production signal board (PRD §11). Five checks; a red pill means that signal is
+    currently breaching. <a href="/health">/health JSON</a> for dashboards. Engine: <b>${S.esc(h.engine)}</b> · ${modePills}</div>
+
+  <div class="card"><h2>Signal checks</h2>
+    <div class="tabwrap"><table><thead><tr><th>Signal</th><th></th><th>Detail</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr><td>${S.esc(r[0])}</td><td>${r[1]}</td><td class="small">${S.esc(r[2])}</td></tr>`).join('')}</tbody></table></div>
+    ${h.db.webhook_failures.length ? `<div style="margin-top:12px"><h2>Recent webhook failures</h2>
+      <div class="tabwrap"><table><thead><tr><th>Platform</th><th>Client</th><th>Ref</th><th>Error</th><th>At</th></tr></thead>
+      <tbody>${h.db.webhook_failures.map((f) => `<tr><td>${S.esc(f.platform)}</td><td>${S.esc(f.client)}</td>
+        <td class="small">${S.esc(f.ref || '—')}</td><td class="small">${S.esc(f.error || '—')}</td><td class="small">${S.esc(f.at || '—')}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
+  </div>
+
+  <div class="card"><h2>Prod toggles</h2>
+    <div class="note">These gate the live-pilot cutover (see <a href="/pilot-live-checklist">checklist</a>).
+      Live mode (webhook signatures + outbound Meta) is controlled by the <code>XACQORA_LIVE</code> env var;
+      the Meta business-verification flag is a DB setting toggled here.</div>
+    <div class="row" style="gap:10px">
+      <form method="post" action="/alerts/meta-verify"><button class="btn sm ${m.meta_business_verified ? 'sec' : ''}">${m.meta_business_verified ? 'Mark Meta business unverified' : 'Mark Meta business verified'}</button></form>
+      <form method="post" action="/alerts/capi"><button class="btn sm sec">Flip CAPI to ${m.capi === 'live' ? 'dry-run' : 'live'}</button></form>
+    </div>
+    ${m.xt_subdomain ? `<div class="small muted" style="margin-top:8px">xt.js served at ${S.esc('https://' + m.xt_subdomain + '/xt.js')} for third-party CSP pages.</div>`
+      : `<div class="small muted" style="margin-top:8px">Set <code>XACQORA_XT_SUBDOMAIN</code> (or host xt.js on your own subdomain) so third-party CSP pages can load it.</div>`}
+  </div>
+  `;
+  return S.layout({ title: 'Alerts', nav: S.navFor(user), active: 'alerts.html', user, body });
+}
+
 function notFound(user) {
   return S.layout({ title: 'Not found', nav: S.navFor(user), active: '', user, body: '<div class="card"><h1>Not found</h1><div class="muted">That lead does not exist.</div></div>' });
 }
 
 module.exports = {
-  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, duplicates, admin, portal, pilot,
+  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, duplicates, admin, portal, pilot, alerts,
   stagePillClass, notFound,
 };

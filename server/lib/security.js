@@ -143,8 +143,14 @@ function rateLimit(key, maxPerWindowSec, nowMs = Date.now()) {
 // for tests only
 function _resetRateLimit() { _rl.clear(); }
 
+// Phase H: prod toggle / health signal — true when XACQORA_SECRET_KEY is set to
+// a valid 32-byte key (false = the insecure dev fallback is in effect).
+function keySecure() {
+  return masterKey().secure;
+}
+
 module.exports = {
-  encryptSecret, decryptSecret,
+  encryptSecret, decryptSecret, keySecure,
   isTeam, allowedClientIds, canAccessClient, TEAM_ROLES,
   totpSecret, totpCode, totpVerify, otpauthUri,
   rateLimit, _resetRateLimit,

@@ -2,6 +2,70 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-03 (Phase H — production hosting prep)
+
+Production-ready prep: Vercel + managed Postgres (Mumbai) one-command deploy,
+staging prod-mirror gate, monitoring, prod security re-verify. Green on BOTH
+engines after (all 7 unit suites + replay + sweep 0 failures); `scripts/staging.sh`
+run green end-to-end on a throwaway PG db; `scripts/prod-verify.sh` passes every
+check except owner-2FA (expected — that's the pre-cutover gate, not a dev check).
+
+### 1. `/health` JSON + `/alerts.html` screen (`server/lib/health.js` + `screens.alerts`)
+- **`GET /health`** (public, no-store) — `ok`, `engine`, `ts`, mode flags
+  (live/mock/`secret_key_set` via new `security.keySecure()`/CAPI/meta-business-
+  verified/xt subdomain), and the five PRD §11 signals: webhook failures 24 h,
+  queue age >10 min (engine-agnostic — keyed off the `job.next_run_at` epoch
+  column), Meta pull failures (`meta_ad_account.last_error`), CAPI stuck-unsent
+  events, last daily backup + latest backup file.
+- **`/alerts.html`** (team-only, 403 for client — swept) — signal board with
+  PASS/ALERT pills, recent webhook-failure rows, prod toggles (Meta business
+  verification flag + CAPI live/dry flips, both audit-logged), xt.js subdomain
+  display. New POST routes `/alerts/meta-verify` + `/alerts/capi`.
+- `security.js` gains `keySecure()` so the "secrets prod-only" check is
+  meaningful (the insecure dev fallback is now a visible red pill, not silent).
+
+### 2. Serverless-safe app + Vercel wiring (`api/index.js`, `vercel.json`)
+- `server/index.js` refactored: the request handler is `handleRequest` (exported),
+  `server.listen` runs only when the file is the entry point (`require.main`) —
+  so `api/index.js` (one line: `module.exports = require('../server').handleRequest`)
+  is the Vercel function and the `node:http` req/res shapes match natively.
+- **Vercel Cron → `POST /admin/tick`** every 5 min (gated by the
+  `XACQORA_TICK_SECRET` header, timing-safe compare) replaces the in-process
+  ticker on a scale-to-zero host; `XT_DISABLE_TICKER=1` turns the interval off
+  (self-hosted `npm start` keeps the interval, endpoint optional there).
+- `vercel.json`: catchall rewrite → `/api`, 60s maxDuration, the cron entry.
+
+### 3. Staging gate (`scripts/staging.sh`)
+- Throwaway `xacqora_staging` PG db (fake data only — privacy rule), prod-mirror
+  config (pg engine + generated `XACQORA_SECRET_KEY` + prod rate limits) →
+  full backend suite (reports/security/liveapi/xt-queue/isolation/gates) +
+  replay + sweep + backup/restore drill. `STAGING PASS` = prod will mechanically
+  pass. **Run and green this session.**
+
+### 4. Prod security re-verify (`scripts/prod-verify.sh`)
+- Phase S checklist against the prod cluster, read-only: engine=pg, FORCE RLS
+  binding (scoped conn sees only its client), `XACQORA_SECRET_KEY` set
+  (prod-only secrets), owner 2FA enrolled, audit_log live, daily backup +
+  monthly restore drill on THIS cluster, `/health` clean (when `APP_URL` set),
+  prod toggles state. `PROD VERIFY PASS` is the entry condition for the
+  live-pilot cutover.
+
+### 5. Deploy doc + env reference (`docs/deploy.md`, `.env.example`)
+- Topology (Vercel function + Mumbai Postgres + `track.` subdomain for xt.js on
+  CSP pages), role design (non-super `xacq_app` binds FORCE RLS; super
+  `xacq_backup` dump-only), full env-var table with prod values, the `vercel
+  deploy --prod` one-command sequence, rollback (additive schema = both
+  directions boot), and the 4-step live-pilot cutover (LIVE flag, secrets,
+  `capi=live`, prod-verify + checklist).
+
+### 6. Test wiring
+- `test/sweep.sh` gains: `/alerts.html` (owner 200, client 403) + `/health`
+  (200, `ok:true`, all five signal fields present).
+
+**Done per the fast-track:** deploy docs + staging config + monitoring
+committed; one command can prod-deploy once the budget decision (Arpit §6)
+lands. Next session: Phase F frontend upgrade.
+
 ## 2026-11-03 (Phase G — pilot gates tooling)
 
 Pilot-ready self-verification on fake/pilot-mock data, green on BOTH engines

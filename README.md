@@ -68,6 +68,9 @@ Sign in, Meta spend, Weekly summary.
 - `docs/meta-spend-capi.md` — spend pull + CAPI push (dedup, hashing, PRD rules)
 - `docs/reports-attribution.md` — 4 models, 7 reports, settings keys
 - `docs/auth-security.md` — roles, masking, client isolation, audit
+- `docs/pilot-tooling.md` — Phase G: CSV import, URL checker, gate suite, accuracy checkers
+- `docs/pilot-live-checklist.md` — live-pilot runbook (who/where/pass-fail per step)
+- `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 
 ## Tests
 
@@ -84,6 +87,10 @@ node test/gates.js     # Phase G pilot tooling: CSV import, URL checker, G1–G4
 # backups (Phase S / PRD §10)
 node scripts/backup.js      # WAL-safe VACUUM INTO snapshot -> backups/ (keep 7)
 bash scripts/restore-drill.sh  # restore newest snapshot to a fresh dir, assert table counts
+
+# Phase H: production prep
+bash scripts/staging.sh     # prod-mirror config on a throwaway PG db: full suite + sweep + backup/restore
+bash scripts/prod-verify.sh # Phase S checklist re-verified on the prod Postgres cluster (runbook in docs/deploy.md)
 ```
 
 `test-samples/*.json` are saved sample payloads (fake data — never real client data).

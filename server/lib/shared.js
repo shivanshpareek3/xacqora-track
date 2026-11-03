@@ -615,7 +615,7 @@ function navFor(user) {
   const n = [];
   if (user.role !== 'viewer') n.push({ path: 'dashboard.html', label: 'Dashboard' });
   n.push({ path: 'leads.html', label: 'Leads' }, { path: 'pipeline.html', label: 'Pipeline' }, { path: 'reports.html', label: 'Reports' }, { path: 'meta.html', label: 'Meta' });
-  if (['owner', 'admin', 'media_buyer'].includes(user.role)) n.push({ path: 'integrations.html', label: 'Integrations' }, { path: 'pilot', label: 'Pilot' });
+  if (['owner', 'admin', 'media_buyer'].includes(user.role)) n.push({ path: 'integrations.html', label: 'Integrations' }, { path: 'pilot', label: 'Pilot' }, { path: 'alerts.html', label: 'Alerts' });
   if (user.role === 'owner' || user.role === 'admin') n.push({ path: 'duplicates.html', label: 'Duplicates' }, { path: 'admin.html', label: 'Admin' });
   return n;
 }
