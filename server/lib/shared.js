@@ -526,6 +526,8 @@ function css() {
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}
 a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
 .top{display:flex;align-items:center;gap:18px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.demo-band{padding:6px 16px;background:#2a2410;color:#f5d98a;border-bottom:1px solid #4a3d14;font-size:12px;letter-spacing:.2px}
+.demo-band:hover{background:#332b12}
 .brand{font-weight:700;font-size:15px;letter-spacing:.3px}
 .brand span{color:var(--blue)}
 .nav{display:flex;gap:2px;flex-wrap:wrap}
@@ -586,6 +588,13 @@ form.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 footer{color:var(--mut);font-size:11px;text-align:center;padding:18px}
 `;
 }
+// Master v7 §1.4/§6: the honest demo-data label. Shown while the app runs in
+// mock mode (every figure is seed fixture data); once XACQORA_LIVE=1 flips the
+// build to real gateways/Meta, the band disappears and the numbers become real.
+function layoutDemoBand() {
+  if (require('./liveapi').liveMode()) return '';
+  return `<div class="demo-band" title="Mock mode: every figure on these screens comes from the seed fixtures, not a live gateway or Meta pull.">Demo data — the live pilot will show real numbers.</div>`;
+}
 function layout({ title, nav, active, user, body, notes = '' }) {
   const links = nav.map((n) => `<a href="/${n.path}" class="${n.path === active ? 'on' : ''}">${esc(n.label)}</a>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -596,6 +605,7 @@ function layout({ title, nav, active, user, body, notes = '' }) {
   <div class="nav">${links}</div>
   <div class="userbox"><b>${esc(user.name)}</b>${esc(user.role)}${user.clientNames ? ' · ' + esc(user.clientNames.join(', ')) : ''}<br><a href="/signout">Sign out</a></div>
 </div>
+${layoutDemoBand()}
 <main>${notes}${body}</main>
 <footer>Xacqora Track demo build · SQLite + Node ${process.versions.node} · all webhooks verified with secret · CAPI events deduplicated by event_id</footer>
 </body></html>`;

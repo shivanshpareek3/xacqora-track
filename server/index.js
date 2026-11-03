@@ -226,6 +226,43 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // ---------- Phase F: the SPA (public/app). The shell is auth-gated:
+    // unauthenticated GET /app 302s to /signin (same as the HTML screens).
+    // Assets under /app are served by extension (hashed JS/CSS/SVG).
+    if (u.pathname === '/app' || u.pathname === '/app/' || u.pathname === '/app/index.html') {
+      if (!user) { res.writeHead(302, { Location: '/signin' }); res.end(); return; }
+      const shell = path.join(__dirname, '..', 'public', 'app', 'index.html');
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' });
+      res.end(fs.readFileSync(shell));
+      return;
+    }
+    if (u.pathname.startsWith('/app/') && method === 'GET') {
+      const clean = path.normalize(u.pathname).replace(/^([.][.])+([\/\\]|$)/g, ''); // no traversal
+      const file = path.join(__dirname, '..', 'public', clean);
+      if (!fs.existsSync(file) || !fs.statSync(file).isFile() || !file.startsWith(path.join(__dirname, '..', 'public', 'app'))) {
+        send(res, 404, 'not found'); return;
+      }
+      const ext = path.extname(file).toLowerCase();
+      const type = { '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.woff': 'font/woff' }[ext] || 'application/octet-stream';
+      // the SPA is a dev/demo build with no CDN: no-cache so a rebuild is
+      // never served stale. (Vercel/static hosts can add content-hashing later.)
+      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+      res.end(fs.readFileSync(file));
+      return;
+    }
+
+    // ---------- Phase F: JSON API for the SPA. Cookie-authenticated,
+    // role-aware + RLS-scoped (lib/api.js). The HTML routes above stay the
+    // fallback and render the same data.
+    if (u.pathname.startsWith('/api/app/')) {
+      const app = require('./lib/api');
+      const { json: body } = method === 'POST' ? await parseBody(req) : { json: null };
+      if (method === 'GET') app.api.get(u, db, user, res);
+      else if (method === 'POST') app.api.post(u, body, db, user, res, req);
+      else { res.writeHead(405, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'method not allowed' })); }
+      return;
+    }
+
     // ---------- static: xt.js, demo page ----------
     if (u.pathname === '/xt.js' || u.pathname === '/public/xt.js') {
       res.writeHead(200, { 'Content-Type': 'text/javascript', 'Access-Control-Allow-Origin': '*' });

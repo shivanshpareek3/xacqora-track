@@ -42,6 +42,11 @@ done
 "${PSQL_SUPER[@]}" -d postgres -v ON_ERROR_STOP=1 -Atc "CREATE DATABASE $APP_DB OWNER $APP_ROLE;" >/dev/null
 # Superuser backup role: pg_dump/pg_restore must bypass RLS to export the
 # forced-RLS tables, so the backup path connects as this role only.
+# CREATE ROLE has no IF NOT EXISTS clause; the role survives the db drop above
+# on a re-run, so drop-then-create keeps the provision idempotent (the role is
+# dump-only and holds nothing of its own, so dropping it is always safe).
+"${PSQL_SUPER[@]}" -d postgres -v ON_ERROR_STOP=0 -Atc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='$BACKUP_ROLE' AND pid<>pg_backend_pid();" >/dev/null
+"${PSQL_SUPER[@]}" -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS $BACKUP_ROLE;" >/dev/null
 "${PSQL_SUPER[@]}" -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE $BACKUP_ROLE LOGIN SUPERUSER;" >/dev/null
 echo "created db $APP_DB owned by $APP_ROLE (non-superuser); backup role $BACKUP_ROLE (superuser, dump-only)"
 

@@ -2,6 +2,58 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-03 (Phase F close-out — polished SPA, dual-engine green, tour + screenshots)
+
+Closed out the Phase F frontend (the SPA the Phase F session built in-tree but
+had not committed/verified on Postgres). Green on BOTH engines: 7 backend
+suites + the headless `test/spa.js` (42 assertions: role-aware masking,
+client scoping, 403 on team-only endpoints) + replay + sweep = 0 failures on
+SQLite and on a clean Postgres re-provision.
+
+### What landed
+- **Demo-data banner (master v7 §1.4/§6)** — an honest "Demo data — the live
+  pilot will show real numbers" band on every screen, in BOTH UIs:
+  - classic screens: `layoutDemoBand()` in `server/lib/shared.js` (a yellow
+    band under the nav).
+  - SPA: the API's `me` now returns `demo: !liveapi.liveMode()`, and the SPA
+    chrome renders the band only when `demo` is true.
+  - The band is **mode-driven, not static**: it shows in mock mode and
+    disappears automatically the moment `XACQORA_LIVE=1` flips the build to
+    real gateways/Meta — so a screenshot taken live is unambiguously real.
+- **SPA data-layer fixes (found while screenshotting):**
+  - `renderDashboard` never called `clear(main)` after the API resolved, so a
+    stuck "Loading…" card sat above the dashboard. Fixed.
+  - The `h()` DOM helper in `public/app/ui.js` had no `selected` handling and
+    option elements passed `'selected'` as a child (rendered as literal text
+    "…(default)selected") plus no attribute, so every `<select>` silently fell
+    back to its first option (Window showed "7d" while the banner said "30d").
+    Added a `selected` case to `h()` and converted all 10 option call-sites to
+    `selected: <cond>` in attrs.
+- **Deterministic demo seed** (the Phase F session's `scripts/seed.js`): 26
+  leads across every stage, 8 deals (incl. refunds + a failed payment),
+  ad-click touchpoints, Meta campaigns/adsets/ads for 2 accounts, 14 days of
+  per-ad spend, CAPI log, webhook log, and a duplicate pair — all via
+  `rnd(seed)` so both engines show identical numbers and every screen is
+  populated on a fresh open (no empty states).
+- **Tour + screenshots** — `docs/frontend-tour.md` (open-it, the
+  dashboard→portal walk-through, role-aware/honest-label notes, file map) and
+  `scripts/screenshots.js` (zero-dep CDP driver over the cached headless
+  Chrome + Node 24's built-in WebSocket; captures the 5 pilot screens as
+  `docs/screenshots/shot-*.png`). Two `/reports` crops are made distinct by
+  document-offset `clip` (the headless shell's clip is document-anchored and
+  ignores scroll, so the ad-performance crop targets the per-ad card's Y).
+- **Provisioner idempotency fix** — `scripts/pg-provision.sh`: `CREATE ROLE`
+  has no `IF NOT EXISTS` clause in Postgres, so a re-run on a cluster where
+  the backup role survives the db drop failed. Now drop-then-create (the
+  backup role is dump-only and holds nothing of its own, so dropping is safe).
+
+### Honest note for the pilot (master v7 §6)
+Every number on these screens is demo data until the §6 decisions + prod
+cutover happen; the demo-data band is the thing to show alongside any
+screenshot. After this: pilot cutover is a ~30-min task the moment Arpit's
+§6 answers (name, 3–4 clients, owner/dev, hosting budget, default
+attribution, call-logging, live-secret owner) land.
+
 ## 2026-11-03 (Phase H — production hosting prep)
 
 Production-ready prep: Vercel + managed Postgres (Mumbai) one-command deploy,

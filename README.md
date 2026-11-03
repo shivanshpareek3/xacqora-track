@@ -71,6 +71,7 @@ Sign in, Meta spend, Weekly summary.
 - `docs/pilot-tooling.md` — Phase G: CSV import, URL checker, gate suite, accuracy checkers
 - `docs/pilot-live-checklist.md` — live-pilot runbook (who/where/pass-fail per step)
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
+- `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
 
 ## Tests
 
