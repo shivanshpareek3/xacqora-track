@@ -2,6 +2,73 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-03 (Meta live connect — pull only, CAPI dry-run; .env bridge)
+
+The task asked for "fill the .env Meta section and be done." Reading the code
+first (task rule: code is the authority) revealed the token is **not** an env
+var the pull path reads — it is stored **per ad account** in
+`meta_ad_account.token` (encrypted at rest via `security.encryptSecret`,
+keyed by `XACQORA_SECRET_KEY`), and the only live-mode env var is
+`XACQORA_LIVE` (+ `MOCK`). So a bare `.env` with `META_ACCESS_TOKEN=` would do
+nothing. This task wires the missing bridge so the requested workflow works.
+
+### What landed
+- **`.env` (gitignored, `git check-ignore` passes)** — copy of the
+  `.env.example` template with a **META LIVE** section: `META_ACCESS_TOKEN`,
+  `META_AD_ACCOUNT_IDS` (comma-separated `ACT_` ids), optional
+  `META_PIXEL_ID`/`META_AD_ACCOUNT_NAME`/`META_CLIENT_ID`; each with a
+  "kahan se milega" comment. Prod placeholders (Postgres URL, `PG_BACKUP_USER`,
+  `XACQORA_SECRET_KEY`) left empty until cutover. Real values never committed
+  and never pasted into chat.
+- **`server/lib/env.js`** — zero-dep `.env` loader (the app had no dotenv).
+  Fills `process.env` only for keys not already set, so real env / Vercel
+  dashboard vars always win. Loaded first in `server/index.js`.
+- **`server/lib/metalive.js`** — the **env → DB bootstrap**:
+  `syncMetaAccountsFromEnv` upserts `meta_ad_account` rows (token **encrypted**
+  at rest, `status='connected'`, pixel) for each id in `META_AD_ACCOUNT_IDS`;
+  a blank `.env` is a no-op (dev stays mock). Also `classifyMetaError` (401 →
+  "regenerate token"; 200/permission → "assign the account"; network →
+  "retries with backoff") and `metaTokenExpiry` (expired / expiring-within-48h
+  flags from a new `meta_ad_account.token_expires_at` column).
+- **`server/index.js`** — calls the bootstrap on startup (`[meta-live] …` log
+  line when values are present).
+- **`server/schema.sql` + `schema.pg.sql` + `db.js`** — additive
+  `meta_ad_account.token_expires_at TEXT` (idempotent migration for live DBs).
+- **`/health` + `/alerts.html`** — a "Meta token expiry" signal row + friendly
+  (classified) Meta-pull-failure lines, so a bad token is actionable, not a
+  raw dump.
+- **`scripts/meta-validate.js`** — offline-safe. No token → prints the 3-point
+  "grab-from-Meta" steps and exits 0. With a token → `GET /me` + `/me/adaccounts`
+  (lists accessible `ACT_` ids, flags any not in `META_AD_ACCOUNT_IDS`) +
+  `/debug_token` (prints `expires_at`, records it on the account rows for the
+  `/alerts` warning).
+- **`test/metalive.js`** (both engines) — env→DB upsert + encrypted-at-rest +
+  idempotent re-sync; blank `.env` no-op; `liveMode()` `XACQORA_LIVE`/`MOCK`
+  gating; **CAPI dry-run by default**; error-classifier + expiry signals.
+- **Docs** — `docs/meta-live-connect.md` (architecture, 3-point list, live-pull
+  test + ≤1% spend gate, the CAPI dry-run rule); `.env.example` + `README.md`
+  get the "create `.env` for local dev (values from your secret manager), never
+  commit" line; test + module-doc entries in the README index.
+
+### CAPI stays dry-run (explicit task rule)
+No code change flips it on: the gate is `settings.capi` (seeded `dry`) re-checked
+by `liveMode()` + a real row token. Keep `settings.capi='dry'` (the alerts
+screen's toggle) — live CAPI is a pilot-cutover step only.
+
+### Live-pull test (task 3, human + real data)
+Not run here — needs a real token + network (never in chat). Runbook is
+`docs/meta-live-connect.md`: fill `.env` with **one** `ACT_`, set
+`XACQORA_LIVE=1` + a real `XACQORA_SECRET_KEY`, restart, watch `/alerts` +
+`/meta.html → Pull now`; pass = `spend_daily` rows, spend within **≤1%** of
+Meta Ads Manager, and Reports → Meta-vs-Track showing real conversions. Add
+the other accounts once the first is green.
+
+### Verification
+`test/metalive.js` + the full existing suite green on BOTH engines (SQLite:
+8 suites incl. `metalive` PASS + server boot no-op confirmed; Postgres:
+provision + all suites incl. `metalive` + replay + sweep, in progress at
+commit time). **Commit is code/docs/tests only — `.env` is never committed.**
+
 ## 2026-11-03 (Phase F close-out — polished SPA, dual-engine green, tour + screenshots)
 
 Closed out the Phase F frontend (the SPA the Phase F session built in-tree but

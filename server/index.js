@@ -1,4 +1,8 @@
 // Xacqora Track demo server: zero-dependency Node 24 (node:sqlite built in).
+// Load .env FIRST (before anything reads process.env — DATABASE_URL, the
+// META_* bootstrap values, XACQORA_LIVE, XACQORA_SECRET_KEY all live there
+// for local dev). Real env vars always win; no .env = pure mock/dev.
+require('./lib/env').loadEnvFile();
 const http = require('node:http');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -16,6 +20,22 @@ const screens = require('./screens');
 
 const db = open();
 ensureCapiLogTable(db);
+
+// Meta live connect (env -> DB bridge): if the operator filled META_ACCESS_TOKEN
+// + META_AD_ACCOUNT_IDS in .env, upsert the encrypted token onto those ad-account
+// rows now so the live pull has it. No-op when the values are blank/absent (dev).
+{
+  const sys = makeTx(db, null);
+  const ml = require('./lib/metalive');
+  const notes = ml.syncMetaAccountsFromEnv(sys, {
+    token: process.env.META_ACCESS_TOKEN,
+    adAccountIds: (process.env.META_AD_ACCOUNT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    pixelId: process.env.META_PIXEL_ID || null,
+    name: process.env.META_AD_ACCOUNT_NAME || null,
+    clientId: process.env.META_CLIENT_ID,
+  });
+  for (const n of notes) console.log('[meta-live] ' + n);
+}
 
 const PORT = Number(process.env.PORT || 4100);
 

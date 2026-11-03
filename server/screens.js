@@ -742,10 +742,13 @@ function alerts(db, user, p) {
   const h = HLT.health(tx, db);
   const A = h.alerts;
   const on = (b) => `<span class="pill ${b ? 'r' : 'g'}">${b ? 'ALERT' : 'ok'}</span>`;
+  const mt = h.db.meta_token || { expired: 0, expiringSoon: 0, tracked: 0, note: '' };
+  const tokenAlert = mt.expired > 0 || mt.expiringSoon > 0;
   const rows = [
     ['Webhook failures (24h)', on(A.webhook_failures), h.db.webhook_failures_24h + ' failed delivery(ies)'],
     ['Queue age > 10 min', on(A.queue_age_over_10min), h.db.queue.stale_over_10min + ' stale job(s), ' + h.db.queue.pending + ' pending, oldest due ' + h.db.queue.age_min + 'm ago'],
-    ['Meta pull failures', on(A.meta_pull_failures), h.db.meta_pull_failures.length ? h.db.meta_pull_failures.map((m) => m.ad_account + ': ' + m.error).join('; ') : 'no errors recorded'],
+    ['Meta pull failures', on(A.meta_pull_failures), h.db.meta_pull_failures.length ? h.db.meta_pull_failures.map((m) => m.ad_account + ': ' + m.reason).join('; ') : 'no errors recorded'],
+    ['Meta token expiry', on(tokenAlert), S.esc(mt.note)],
     ['CAPI send failures', on(A.capi_send_failures), h.db.capi_stuck_unsent + ' event(s) still unsent (' + h.db.capi_suppressed_refund + ' suppressed for refunds)'],
     ['Backup (daily)', on(!A.backup_not_recorded), h.db.backup.last_date ? 'last ' + h.db.backup.last_date + ' · ' + (h.db.backup.latest_file || '') : 'no daily backup recorded yet'],
   ];

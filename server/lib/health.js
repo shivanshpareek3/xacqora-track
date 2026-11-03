@@ -81,7 +81,16 @@ function health(tx, db) {
         platform: r.platform, client: r.client_id, ref: r.ref, error: r.error, at: r.ingested_at,
       })),
       queue: { pending, age_min: queueAgeMin, stale_over_10min: queueStale },
-      meta_pull_failures: metaFails.map((r) => ({ ad_account: r.ad_account_id, name: r.name, error: r.last_error, last_pull_at: r.last_pull_at })),
+      // friendly, operator-facing classification of each raw pull error
+      // (401 vs permission vs network) so /alerts is actionable, not a raw dump
+      meta_pull_failures: metaFails.map((r) => ({
+        ad_account: r.ad_account_id, name: r.name, error: r.last_error,
+        reason: require('./metalive').classifyMetaError(r.last_error),
+        last_pull_at: r.last_pull_at,
+      })),
+      // token expiry (recorded by scripts/meta-validate.js into the
+      // meta_ad_account.token_expires_at column; live-token-aware alerting)
+      meta_token: require('./metalive').metaTokenExpiry(tx),
       capi_stuck_unsent: capiStuck,
       capi_suppressed_refund: capiSuppressed,
       backup: { last_date: lastBackup ? lastBackup.value : null, latest_file: latestBackupFile },

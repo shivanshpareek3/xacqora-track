@@ -22,6 +22,14 @@ npm run seed     # one-time: users, 2 clients, 2 ad accounts, sample leads
 npm start        # http://localhost:4100/signin   (password: xacqora)
 ```
 
+**`.env` (local dev)** — copy `.env.example` → `.env` and fill it. Real secret
+values (Meta token, Postgres URL, AES key) come from your secret manager and are
+**never committed** (`.env` is gitignored; `.env.example` is the committed
+template). The app loads `.env` on startup; real env vars always win. For a live
+Meta spend pull, fill only the `META_*` values — see
+[docs/meta-live-connect.md](docs/meta-live-connect.md) (the 3-point
+"what to grab from Meta" list + the live-pull test).
+
 Demo users (all password `xacqora`):
 
 | email | role |
@@ -72,6 +80,7 @@ Sign in, Meta spend, Weekly summary.
 - `docs/pilot-live-checklist.md` — live-pilot runbook (who/where/pass-fail per step)
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 - `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
+- `docs/meta-live-connect.md` — Meta live connect (pull only, CAPI dry-run): the 3-point "what to grab from Meta" list, `.env`→DB token bridge, live-pull test + ≤1% spend gate, `/alerts` token-expiry + friendly failure lines
 
 ## Tests
 
@@ -84,6 +93,7 @@ node test/isolation.js # DB-layer client-isolation proof: canary renders + query
 node test/xt-queue.js  # xt.js survives the API being down (nothing lost)
 node test/liveapi.js   # Razorpay/Cashfree gateway signatures (verified spec)
 node test/gates.js     # Phase G pilot tooling: CSV import, URL checker, G1–G4, accuracy checkers
+node test/metalive.js  # Meta live-connect bridge: .env->DB token sync, liveMode gate, CAPI dry, /alerts signals
 
 # backups (Phase S / PRD §10)
 node scripts/backup.js      # WAL-safe VACUUM INTO snapshot -> backups/ (keep 7)

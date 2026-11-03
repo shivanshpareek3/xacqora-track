@@ -40,6 +40,9 @@ function open() {
     // covers a live db created before it. (DDL is not subject to the FORCE RLS
     // row policies, so the owner role can alter its own table.)
     sys.exec(`ALTER TABLE spend_daily ADD COLUMN IF NOT EXISTS conversions INTEGER DEFAULT 0`);
+    // Meta token-expiry (live connect): where the last /debug_token check noted
+    // when the per-account system-user token expires, for the /alerts warning.
+    sys.exec(`ALTER TABLE meta_ad_account ADD COLUMN IF NOT EXISTS token_expires_at TEXT`);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -90,6 +93,9 @@ function open() {
   // Phase R: Meta-reported conversions for the Meta-vs-Track report.
   const sd = cols('spend_daily');
   if (!sd.includes('conversions')) db.exec(`ALTER TABLE spend_daily ADD COLUMN conversions INTEGER DEFAULT 0`);
+  // Meta token-expiry (live connect): see the PG branch for what it is.
+  const ma = cols('meta_ad_account');
+  if (!ma.includes('token_expires_at')) db.exec(`ALTER TABLE meta_ad_account ADD COLUMN token_expires_at TEXT`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,
