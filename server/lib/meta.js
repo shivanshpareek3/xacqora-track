@@ -34,10 +34,13 @@ async function runMetaPull(tx, payload) {
     return;
   }
 
-  // live: batched Marketing API pull over the last 7 days
+  // live: batched Marketing API pull over the last 7 days.
+  // time_range dates MUST be YYYY-MM-DD (the insights API rejects a full ISO
+  // timestamp with #100 "Must be a date representation in the format
+  // YYYY-MM-DD").
   try {
-    const to = new Date(now);
-    const from = new Date(Date.now() - 6 * 86400000);
+    const to = now.slice(0, 10);
+    const from = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
     const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token });
     upsertEntities(tx, ad_account_id, data);
     upsertSpend(tx, ad_account_id, data.spend);

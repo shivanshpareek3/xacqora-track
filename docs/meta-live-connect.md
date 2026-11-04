@@ -11,8 +11,16 @@ The live pull does **not** read a `META_ACCESS_TOKEN` env var at pull time.
 The token is stored **per ad account** in `meta_ad_account.token`, encrypted
 at rest with AES-256-GCM (`security.encryptSecret` — keyed by
 `XACQORA_SECRET_KEY`). `meta.js → runMetaPull` decrypts the row's token and
-calls the Marketing API (`liveapi.js → runLiveMetaPull`, `v19.0/{acct}/insights`,
-20-day batches, fields `spend,impressions,reach,clicks,conversions,…`).
+calls the Marketing API (`liveapi.js → runLiveMetaPull`,
+`v19.0/{acct}/insights?level=ad`, a 7-day `time_range` with
+`time_increment: 1` for one row per day, fields
+`ad_id,spend,impressions,reach,clicks,conversions`).
+Two live-verified API facts (see `tmp/probe-meta.js`):
+- **Spend is in currency units, not microcurrency** — a 7-day aggregate and
+  the same days summed from the daily rows both read e.g. `9.72` (not `9.72e-6`).
+  Do not divide by 1e6; doing so would store near-zero and break the ≤1% gate.
+- **Daily rows carry `date_start`/`date_stop` (equal), not a `date` field** —
+  the pull reads `date_start` so `spend_daily.date` is always populated.
 
 So the `.env` → app path is a **bootstrap bridge** (`server/lib/metalive.js`,
 run on every server start):
@@ -27,6 +35,13 @@ run on every server start):
 
 Fill the two values in `.env` and start the server — that's the whole wiring.
 You never edit the DB by hand.
+
+Guard: the bridge needs its target client row to exist
+(`meta_ad_account.client_id` is NOT NULL, FK to `client`). On a fresh,
+unseeded database (e.g. the replay test's scratch DB) the boot logs a
+`[meta-live] target client id … not found — skipping sync` line and starts
+clean instead of crashing on the FK; seed (`node scripts/seed.js`) and the
+next start syncs.
 
 ## The 3-point list — what to grab from Meta, and where
 

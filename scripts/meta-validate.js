@@ -42,11 +42,16 @@ const showOfflineHelp = () => {
   try {
     const rA = await fetch(graph('/me/adaccounts?limit=100'), { headers: { Authorization: 'Bearer ' + token } });
     accts = await rA.json().catch(() => ({}));
+    // Meta returns ids either 'act_123' (legacy) or bare '123' — normalize
+    // both sides so the user's META_AD_ACCOUNT_IDS (either form) compares cleanly
+    const norm = (s) => String(s || '').replace(/^act_/, '');
     const list = (accts.data || []).map((a) => a.id);
-    console.log('✓ accessible ad accounts (' + list.length + '): ' + (list.join(', ') || 'NONE — assign accounts in Business Settings > System Users'));
+    const listNorm = list.map(norm);
+    console.log('✓ accessible ad accounts (' + list.length + '): ' + (list.slice(0, 8).join(', ') + (list.length > 8 ? ', …' : '')));
     for (const id of wantIds) {
-      if (!list.includes(id)) console.log('✗ ' + id + ' is NOT accessible to this token — assign it, or drop it from META_AD_ACCOUNT_IDS');
+      if (!listNorm.includes(norm(id))) console.log('✗ ' + id + ' is NOT accessible to this token — assign it in Business Settings > System Users, or drop it from META_AD_ACCOUNT_IDS');
     }
+    if (wantIds.length && wantIds.every((id) => listNorm.includes(norm(id)))) console.log('✓ all ' + wantIds.length + ' requested account(s) are accessible');
   } catch { console.log('(!) /me/adaccounts unreachable (offline?) — skip account check'); }
   try {
     const rD = await fetch(graph('/debug_token?input_token=' + encodeURIComponent(token)), { headers: { Authorization: 'Bearer ' + token } });

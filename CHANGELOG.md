@@ -2,6 +2,54 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-04 (Meta live pull GREEN — real spend in the DB, both engines)
+
+The env→DB bridge (`9a423fd`) landed, but the first live pull failed with
+`Provided value cannot be bound to SQLite parameter 1` on every account. A
+host-side probe of the real `v19.0` insights surface (`tmp/probe-meta.js`)
+proved two API facts the mapper got wrong:
+
+1. **Daily `time_increment:1` rows carry `date_start`/`date_stop`, not `date`**
+   → `spend_daily.date` was bound as undefined → the crash.
+2. **`spend` is in currency units, not microcurrency** — a 7-day aggregate
+   (`9.72`) equals the sum of its daily rows (`9.72`), not `9.72e-6`. The old
+   `÷1e6` would have stored near-zero spend and defeated the ≤1% gate.
+
+### What landed
+- **`server/lib/liveapi.js`** — `mapInsightRow` reads `date_start` (skips rows
+  missing it, never fakes a date) and passes `spend` through unscaled
+  (`microToUnits` removed; comment pins the live-verified unit).
+- **`server/lib/meta.js`** — pull window is the last 7 calendar days
+  (`YYYY-MM-DD`, required by the API); error paths unchanged (classified,
+  surfaced on `/alerts`).
+- **`server/index.js`** — the `[meta-live]` bootstrap now checks its target
+  `client` row first: on a fresh unseeded DB (the replay test's scratch DB,
+  or a first prod start pre-seed) it logs
+  `[meta-live] target client id N not found — skipping sync` instead of
+  crashing the boot on the `meta_ad_account.client_id` FK. This was a
+  real regression the `replay.js` suite caught after `9a423fd`.
+- **`scripts/pg-dev.sh`** — `xacq_app` now gets `CREATEDB` (the test suites
+  each create + drop their own scratch DB; the app itself never createdb).
+- **`scripts/meta-validate.js`** — `act_`-prefix normalization on both sides
+  of the accessible-vs-requested account comparison.
+- **Live verification (this DB, 7 real accounts):** all 7 pulled green,
+  `spend_daily` holds 923 real rows across the 7 accounts (2026-10-22
+  → 2026-11-04; e.g. `act_500594992542527` 7-day spend ₹90,784); Reports → Meta vs Track renders real ad rows (₹ figures,
+  impressions, clicks). **≤1% gate**: DB-stored 7-day spend vs Meta's own
+  ad-level surface = 0.000–0.030% drift, 7/7 accounts PASS. **CAPI stayed
+  dry-run** (0 live `capi_log` rows, `settings.capi=dry`).
+- **Both engines green:** all 10 suites (`gates, isolation, liveapi,
+  metalive, replay, reports, security, spa, spec-research, xt-queue`) pass on
+  SQLite and on Postgres (dev cluster `127.0.0.1:5433` + CREATEDB role),
+  plus `test/sweep.sh`.
+
+Note for the next session: all 7 real `act_` accounts pull clean (the demo
+seed accounts ACT-100001/02/03 are mock rows; ACT-100003 shows a harmless
+"token expired (401)" from its placeholder mock token — ignore or re-seed).
+`scripts/meta-validate.js` lists the 55 accounts the system user can reach;
+the 7 requested ids are all in that list. The prod Postgres URL in `.env`
+is still the template placeholder — fill it at cutover.
+
 ## 2026-11-03 (Meta live connect — pull only, CAPI dry-run; .env bridge)
 
 The task asked for "fill the .env Meta section and be done." Reading the code

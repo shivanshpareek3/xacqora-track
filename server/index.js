@@ -24,17 +24,26 @@ ensureCapiLogTable(db);
 // Meta live connect (env -> DB bridge): if the operator filled META_ACCESS_TOKEN
 // + META_AD_ACCOUNT_IDS in .env, upsert the encrypted token onto those ad-account
 // rows now so the live pull has it. No-op when the values are blank/absent (dev).
+// The bridge needs its target client row (meta_ad_account.client_id is NOT NULL,
+// FK to client): on a fresh unseeded DB (e.g. the replay test's scratch db) there
+// is no client yet, so skip with a note instead of crashing the boot with an FK
+// violation — seed first (node scripts/seed.js) and the next start syncs.
 {
   const sys = makeTx(db, null);
   const ml = require('./lib/metalive');
-  const notes = ml.syncMetaAccountsFromEnv(sys, {
-    token: process.env.META_ACCESS_TOKEN,
-    adAccountIds: (process.env.META_AD_ACCOUNT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
-    pixelId: process.env.META_PIXEL_ID || null,
-    name: process.env.META_AD_ACCOUNT_NAME || null,
-    clientId: process.env.META_CLIENT_ID,
-  });
-  for (const n of notes) console.log('[meta-live] ' + n);
+  const clientId = Number(process.env.META_CLIENT_ID) || 1;
+  if (process.env.META_ACCESS_TOKEN && !sys.get(`SELECT id FROM client WHERE id=?`, clientId)) {
+    console.log(`[meta-live] target client id ${clientId} not found in this DB — skipping sync (seed first, e.g. node scripts/seed.js; the next start will sync).`);
+  } else {
+    const notes = ml.syncMetaAccountsFromEnv(sys, {
+      token: process.env.META_ACCESS_TOKEN,
+      adAccountIds: (process.env.META_AD_ACCOUNT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+      pixelId: process.env.META_PIXEL_ID || null,
+      name: process.env.META_AD_ACCOUNT_NAME || null,
+      clientId,
+    });
+    for (const n of notes) console.log('[meta-live] ' + n);
+  }
 }
 
 const PORT = Number(process.env.PORT || 4100);

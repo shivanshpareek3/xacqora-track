@@ -27,7 +27,9 @@ LC_ALL=C LANG=C pg_ctl -D "$DIR/data" -l "$DIR/pg.log" \
   -w start
 
 psql() { psql -h 127.0.0.1 -p 5433 -U xacqora -d postgres -v ON_ERROR_STOP=1 -c "$1" >/dev/null 2>&1 || true; }
-psql "CREATE ROLE xacq_app LOGIN;"
+# CREATEDB so the test suites (replay/metalive/gates/isolation/spa) can each
+# create + drop their own scratch database; the app itself never createdb.
+psql "CREATE ROLE xacq_app LOGIN CREATEDB;"
 psql "CREATE DATABASE xacqora OWNER xacq_app;"
 # dedicated superuser backup role: FORCE ROW LEVEL SECURITY makes Postgres refuse
 # a table export by any non-superuser ("query would be affected by row-level

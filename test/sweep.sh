@@ -114,7 +114,10 @@ echo "$rd" | grep -q "PASSED" || { echo "FAIL restore-drill did not pass"; FAILS
 echo '--- S.3: 2FA flow (enroll -> OTP verify -> session; wrong code denied) ---'
 T="$BASE_DIR"/tmp/xt-$PORT-tfa.txt
 setup=$(curl -s -b "$O" -c "$O" -X POST -d "action=enroll" "$BASE/admin/2fa" -o /dev/null -w "%{redirect_url}")
-secret=$(node scripts/dbq.js "SELECT totp_secret FROM \"user\" WHERE lower(email)='owner@xacqora.local'" 2>/dev/null | tail -1 | tr -d '\r' | node -e "const s=require('fs').readFileSync(0,'utf8').trim();const sec=require('./server/lib/security');console.log(sec.decryptSecret(s));")
+# The sweep's own server auto-loads the repo .env (server/lib/env.js), where a
+# real XACQORA_SECRET_KEY may live; this standalone decrypt MUST resolve the key
+# the same way or the GCM tag check fails against the dev-fallback key.
+secret=$(node scripts/dbq.js "SELECT totp_secret FROM \"user\" WHERE lower(email)='owner@xacqora.local'" 2>/dev/null | tail -1 | tr -d '\r' | node -e "require('./server/lib/env').loadEnvFile();const s=require('fs').readFileSync(0,'utf8').trim();const sec=require('./server/lib/security');if(!s){console.log('');process.exit(0)}console.log(sec.decryptSecret(s));")
 [ -z "$secret" ] && { echo "FAIL could not read enrolled 2FA secret"; FAILS=$((FAILS+1)); }
 # sign out, sign back in with a FRESH jar so the xt_tfa pending cookie is captured
 rm -f "$T"
