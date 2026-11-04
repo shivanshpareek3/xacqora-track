@@ -108,8 +108,11 @@ function recordTouchpoint(tx, row) {
 }
 
 // Duplicate review: same email, different phone (and vice-versa), within a client.
-function likelyDuplicates(tx, clientId) {
-  const leads = tx.all(`SELECT * FROM lead WHERE client_id=?`, clientId);
+// live (v9): when true, demo/seed leads are excluded from the comparison.
+function likelyDuplicates(tx, clientId, live = false) {
+  const dm = require('./datamode');
+  const exLead = live ? ` AND ${dm.leadNotDemo(dm.LIVE, 'l')}` : '';
+  const leads = tx.all(`SELECT l.* FROM lead l WHERE l.client_id=?${exLead}`, clientId);
   const byEmail = {};
   for (const l of leads) {
     if (!l.email) continue;

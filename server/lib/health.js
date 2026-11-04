@@ -20,14 +20,18 @@ function normTs(s) {
   return Number.isNaN(ms) ? null : ms;
 }
 
-function health(tx, db) {
+function health(tx, db, dataMode) {
   const now = Date.now();
   const live = require('./liveapi');
   const { engine } = require('../db');
 
-  // 1. webhook failures (last 24h, JS-side filter on the display timestamps)
-  const failed = tx.all(`SELECT id, client_id, platform, ref, error, ingested_at FROM webhook_log
-    WHERE status='failed' ORDER BY id DESC LIMIT 50`);
+  // 1. webhook failures (last 24h, JS-side filter on the display timestamps).
+  //    In live data-mode, exclude the seed's demo webhook rows so the ops
+  //    board doesn't report test fixture failures as real.
+  const whEx = dataMode === 'live'
+    ? require('./datamode').webhookNotDemo('live', 'w') : '';
+  const failed = tx.all(`SELECT id, client_id, platform, ref, error, ingested_at FROM webhook_log w
+    WHERE status='failed' ${whEx ? `AND ${whEx}` : ''} ORDER BY id DESC LIMIT 50`);
   const cutoff24h = now - 24 * 3600000;
   const webhookFailures = failed.filter((r) => {
     const t = normTs(r.ingested_at);

@@ -464,12 +464,15 @@ async function handleRequest(req, res) {
       switch (parts[0]) {
         case undefined:
           if (user) { // dashboard or portal
-            const page = user.role === 'client' ? screens.portal(db, user, {}) : screens.dashboard(db, user, {});
+            const p0 = Object.fromEntries(u.searchParams.entries());
+            const page = user.role === 'client' ? screens.portal(db, user, p0) : screens.dashboard(db, user, p0);
             guard(page);
           } else { res.writeHead(302, { Location: '/signin' }); res.end(); }
           return;
         case 'dashboard.html':
-          return guard(user.role === 'client' ? screens.portal(db, user, {}) : screens.dashboard(db, user, {}));
+          return guard(user.role === 'client'
+            ? screens.portal(db, user, Object.fromEntries(u.searchParams.entries()))
+            : screens.dashboard(db, user, Object.fromEntries(u.searchParams.entries())));
         case 'leads': {
           if (!user) { res.writeHead(302, { Location: '/signin' }); res.end(); return; }
           const p = Object.fromEntries(u.searchParams.entries());
@@ -561,6 +564,17 @@ async function handleRequest(req, res) {
           }
         }
         audit(db, user, 'settings.update', 'settings');
+        res.writeHead(302, { Location: '/admin.html' }); res.end(); return;
+      }
+      // Master v9 Task 2: DATA_MODE admin toggle (demo | live | default->env).
+      // The settings row wins over the DATA_MODE env var; team-only + audited.
+      if (u.pathname === '/admin/data-mode') {
+        if (!['owner', 'admin'].includes(user.role)) { send(res, 403, 'forbidden'); return; }
+        const { json } = await parseBody(req);
+        const dm = require('./lib/datamode');
+        const before = dm.mode(tx);
+        const result = dm.setDataMode(tx, String(json.mode || ''));
+        audit(db, user, 'data_mode.toggle', 'settings', `${before} -> ${result}${result === 'default' ? ' (env/default)' : ''}`);
         res.writeHead(302, { Location: '/admin.html' }); res.end(); return;
       }
       // Phase S: 2FA enrollment for the logged-in user
@@ -770,24 +784,38 @@ function reportScope(user, u, tx) {
     : (u.searchParams.get('client') ? [u.searchParams.get('client')] : null);
   return scope;
 }
+// Master v9: ?acc= on the report exports — scope to one REAL ad account,
+// validated against the caller's in-scope accounts (invalid/foreign -> off),
+// so CSV/Excel match the Reports screen.
+function reportAccount(u, tx, scope, live) {
+  const dm = require('./lib/datamode');
+  const accReq = u.searchParams.get('acc') || '';
+  const rep = S.metaAccountReport(tx, { adAccount: '', clientIds: scope, dataMode: live ? dm.LIVE : dm.DEMO });
+  return rep.accounts.some((a) => a.ad_account_id === accReq) ? accReq : '';
+}
 
 function exportRoute(res, user, parts, u) {
   const kind = parts[1] || '';
   const fmt = (u.searchParams.get('fmt') || 'csv').toLowerCase();
   const isExcel = fmt === 'excel' || fmt === 'xls' || fmt === 'xlsx';
   const tx = makeTx(db, user); // export rows bounded by the user's RLS scope
+  // Master v9: DATA_MODE — live exports exclude the demo seed rows.
+  const dm = require('./lib/datamode');
+  const live = dm.mode(tx) === dm.LIVE;
   let rows = [], label = '', sheet = kind;
 
   if (kind === 'leads') {
     const scope = user.role === 'client'
       ? Number((user.client_ids || '').split(',')[0] || 0)
       : Number(u.searchParams.get('client') || 0);
-    const where = scope ? `WHERE l.client_id=?` : '';
+    let where = scope ? `WHERE l.client_id=?` : '';
     const args = scope ? [scope] : [];
     const q = (u.searchParams.get('q') || '').trim();
     if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
     const stage = u.searchParams.get('stage');
     if (stage) { where += ` AND l.stage=?`; args.push(stage); }
+    const exLead = dm.leadNotDemo(live ? dm.LIVE : dm.DEMO, 'l');
+    if (exLead) { where = where ? `${where} AND ${exLead}` : `WHERE ${exLead}`; }
     const leadRows = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.city, l.stage, l.owner, l.client_id, c.name client,
       (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid
       FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 5000`, ...args);
@@ -800,7 +828,8 @@ function exportRoute(res, user, parts, u) {
     // ad performance export — same scoping + attribution model as the Reports screen
     const scope = reportScope(user, u, tx);
     const settings = reportSettings(u, tx);
-    const ap = S.adPerformance(tx, settings, scope);
+    const acc = reportAccount(u, tx, scope, live);
+    const ap = S.adPerformance(tx, settings, scope, acc, live);
     rows = ap.rows.map((r) => ({
       ad_id: r.ad_id, ad: r.name, campaign: r.campaign, account: r.account, status: r.status,
       spend: r.spend, impressions: r.impressions, clicks: r.clicks,
@@ -813,7 +842,7 @@ function exportRoute(res, user, parts, u) {
   } else if (kind === 'funnel') {
     const scope = reportScope(user, u, tx);
     const settings = reportSettings(u, tx);
-    const fp = S.funnelReport(tx, null, settings, scope);
+    const fp = S.funnelReport(tx, null, settings, scope, live);
     rows = [
       { metric: 'Leads', value: fp.leads },
       { metric: 'Registered', value: fp.registered },
@@ -835,13 +864,13 @@ function exportRoute(res, user, parts, u) {
     sheet = 'funnel';
   } else if (kind === 'source-mix') {
     const scope = reportScope(user, u, tx);
-    rows = S.sourceMix(tx, scope).map((r) => ({ source: r.src, leads: r.c }));
+    rows = S.sourceMix(tx, scope, live).map((r) => ({ source: r.src, leads: r.c }));
     label = `report/source-mix (${rows.length} buckets)`;
     sheet = 'source_mix';
   } else if (kind === 'new-vs-old') {
     const scope = reportScope(user, u, tx);
     const settings = reportSettings(u, tx);
-    const nv = S.newVsOld(tx, settings, scope);
+    const nv = S.newVsOld(tx, settings, scope, live);
     rows = [
       { bucket: 'in range', leads: nv.in_range_count, revenue: nv.in_range_revenue },
       { bucket: 'older', leads: nv.older_count, revenue: nv.older_revenue },
@@ -853,7 +882,8 @@ function exportRoute(res, user, parts, u) {
   } else if (kind === 'meta-vs-track') {
     const scope = reportScope(user, u, tx);
     const settings = reportSettings(u, tx);
-    const mvt = S.metaVsTracker(tx, settings, scope);
+    const acc = reportAccount(u, tx, scope, live);
+    const mvt = S.metaVsTracker(tx, settings, scope, acc, live);
     rows = mvt.rows.map((r) => ({
       ad_id: r.ad_id, ad: r.ad, campaign: r.campaign,
       meta_conversions: r.meta_conv, our_conversions: r.our_conv, delta: r.delta,
@@ -864,7 +894,7 @@ function exportRoute(res, user, parts, u) {
   } else if (kind === 'weekly-summary') {
     const scope = reportScope(user, u, tx);
     const settings = reportSettings(u, tx);
-    const ws = S.weeklySummary(tx, settings, scope);
+    const ws = S.weeklySummary(tx, settings, scope, live);
     rows = [
       { item: 'generated_at', value: ws.generated_at },
       { item: 'model', value: ws.settings.model },
@@ -997,12 +1027,16 @@ async function tickerCycle() {
         attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value,
         attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value,
       };
+      // Master v9: the auto PDF must not mail demo figures to clients in live
+      // mode (seed rows are excluded from every screen there too).
+      const dm = require('./lib/datamode');
+      const live = dm.mode(tx) === dm.LIVE;
       const outDir = path.join(__dirname, '..', 'reports');
       fs.mkdirSync(outDir, { recursive: true });
       const date = now.toISOString().slice(0, 10);
 
       // all-client summary (audit trail + team view)
-      const wsAll = S.weeklySummary(tx, settings);
+      const wsAll = S.weeklySummary(tx, settings, null, live);
       const allFile = path.join(outDir, `summary-${date}.json`);
       fs.writeFileSync(allFile, JSON.stringify(wsAll, null, 2));
       audit(db, null, 'weekly_summary', 'report', allFile.split('/').pop());
@@ -1010,7 +1044,7 @@ async function tickerCycle() {
       // one PDF + portal card per client
       const clients = tx.all(`SELECT c.id, c.name FROM client c ORDER BY c.id`);
       for (const c of clients) {
-        const ws = S.weeklySummary(tx, settings, [c.id]);
+        const ws = S.weeklySummary(tx, settings, [c.id], live);
         const pdfBytes = pdfReport(S.weeklyPdfLines(ws, c.name));
         const pdfFile = path.join(outDir, `summary-${date}-client${c.id}.pdf`);
         fs.writeFileSync(pdfFile, pdfBytes);

@@ -44,6 +44,9 @@ async function runMetaPull(tx, payload) {
     const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token });
     upsertEntities(tx, ad_account_id, data);
     upsertSpend(tx, ad_account_id, data.spend);
+    // record the account's billing currency (KPI cards: "₹ + currency"); a
+    // null just leaves the existing value untouched.
+    if (data.currency) tx.run(`UPDATE meta_ad_account SET currency=? WHERE ad_account_id=? AND currency IS NULL`, data.currency, ad_account_id);
     tx.run(`UPDATE meta_ad_account SET last_pull_at=?, last_error=NULL WHERE ad_account_id=?`, now, ad_account_id);
   } catch (e) {
     // PRD risk rule: alert on failures

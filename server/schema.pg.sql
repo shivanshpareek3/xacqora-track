@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_deal_client ON deal(client_id, status, paid_at);
 CREATE TABLE IF NOT EXISTS meta_ad_account (
   id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES client(id),
   name TEXT, ad_account_id TEXT, token TEXT, pixel_id TEXT, status TEXT DEFAULT 'connected',
-  token_expires_at TEXT,
+  token_expires_at TEXT, currency TEXT,
   last_pull_at TEXT, auto_pull INTEGER DEFAULT 1, last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS webhook_endpoint (

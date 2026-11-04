@@ -20,8 +20,16 @@ function emailOf(u, lead) {
 }
 
 // ---------------------------------------------------------------- Dashboard
+// ---------------------------------------------------------------- Dashboard
+// Master v9: real Meta spend front and center. The top-bar account switcher
+// (layout accSelect) scopes KPIs, the 30-day trend, top campaigns/ads, the
+// pull-status card and Reports to one ad account. Default (no ?acc) = the
+// largest real account by 7-day spend. DATA_MODE=live swaps demo figures for
+// real-only and renders clean empty states.
 function dashboard(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const settings = {
     attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
     attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
@@ -29,21 +37,98 @@ function dashboard(db, user, p) {
   };
   // client logins are scoped to their own data; team roles see all internal clients
   const scopeIds = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : null;
-  const fp = S.funnelReport(tx, null, settings, scopeIds);
-  const ap = S.adPerformance(tx, settings, scopeIds);
-  const mix = S.sourceMix(tx, scopeIds);
+
+  // ---- real-data report (Meta spend front and center) ----
+  // Design: opening the dashboard with no ?acc auto-selects the LARGEST
+  // account by 7-day spend (base.defaultAccount), so real numbers show first.
+  // ?acc=all = the explicit "All accounts (aggregate)" choice; any other ?acc
+  // must be one of the caller's in-scope real accounts (invalid/foreign ->
+  // falls back to the largest, never a cross-client leak).
+  const base = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode });
+  const accParam = p.acc === undefined ? null : String(p.acc);
+  let selected;
+  if (accParam === null) selected = base.defaultAccount;                    // default = largest
+  else if (accParam === '' || accParam === 'all') selected = '';            // aggregate
+  else selected = base.accounts.some((a) => a.ad_account_id === accParam) ? accParam : base.defaultAccount;
+  const rep = selected ? S.metaAccountReport(tx, { adAccount: selected, clientIds: scopeIds, dataMode }) : base;
+  const kpis = rep.kpis;
+  const win = p.win === '30' ? 'd30' : 'd7';
+  const k = kpis[win];
+  const money2 = (n) => (n == null ? '—' : '₹' + Math.round(n).toLocaleString('en-IN'));
+  const roasOk = rep.revenue > 0 && kpis.d30.spend_inr > 0;
+  const kpiCards = [
+    { l: `${win === 'd7' ? '7' : '30'}d spend (INR)`, v: money2(k.spend_inr), sub: rep.currency ? `+ ${k.spend.toLocaleString('en-IN')} ${rep.currency}` : '' },
+    { l: 'Impressions', v: S.fmtN(k.impressions) },
+    { l: 'Reach', v: S.fmtN(k.reach) },
+    { l: 'Clicks · CTR', v: `${S.fmtN(k.clicks)} · ${k.ctr != null ? k.ctr + '%' : '—'}` },
+    { l: 'Avg CPC', v: k.cpc != null ? money2(k.cpc) : '—' },
+    { l: 'ROAS', v: roasOk ? (kpis.d30.spend_inr ? Math.round(rep.revenue / kpis.d30.spend_inr * 100) / 100 : '—') : '<span class="muted">N/A — pilot live</span>', noraos: !roasOk },
+  ].map((x) => `<div class="kpi"><div class="l">${x.l}</div><div class="v" ${x.noraos ? 'style="font-size:16px"' : ''}>${x.v}</div>${x.sub ? `<div class="small muted">${S.esc(x.sub)}</div>` : ''}</div>`).join('');
+
+  // ---- 30-day spend trend (account-level; per-campaign when one account) ----
+  const trendChart = S.sparklineSvg(rep.trend, { metric: 'spend' });
+  const trendNote = selected
+    ? `<div class="small muted" style="margin-top:6px">Per-campaign daily (click "All accounts" to view the aggregate):</div>`
+    : `<div class="small muted" style="margin-top:6px">Daily spend across all real ad accounts.</div>`;
+  // campaign split for a single account
+  let campSplit = '';
+  if (rep.campTrend.length) {
+    const byCamp = {};
+    for (const r of rep.campTrend) byCamp[r.campaign] = (byCamp[r.campaign] || 0) + r.spend;
+    const camps = Object.entries(byCamp).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    const max = Math.max(1, ...camps.map((c) => c[1]));
+    campSplit = `<div style="margin-top:10px">${camps.map((c) => `
+      <div class="row" style="gap:8px;margin-bottom:6px"><div style="width:150px" class="small muted">${S.esc(c[0].slice(0, 22))}</div>
+      <div class="bar" style="flex:1"><i style="width:${Math.max(2, (c[1] / max) * 100)}%"></i></div>
+      <div style="width:70px;text-align:right" class="small">${money2(c[1])}</div></div>`).join('')}</div>`;
+  }
+
+  // ---- pull-status card (last pull + next auto-pull + per-account Pull now) ----
+  const canPull = ['owner', 'admin', 'media_buyer'].includes(user.role);
+  const pullRows = (Array.isArray(rep.pull) ? rep.pull : [rep.pull]).map((a) => {
+    const rowId = rep.accounts.find((x) => x.ad_account_id === a.ad_account_id)?.id || '';
+    if (!a || !a.last_pull_at) {
+      return `<tr><td><b>${S.esc(a && a.name || a && a.ad_account_id || '—')}</b></td>
+        <td><span class="pill r">never pulled</span></td><td class="small muted">—</td><td class="small muted">—</td>
+        ${canPull ? `<td>${rowId ? `<a class="btn sm sec" href="/meta/pull?acc=${rowId}">Pull now</a>` : ''}</td>` : ''}</tr>`;
+    }
+    const ageH = Math.max(0, Math.round((Date.now() - new Date(a.last_pull_at).getTime()) / 3600000));
+    const next = new Date(new Date(a.last_pull_at).getTime() + 3 * 3600000);
+    const due = next.getTime() < Date.now();
+    const err = a.last_error;
+    return `<tr>
+      <td><b>${S.esc(a.name || a.ad_account_id)}</b><div class="small muted">${S.esc(a.ad_account_id || '')}</div></td>
+      <td>${err ? `<span class="pill r" title="${S.esc(String(err))}">${S.esc(String(err).slice(0, 30))}…</span>` : `<span class="pill g">ok · ${ageH}h ago</span>`}</td>
+      <td class="small muted">${S.fmtDT(a.last_pull_at)}</td>
+      <td>${due ? `<span class="pill o">due now</span>` : `<span class="small muted">next ${S.fmtDT(next.toISOString())}</span>`}</td>
+      ${canPull ? `<td>${rowId ? `<a class="btn sm sec" href="/meta/pull?acc=${rowId}">Pull now</a>` : ''}</td>` : ''}</tr>`;
+  }).join('');
+  const pullHead = `<thead><tr><th>Account</th><th>Status</th><th>Last pull</th><th>Next auto-pull</th>${canPull ? '<th></th>' : ''}</tr></thead>`;
+  const pullCard = `
+  <div class="card"><h2>Meta pull status <span class="badge">auto every 3h + nightly</span></h2>
+    <div class="tabwrap"><table>${pullHead}
+    <tbody>${pullRows || `<tr><td colspan="${canPull ? 5 : 4}" class="muted">No real ad accounts yet — fill META_AD_ACCOUNT_IDS in .env and restart the server</td></tr>`}</tbody></table></div>
+    <div class="row" style="margin-top:8px;gap:8px"><a class="btn sm sec" href="/meta.html">Manage accounts →</a>
+      <span class="small muted">Failures show here + on <a href="/alerts.html">Alerts</a> (classified, retried with backoff).</span></div></div>`;
+
+  // ---- top campaigns / top ads ----
+  const campRows = rep.topCampaigns.map((c) => `<tr>
+    <td><b>${S.esc(c.name)}</b></td><td><span class="pill ${c.status === 'ACTIVE' ? 'g' : 'o'}">${S.esc(c.status || '—')}</span></td>
+    <td>${money2(c.spend)}</td><td class="small">${S.fmtN(c.impressions)} imp</td></tr>`).join('');
+  const adThumb = (img) => `<img class="lead-img" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='52' height='52'><rect width='52' height='52' rx='8' fill='%23252c40'/></svg>" style="width:34px;height:34px" alt="">`;
+  const adRows = rep.topAds.map((a) => `<tr>
+    <td>${adThumb(a.creative_img)} <b>${S.esc(a.name || a.ad_id)}</b><div class="small muted">${S.esc(a.ad_id)} · ${S.esc(a.creative_img || '')}</div></td>
+    <td><span class="pill ${a.status === 'ACTIVE' ? 'g' : 'o'}">${S.esc(a.status || '—')}</span></td>
+    <td>${money2(a.spend)}</td><td class="small">${S.fmtN(a.impressions)} imp</td><td class="small">${S.fmtN(a.clicks)} clk</td></tr>`).join('');
+
+  // ---- bottom: funnel + recent leads (compact, demo-aware empty states) ----
+  const live = dataMode === 'live';
+  const fp = S.funnelReport(tx, null, settings, scopeIds, live);
   const totalLeads = scopeIds
     ? tx.get(`SELECT COUNT(*) c FROM lead WHERE client_id IN (${scopeIds.map((n) => Number(n)).join(',')})`)?.c || 0
     : tx.get(`SELECT COUNT(*) c FROM lead`)?.c || 0;
-  const recentWhere = scopeIds ? `WHERE l.client_id IN (${scopeIds.map((n) => Number(n)).join(',')})` : '';
-  const recent = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
-    FROM lead l LEFT JOIN client c ON c.id=l.client_id ${recentWhere} ORDER BY l.id DESC LIMIT 8`);
-
   const funnelSteps = [
     { l: 'Leads', v: fp.leads, max: fp.leads || 1, c: 'b' },
-    { l: 'Registered', v: fp.registered, max: fp.leads || 1, c: 'p' },
-    { l: 'Attended', v: fp.attended, max: fp.leads || 1, c: 'o' },
-    { l: 'Calls', v: fp.calls, max: fp.leads || 1, c: 'g' },
     { l: 'Paid', v: fp.paid, max: fp.leads || 1, c: 'g' },
   ];
   const funnelBars = funnelSteps.map((s) => `
@@ -52,38 +137,63 @@ function dashboard(db, user, p) {
       <div class="bar" style="flex:1"><i style="width:${Math.max(2, (s.v / s.max) * 100)}%;background:var(--${s.c})"></i></div>
       <div style="width:64px;text-align:right" class="small">${S.fmtN(s.v)}</div></div>
     </div>`).join('');
-
-  const mixChips = mix.map((m) => `<span class="chip"><b>${S.esc(m.src)}</b> ${m.c}</span>`).join('');
-
-  const kpis = [
-    { l: 'Total leads', v: S.fmtN(totalLeads) },
-    { l: 'Show-up rate', v: S.fmtPct(fp.show_up_rate) },
-    { l: 'Close rate', v: S.fmtPct(fp.close_rate) },
-    { l: 'Cost per lead', v: fp.cpl != null ? S.fmtINR(fp.cpl) : '—' },
-    { l: 'Net revenue', v: S.fmtINR(fp.revenue) },
-    { l: 'Ad spend', v: S.fmtINR(fp.spend) },
-    { l: 'ROAS', v: ap.total.roas != null ? ap.total.roas : '—' },
-    { l: 'Profit', v: S.fmtINR(ap.total.profit) },
-  ].map((k) => `<div class="kpi"><div class="l">${k.l}</div><div class="v">${k.v}</div></div>`).join('');
-
-  const recentRows = recent.map((r) => `<tr>
+  const leadsEmpty = dataMode === 'live' ? `<div class="empty-state">${S.esc(dm.EMPTY.leads)}</div>` : '';
+  const recentRows = (() => {
+    const ex = dm.leadNotDemo(dataMode, 'l');
+    const where = scopeIds ? `WHERE l.client_id IN (${scopeIds.map((n) => Number(n)).join(',')}) ${ex ? 'AND ' + ex : ''}` : (ex ? `WHERE ${ex}` : '');
+    return tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
+      FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 8`);
+  })().map((r) => `<tr>
     <td><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a></td>
     <td class="small muted">${S.esc(r.client_name || '')}</td>
     <td class="small">${phoneOf(user, r)}</td>
     <td><span class="pill ${stagePillClass(r.stage)}">${S.esc(r.stage)}</span></td>
     <td class="small muted">${S.fmtDT(r.created_at)}</td></tr>`).join('');
 
+  // ---- switcher options (real act_ accounts, status marker) ----
+  const dotMark = (a) => a.last_error ? ' · error' : (a.last_pull_at ? '' : ' · never pulled');
+  const switcher = {
+    path: 'dashboard.html',
+    current: selected,
+    options: rep.accounts.map((a) => ({ value: a.ad_account_id, label: `${a.name || a.ad_account_id}${dotMark(a)}` })),
+    hidden: [{ name: 'win', value: win === 'd7' ? '7' : '30' }],
+  };
+
+  const titleSuffix = selected ? (rep.accounts.find((a) => a.ad_account_id === selected)?.name || selected) : (scopeIds ? 'My account' : 'All accounts');
   const body = `
-  <h1>Dashboard</h1>
-  <div class="grid g4">${kpis}</div>
+  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:12px">
+    <h1 style="margin:0">Dashboard ${titleSuffix !== 'All accounts' ? `· <span class="badge">${S.esc(titleSuffix)}</span>` : '<span class="badge">all real accounts</span>'}</h1>
+    <div class="row" style="gap:6px"><span class="badge">window</span>
+      <a class="btn sm ${win === 'd7' ? '' : 'sec'}" href="/dashboard.html?win=7${selected ? '&acc=' + encodeURIComponent(selected) : ''}">7d</a>
+      <a class="btn sm ${win === 'd30' ? '' : 'sec'}" href="/dashboard.html?win=30${selected ? '&acc=' + encodeURIComponent(selected) : ''}">30d</a></div>
+  </div>
+  <div class="grid g4" style="grid-template-columns:repeat(6,1fr)">${kpiCards}</div>
+
   <div class="grid g2" style="margin-top:14px">
-    <div class="card"><h2>Funnel</h2>${funnelBars}
-      <div class="note">Attribution model: <b>${S.esc(settings.attribution_model)}</b> · window ${settings.attribution_window_days}d · revenue net of refunds.</div></div>
-    <div class="card"><h2>Lead source mix</h2>${mixChips || '<span class="muted">No leads yet</span>'}
-      <h2 style="margin-top:14px">Recent leads</h2>
-      <div class="tabwrap"><table>${recentRows || '<tr><td class="muted">No leads</td></tr>'}</table></div></div>
+    <div class="card"><h2>Spend trend <span class="badge">last 30 days, INR</span></h2>
+      ${trendChart || '<div class="empty-state">No spend yet — run a Meta pull to start charting.</div>'}
+      ${trendNote}${campSplit}</div>
+    ${pullCard}
+  </div>
+
+  <div class="grid g2" style="margin-top:0">
+    <div class="card"><h2>Top campaigns <span class="badge">by ${win === 'd7' ? '7d' : '30d'} spend</span></h2>
+      <div class="tabwrap"><table>${campRows || '<tr><td class="muted">No campaigns pulled yet</td></tr>'}</table></div></div>
+    <div class="card"><h2>Top ads <span class="badge">by ${win === 'd7' ? '7d' : '30d'} spend</span></h2>
+      <div class="tabwrap"><table>${adRows || '<tr><td class="muted">No ads pulled yet</td></tr>'}</table></div></div>
+  </div>
+
+  ${leadsEmpty}
+  <div class="grid g2" style="margin-top:0">
+    <div class="card"><h2>Funnel <span class="badge">${win === 'd7' ? '7' : '30'}d</span></h2>${funnelBars}
+      <div class="small muted">Attribution: <b>${S.esc(settings.attribution_model)}</b> · window ${settings.attribution_window_days}d · revenue net of refunds.</div></div>
+    <div class="card"><h2>Recent leads</h2>
+      <div class="tabwrap"><table>${recentRows || `<tr><td class="muted">${dataMode === 'live' ? 'No leads yet (pilot live)' : 'No leads'}</td></tr>`}</table></div></div>
   </div>`;
-  return S.layout({ title: 'Dashboard', nav: S.navFor(user), active: 'dashboard.html', user, body });
+  return S.layout({
+    title: 'Dashboard', nav: S.navFor(user), active: 'dashboard.html', user, body,
+    band: S.layoutDemoBand(dataMode), accSelect: switcher,
+  });
 }
 function stagePillClass(s) {
   if (['Paid'].includes(s)) return 'g';
@@ -95,6 +205,8 @@ function stagePillClass(s) {
 // ---------------------------------------------------------------- Lead list
 function leads(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const q = (p.q || '').trim();
   const stage = p.stage || '';
   // client logins only ever see their own client; team roles can filter
@@ -102,6 +214,8 @@ function leads(db, user, p) {
   const client = user.role === 'client' ? String(scopeIds[0] || '') : (p.client || '');
   let where = `1=1`;
   const args = [];
+  const exLead = dm.leadNotDemo(dataMode, 'l');
+  if (exLead) { where += ` AND ${exLead}`; } // live mode: hide seed/demo leads
   if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
   if (stage) { where += ` AND l.stage = ?`; args.push(stage); }
   if (client) { where += ` AND l.client_id = ?`; args.push(client); }
@@ -150,15 +264,18 @@ function leads(db, user, p) {
   <div class="card">
     <div class="tabwrap"><table>
       <thead><tr><th>Name</th><th>Client</th><th>Phone</th><th>Email</th><th>Stage</th><th>Owner</th><th>Paid</th><th>Events</th></tr></thead>
-      <tbody>${rowsHtml || '<tr><td colspan="8" class="muted">No leads match</td></tr>'}</tbody>
+      <tbody>${rowsHtml || (dataMode === 'live'
+        ? `<tr><td colspan="8"><div class="empty-state">${S.esc(dm.EMPTY.leads)}<br><a href="/pilot-live-checklist">Pilot cutover checklist →</a></div></td></tr>`
+        : '<tr><td colspan="8" class="muted">No leads match</td></tr>')}</tbody>
     </table></div>
   </div>`;
-  return S.layout({ title: 'Leads', nav: S.navFor(user), active: 'leads', user, body });
+  return S.layout({ title: 'Leads', nav: S.navFor(user), active: 'leads', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Lead timeline
 function leadTimeline(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dataMode = require('./lib/datamode').mode(tx);
   const lead = tx.get(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.id=?`, p.id);
   if (!lead) return notFound(user);
   // PRD §10: row-level isolation at the route too. A client login may only
@@ -239,25 +356,32 @@ function leadTimeline(db, user, p) {
     <tbody>${dealRows || '<tr><td class="muted">No payments</td></tr>'}</tbody></table></div></div>
   <div class="card"><h2>Timeline <span class="badge">newest first, IST</span></h2>
     <div class="tl">${evRows || '<div class="muted">No events yet</div>'}</div></div>`;
-  return S.layout({ title: lead.name || 'Lead', nav: S.navFor(user), active: 'leads.html', user, body });
+  return S.layout({ title: lead.name || 'Lead', nav: S.navFor(user), active: 'leads.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Pipeline kanban
 function pipeline(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const sec = require('./lib/security');
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
+  const exLead = dm.leadNotDemo(dataMode, 'l');
   // a client login is locked to its own clients; the ?client= filter cannot widen it
   let client = p.client || '';
   if (user.role === 'client') client = String((user.client_ids || '').split(',')[0] || '');
   const stages = S.DEFAULT_STAGES;
-  const where = client ? `AND l.client_id=?` : '';
+  const where = [client ? `AND l.client_id=?` : '', exLead ? `AND ${exLead}` : ''].filter(Boolean).join(' ');
   const args = client ? [client] : [];
-  const cols = stages.map((s) => {
-    const rows = tx.all(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.stage=? ${where} ORDER BY l.id DESC LIMIT 40`, s, ...args);
-    const cards = rows.map((r) => `<div class="kcard"><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a>
-      <div class="small muted">${S.esc(r.client_name || '')} · ${phoneOf(user, r)}</div></div>`).join('');
-    return `<div class="kcol"><h3>${s} <span class="badge">${rows.length}</span></h3>${cards || '<div class="muted small">empty</div>'}</div>`;
-  }).join('');
+  const stageRows = stages.map((s) => tx.all(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.stage=? ${where} ORDER BY l.id DESC LIMIT 40`, s, ...args));
+  const totalCards = stageRows.reduce((n, r) => n + r.length, 0);
+  const cols = dataMode === 'live' && totalCards === 0
+    ? `<div class="empty-state">${S.esc(dm.EMPTY.leads)}<br><a href="/pilot-live-checklist">Pilot cutover checklist →</a></div>`
+    : stages.map((s, i) => {
+        const rows = stageRows[i];
+        const cards = rows.map((r) => `<div class="kcard"><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a>
+          <div class="small muted">${S.esc(r.client_name || '')} · ${phoneOf(user, r)}</div></div>`).join('');
+        return `<div class="kcol"><h3>${s} <span class="badge">${rows.length}</span></h3>${cards || '<div class="muted small">empty</div>'}</div>`;
+      }).join('');
   const clients = user.role === 'client'
     ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
     : tx.all(`SELECT id, name FROM client`);
@@ -271,12 +395,14 @@ function pipeline(db, user, p) {
     </div>
   </div>
   <div class="kanban">${cols}</div>`;
-  return S.layout({ title: 'Pipeline', nav: S.navFor(user), active: 'pipeline.html', user, body });
+  return S.layout({ title: 'Pipeline', nav: S.navFor(user), active: 'pipeline.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Reports
 function reports(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const settings = {
     attribution_model: p.model || tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
     attribution_window_days: p.window || tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
@@ -288,12 +414,18 @@ function reports(db, user, p) {
   const scopeIds = user.role === 'client'
     ? (user.client_ids || '').split(',').filter(Boolean)
     : (clientFilter ? [clientFilter] : null);
+  // Master v9 ?acc=: scope the report to one real ad account. Validated
+  // against the caller's in-scope real accounts; invalid/foreign -> off.
+  const repAcc = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode });
+  const accReq = String(p.acc || '');
+  const acc = repAcc.accounts.some((a) => a.ad_account_id === accReq) ? accReq : '';
   const allClients = tx.all(`SELECT id, name FROM client`);
-  const ap = S.adPerformance(tx, settings, scopeIds);
-  const fp = S.funnelReport(tx, null, settings, scopeIds);
+  const live = dataMode === 'live';
+  const ap = S.adPerformance(tx, settings, scopeIds, acc, live);
+  const fp = S.funnelReport(tx, null, settings, scopeIds, live);
   const waste = S.wastedSpend(ap);
-  const mix = S.sourceMix(tx, scopeIds);
-  const mvt = S.metaVsTracker(tx, settings, scopeIds); // PRD §5.7 Meta vs Track
+  const mix = S.sourceMix(tx, scopeIds, live);
+  const mvt = S.metaVsTracker(tx, settings, scopeIds, acc, live); // PRD §5.7 Meta vs Track
   const models = ['last_paid_click', 'first_click', 'linear', 'lead_source'];
   const modelNames = { last_paid_click: 'Last paid click (default)', first_click: 'First click', linear: 'Linear', lead_source: 'Lead source' };
 
@@ -311,7 +443,7 @@ function reports(db, user, p) {
     return `<a href="/leads?ids=${encodeURIComponent(list)}${clientFilter ? `&client=${clientFilter}` : ''}">${S.esc(value)}</a>`;
   };
   // export URL preserving the current filters (so CSV/Excel match what's shown)
-  const expQ = `?client=${clientFilter}&model=${settings.attribution_model}&window=${settings.attribution_window_days}&from=${settings.report_from || ''}&to=${settings.report_to || ''}`;
+  const expQ = `?client=${clientFilter}&model=${settings.attribution_model}&window=${settings.attribution_window_days}&from=${settings.report_from || ''}&to=${settings.report_to || ''}${acc ? `&acc=${encodeURIComponent(acc)}` : ''}`;
 
   const adRows = ap.rows.map((r) => `<tr>
     <td><img class="lead-img" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='52' height='52'><rect width='52' height='52' rx='8' fill='%23252c40'/></svg>" style="width:34px;height:34px">
@@ -402,24 +534,47 @@ function reports(db, user, p) {
         : '<div class="small muted">No Meta conversion data yet — run a Meta pull to populate per-ad "Conversions".</div>'}
       </div>
   </div>`;
-  return S.layout({ title: 'Reports', nav: S.navFor(user), active: 'reports.html', user, body });
+  const repSwitcher = {
+    path: 'reports.html',
+    current: acc,
+    options: repAcc.accounts.map((a) => ({ value: a.ad_account_id, label: a.name || a.ad_account_id })),
+    hidden: [
+      { name: 'client', value: clientFilter },
+      { name: 'model', value: settings.attribution_model },
+      { name: 'window', value: settings.attribution_window_days },
+      { name: 'from', value: settings.report_from || '' },
+      { name: 'to', value: settings.report_to || '' },
+    ],
+  };
+  const accBadge = acc ? ` · scoped to <b>${S.esc((repAcc.accounts.find((a) => a.ad_account_id === acc) || {}).name || acc)}</b>` : '';
+  return S.layout({
+    title: 'Reports', nav: S.navFor(user), active: 'reports.html', user, body,
+    band: S.layoutDemoBand(dataMode), accSelect: user.role !== 'client' ? repSwitcher : undefined,
+  });
 }
 
 // ---------------------------------------------------------------- Meta hub
 function meta(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
-  const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id`);
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
+  const metaEx = dm.metaNotDemo(dataMode, 'a');
+  const spendEx = dm.spendNotDemo(dataMode, 's');
+  const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id ${metaEx ? `WHERE ${metaEx}` : ''}`);
   const accRows = accounts.map((a) => `<tr>
     <td>${S.esc(a.name)} <span class="small muted">(${S.esc(a.client_name || '')})</span></td>
-    <td class="small muted">${S.esc(a.ad_account_id)}</td>
+    <td class="small muted">${S.esc(a.ad_account_id)}${a.currency ? ` · ${S.esc(a.currency)}` : ''}</td>
     <td><span class="pill ${a.status === 'connected' ? 'g' : 'o'}">${S.esc(a.status)}</span></td>
     <td class="small muted">${S.fmtDT(a.last_pull_at)}</td>
     <td class="small muted">${a.last_error ? S.esc(a.last_error) : 'ok'}</td>
     <td><a class="btn sm sec" href="/meta/pull?acc=${a.id}">Pull now</a></td></tr>`).join('');
-  const spend = tx.all(`SELECT s.ad_id, ad.name, s.date, s.spend, s.spend_inr, s.impressions, s.clicks FROM spend_daily s LEFT JOIN meta_ad ad ON ad.id=s.ad_id ORDER BY s.date DESC LIMIT 40`);
+  const spend = tx.all(`SELECT s.ad_id, ad.name, s.date, s.spend, s.spend_inr, s.impressions, s.clicks FROM spend_daily s LEFT JOIN meta_ad ad ON ad.id=s.ad_id ${spendEx ? `WHERE ${spendEx}` : ''} ORDER BY s.date DESC LIMIT 40`);
   const spendRows = spend.map((r) => `<tr><td class="small muted">${r.date}</td><td>${S.esc(r.name || r.ad_id)}</td>
     <td>${S.fmtINR(r.spend)}</td><td>${S.fmtINR(r.spend_inr)}</td><td class="small">${S.fmtN(r.impressions)}</td><td class="small">${S.fmtN(r.clicks)}</td></tr>`).join('');
-  const capi = tx.all(`SELECT cl.*, e.lead_id, l.name lead_name FROM capi_log cl LEFT JOIN event e ON e.id=cl.event_row_id LEFT JOIN lead l ON l.id=e.lead_id ORDER BY cl.id DESC LIMIT 20`);
+  // live mode: drop CAPI rows that belong to a demo lead (NULL lead = keep).
+  const capiDemoEx = dataMode === 'live'
+    ? `WHERE NOT (l.id BETWEEN ${dm.SEED.leadIds[0]} AND ${dm.SEED.leadIds[1]} OR l.id IS NULL)` : '';
+  const capi = tx.all(`SELECT cl.*, e.lead_id, l.name lead_name FROM capi_log cl LEFT JOIN event e ON e.id=cl.event_row_id LEFT JOIN lead l ON l.id=e.lead_id ${capiDemoEx} ORDER BY cl.id DESC LIMIT 20`);
   const capiRows = capi.map((r) => `<tr><td class="small muted">${S.fmtDT(r.sent_at)}</td><td>${S.esc(r.event_name)}</td>
     <td>${S.esc(r.lead_name || '')}</td><td class="small muted">${S.esc(r.pixel_id)}</td>
     <td><span class="pill ${r.match_quality >= 7 ? 'g' : 'o'}">MQ ${r.match_quality ?? '—'}</span></td>
@@ -437,12 +592,14 @@ function meta(db, user, p) {
     <tbody>${capiRows || '<tr><td class="muted">No CAPI events pushed yet</td></tr>'}</tbody></table></div>
     <div class="note">Rule: an event is never sent twice. A Purchase is never sent for a refunded payment — the refund stays in our records. Phone/email are SHA-256 hashed before leaving the server.</div>
   </div>`;
-  return S.layout({ title: 'Meta', nav: S.navFor(user), active: 'meta.html', user, body });
+  return S.layout({ title: 'Meta', nav: S.navFor(user), active: 'meta.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Integrations
 function integrations(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const PLATFORMS = [
     ['meta_leadgen', 'Meta Lead Forms', 'Instant Form leads with ad IDs'],
     ['tagmango', 'TagMango', 'Course / workshop purchases'],
@@ -460,7 +617,8 @@ function integrations(db, user, p) {
   const clients = tx.all(`SELECT id, name FROM client`);
   const client1 = clients[0];
   const endpoints = tx.all(`SELECT * FROM webhook_endpoint`);
-  const log = tx.all(`SELECT * FROM webhook_log ORDER BY id DESC LIMIT 30`);
+  const whEx = dm.webhookNotDemo(dataMode, '');
+  const log = tx.all(`SELECT * FROM webhook_log ${whEx ? `WHERE ${whEx}` : ''} ORDER BY id DESC LIMIT 30`);
   const logRows = log.map((r) => `<tr><td class="small muted">${S.fmtDT(r.ingested_at)}</td><td>${S.esc(r.platform)}</td>
     <td class="small muted">${S.esc(r.ref || '')}</td>
     <td><span class="pill ${r.status === 'processed' ? 'g' : r.status === 'failed' ? 'r' : 'o'}">${S.esc(r.status)}</span></td>
@@ -496,16 +654,18 @@ function integrations(db, user, p) {
         body:JSON.stringify({client_id:Number(b.dataset.client)})});
       alert('Test event sent: '+r.status+' — refresh log');location.reload();});
   </script>`;
-  return S.layout({ title: 'Integrations', nav: S.navFor(user), active: 'integrations.html', user, body });
+  return S.layout({ title: 'Integrations', nav: S.navFor(user), active: 'integrations.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Duplicates
 function duplicates(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const { likelyDuplicates } = require('./lib/identity');
   const clients = tx.all(`SELECT id, name FROM client`);
   const cid = p.client || clients[0]?.id;
-  const dups = cid ? likelyDuplicates(tx, cid) : [];
+  const dups = cid ? likelyDuplicates(tx, cid, dataMode === 'live') : [];
   const rows = dups.map((d) => `<tr>
     <td><a href="/lead/${d.a.id}">${S.esc(d.a.name || '—')}</a> <span class="small muted">${S.esc(d.a.phone || '')}</span></td>
     <td><a href="/lead/${d.b.id}">${S.esc(d.b.name || '—')}</a> <span class="small muted">${S.esc(d.b.phone || '')}</span></td>
@@ -523,7 +683,7 @@ function duplicates(db, user, p) {
   </div>
   <div class="card"><div class="tabwrap"><table><thead><tr><th>Keep</th><th>Merge into</th><th>Email</th><th>Action</th></tr></thead>
   <tbody>${rows || '<tr><td class="muted">No likely duplicates</td></tr>'}</tbody></table></div></div>`;
-  return S.layout({ title: 'Duplicates', nav: S.navFor(user), active: 'duplicates.html', user, body });
+  return S.layout({ title: 'Duplicates', nav: S.navFor(user), active: 'duplicates.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // ---------------------------------------------------------------- Admin
@@ -552,6 +712,10 @@ function admin(db, user, p) {
     threshold: tx.get(`SELECT value FROM settings WHERE key='wasted_spend_threshold'`)?.value || '0',
     capi: tx.get(`SELECT value FROM settings WHERE key='capi'`)?.value || 'dry',
   };
+  // Master v9: current DATA_MODE + whether an admin toggle overrides the env
+  const dm = require('./lib/datamode');
+  const dmMode = dm.mode(tx);
+  const dmOverride = tx.get(`SELECT value FROM settings WHERE key='data_mode'`)?.value || '';
   const body = `
   ${setupCard}
   <div class="grid g2">
@@ -566,6 +730,18 @@ function admin(db, user, p) {
         <div><label>CAPI mode</label><select name="capi"><option value="dry" ${settings.capi === 'dry' ? 'selected' : ''}>dry-run</option><option value="live" ${settings.capi === 'live' ? 'selected' : ''}>live</option></select></div>
         <button class="btn">Save</button>
       </form>
+      ${['owner', 'admin'].includes(user.role) ? `
+      <div class="note" style="margin-top:12px">
+        <b>DATA_MODE</b> — which data population the screens show (v9):
+        <span class="pill ${dmMode === 'demo' ? 'b' : 'g'}">current: ${S.esc(dmMode)}</span>
+        ${dmOverride ? '<span class="badge">set by admin toggle (wins over the DATA_MODE env var)</span>' : '<span class="badge">from DATA_MODE env / default</span>'}
+        <div class="row" style="margin-top:8px;gap:8px">
+          <form method="post" action="/admin/data-mode"><input type="hidden" name="mode" value="demo"><button class="btn sm ${dmOverride !== 'demo' ? 'sec' : ''}">Demo (seed + real)</button></form>
+          <form method="post" action="/admin/data-mode"><input type="hidden" name="mode" value="live"><button class="btn sm ${dmOverride !== 'live' ? 'sec' : ''}">Live (real only)</button></form>
+          <form method="post" action="/admin/data-mode"><input type="hidden" name="mode" value="default"><button class="btn sm sec">Use env default</button></form>
+        </div>
+        <div class="small muted" style="margin-top:6px">Live hides every seed/demo row on all screens (clean empty states); demo shows seed fixtures + real rows together, with the yellow band. Changes are audit-logged.</div>
+      </div>` : ''}
       <div class="note">Security checklist: RLS by client_id at DB level · encrypted Meta/gateway/webhook secrets · every inbound webhook signature-verified · 2FA on team logins · phone/email masked for roles without need · daily backups (restore tested monthly) · rate-limited public ingest.</div>
       <form class="inline" method="post" action="/admin/prune" style="margin-top:8px">
         <div><label>Delete a lead (privacy request)</label><input name="lead_id" placeholder="lead id" style="width:120px"></div>
@@ -585,16 +761,21 @@ function admin(db, user, p) {
   <div class="card"><h2>Audit log <span class="badge">who viewed / exported / changed what</span></h2>
     <div class="tabwrap"><table><thead><tr><th>When</th><th>User</th><th>Action</th><th>Entity</th></tr></thead>
     <tbody>${auditRows || '<tr><td class="muted">No audit entries</td></tr>'}</tbody></table></div></div>`;
-  return S.layout({ title: 'Admin', nav: S.navFor(user), active: 'admin.html', user, body });
+  return S.layout({ title: 'Admin', nav: S.navFor(user), active: 'admin.html', user, body, band: S.layoutDemoBand(dmMode) });
 }
 
 // ---------------------------------------------------------------- Client portal
 function portal(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
+  const live = dataMode === 'live';
   // client role: only their own client
   const myClients = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : [];
   const cid = myClients[0];
-  const where = user.role === 'client' ? `WHERE l.client_id=${cid}` : 'WHERE 1=1';
+  let where = user.role === 'client' ? `WHERE l.client_id=${cid}` : 'WHERE 1=1';
+  const exLead = dm.leadNotDemo(dataMode, 'l');
+  if (exLead) where += ` AND ${exLead}`; // live mode: portal shows real leads only
   const leads = tx.all(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 50`);
   const leadsRows = leads.map((r) => `<tr><td><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a></td>
     <td class="small muted">${S.esc(r.client_name || '')}</td><td class="small">${phoneOf(user, r)}</td>
@@ -607,7 +788,7 @@ function portal(db, user, p) {
     const ws = S.weeklySummary(tx, {
       attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value || 'last_paid_click',
       attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value || '30',
-    }, [cid]);
+    }, [cid], live);
     const hasPdf = !!tx.get(`SELECT 1 FROM settings WHERE key=?`, 'weekly_pdf_client_' + cid)?.value;
     const k = (l, v) => `<div class="kpi"><div class="l">${S.esc(l)}</div><div class="v" style="font-size:16px">${S.esc(v)}</div></div>`;
     weeklyCard = `
@@ -637,7 +818,7 @@ function portal(db, user, p) {
   <div class="card"><h2>My leads</h2><div class="tabwrap"><table>
     <thead><tr><th>Name</th><th>Client</th><th>Phone</th><th>Stage</th></tr></thead>
     <tbody>${leadsRows || '<tr><td class="muted">No leads</td></tr>'}</tbody></table></div></div>`;
-  return S.layout({ title: 'Portal', nav: S.navFor(user), active: 'dashboard.html', user, body });
+  return S.layout({ title: 'Portal', nav: S.navFor(user), active: 'dashboard.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // Phase G — pilot gates tooling screen (team-only). Runs the gate assertion
@@ -645,6 +826,8 @@ function portal(db, user, p) {
 const P = require('./lib/pilot');
 function pilot(db, user, p) {
   const tx = makeTx(db, user);
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
   const clients = tx.all(`SELECT id, name FROM client ORDER BY id`);
   const g = P.runGates(tx);
   const checked = p.url ? P.checkAdUrl(decodeURIComponent(p.url)) : null;
@@ -730,7 +913,7 @@ John,+919810000001,john@example.com,Mumbai,Paid,4999,1,1</textarea>
     </div>
   </div>
   `;
-  return S.layout({ title: 'Pilot gates', nav: S.navFor(user), active: 'pilot', user, body });
+  return S.layout({ title: 'Pilot gates', nav: S.navFor(user), active: 'pilot', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 // Phase H — production alerts/monitoring screen (team-only). Surfaces the
@@ -739,7 +922,9 @@ John,+919810000001,john@example.com,Mumbai,Paid,4999,1,1</textarea>
 const HLT = require('./lib/health');
 function alerts(db, user, p) {
   const tx = makeTx(db, null); // operational view: system-scoped (no RLS filter)
-  const h = HLT.health(tx, db);
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
+  const h = HLT.health(tx, db, dataMode);
   const A = h.alerts;
   const on = (b) => `<span class="pill ${b ? 'r' : 'g'}">${b ? 'ALERT' : 'ok'}</span>`;
   const mt = h.db.meta_token || { expired: 0, expiringSoon: 0, tracked: 0, note: '' };
@@ -785,7 +970,7 @@ function alerts(db, user, p) {
       : `<div class="small muted" style="margin-top:8px">Set <code>XACQORA_XT_SUBDOMAIN</code> (or host xt.js on your own subdomain) so third-party CSP pages can load it.</div>`}
   </div>
   `;
-  return S.layout({ title: 'Alerts', nav: S.navFor(user), active: 'alerts.html', user, body });
+  return S.layout({ title: 'Alerts', nav: S.navFor(user), active: 'alerts.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
 function notFound(user) {

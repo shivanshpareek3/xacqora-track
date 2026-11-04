@@ -43,6 +43,10 @@ function open() {
     // Meta token-expiry (live connect): where the last /debug_token check noted
     // when the per-account system-user token expires, for the /alerts warning.
     sys.exec(`ALTER TABLE meta_ad_account ADD COLUMN IF NOT EXISTS token_expires_at TEXT`);
+    // v9: the account's billing currency (the adaccount `currency` field —
+    // live-verified; `currency_code` does not exist and 400s with #100).
+    // Recorded so the dashboard KPIs can show billing currency + INR together.
+    sys.exec(`ALTER TABLE meta_ad_account ADD COLUMN IF NOT EXISTS currency TEXT`);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -96,6 +100,11 @@ function open() {
   // Meta token-expiry (live connect): see the PG branch for what it is.
   const ma = cols('meta_ad_account');
   if (!ma.includes('token_expires_at')) db.exec(`ALTER TABLE meta_ad_account ADD COLUMN token_expires_at TEXT`);
+  // Master v9: the account's billing currency (from the ad account's
+  // `currency` field, recorded on each pull — not `currency_code`) for the
+  // dashboard KPI cards.
+  const ma2 = cols('meta_ad_account');
+  if (!ma2.includes('currency')) db.exec(`ALTER TABLE meta_ad_account ADD COLUMN currency TEXT`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,

@@ -60,6 +60,12 @@ Sign in, Meta spend, Weekly summary.
 - **Events + pipeline** — every action is an event on the lead timeline;
   auto stage moves (`webinar_joined -> Attended`, `payment_success -> Paid`, …).
 - **Meta pull** — scheduled ad account pull (spend + entities), mock generator when no token.
+- **Real-data dashboard + DATA_MODE (v9)** — dashboard/reports centre on the real
+  ad accounts (`act_…`, 7d/30d KPIs in INR + billing currency, top campaigns/ads,
+  30-day trend, pull status + "Pull now"; ROAS shows "N/A — pilot live" until
+  revenue is real). `DATA_MODE` (`demo` default locally, `live` in prod) hides the
+  seed fixtures in live mode, with the yellow demo band on / off and clean empty
+  states; admin toggle is audit-logged. See `docs/dashboard-real-data.md`.
 - **CAPI push** — hashed phone/email, fbc/fbp, deterministic `event_id` for dedup;
   never sends twice, suppresses Purchase on refund, records Event Match Quality.
 - **Attribution** — last paid click (default, 30d), first click, linear, lead source;
@@ -81,6 +87,7 @@ Sign in, Meta spend, Weekly summary.
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 - `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
 - `docs/meta-live-connect.md` — Meta live connect (pull only, CAPI dry-run): the 3-point "what to grab from Meta" list, `.env`→DB token bridge, live-pull test + ≤1% spend gate, `/alerts` token-expiry + friendly failure lines
+- `docs/dashboard-real-data.md` — v9: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, dev-DB hygiene
 
 ## Tests
 
@@ -94,6 +101,7 @@ node test/xt-queue.js  # xt.js survives the API being down (nothing lost)
 node test/liveapi.js   # Razorpay/Cashfree gateway signatures (verified spec)
 node test/gates.js     # Phase G pilot tooling: CSV import, URL checker, G1–G4, accuracy checkers
 node test/metalive.js  # Meta live-connect bridge: .env->DB token sync, liveMode gate, CAPI dry, /alerts signals
+node test/datamode.js  # DATA_MODE: resolution, admin toggle, demo empty-predicates, live seed-only exclusion, KPI aggregation
 
 # backups (Phase S / PRD §10)
 node scripts/backup.js      # WAL-safe VACUUM INTO snapshot -> backups/ (keep 7)

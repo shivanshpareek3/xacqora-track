@@ -198,10 +198,16 @@ function isWithinRange(iso, from, to) {
 }
 
 // ---------------------------------------------------------------- reports
-function funnelReport(tx, clientId, settings, clientIds) {
-  // clientId null -> all clients (dashboard); a number -> one client; clientIds -> portal set
+function funnelReport(tx, clientId, settings, clientIds, live = false) {
+  // clientId null -> all clients (dashboard); a number -> one client; clientIds -> portal set.
+  // live (v9 DATA_MODE): when true, seed/demo leads are excluded so the funnel
+  // reflects real gateway leads only. Default false keeps every prior caller.
+  const dm = require('./datamode');
+  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
   const inList = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
-  const filter = clientId != null ? `WHERE l.client_id = ${Number(clientId)}` : inList ? `WHERE l.client_id IN (${inList})` : '';
+  let filter = clientId != null ? `WHERE l.client_id = ${Number(clientId)}` : inList ? `WHERE l.client_id IN (${inList})` : '';
+  if (liveLeadEx && filter) filter += ` AND ${liveLeadEx}`;
+  else if (liveLeadEx) filter = `WHERE ${liveLeadEx}`;
   const rows = tx.all(`
     SELECT l.id, l.stage, l.created_at, l.source_unknown,
            COALESCE(d.net,0) rev, d.refunded_at
@@ -273,49 +279,72 @@ function funnelReport(tx, clientId, settings, clientIds) {
 }
 
 // clientIds: optional array; when present, only that client's ads/spend/deals count
-function adPerformance(tx, settings, clientIds) {
+function adPerformance(tx, settings, clientIds, adAccount, live = false) {
+  // adAccount (Master v9): optional ad_account_id ('act_…'). When set, every
+  // ad + spend query is narrowed to that single account. '' / undefined = off.
+  // live (v9 DATA_MODE): when true, the demo ACT- ad accounts / leads / deals
+  // are excluded so ad performance reflects real data only. Default false.
+  const dm = require('./datamode');
+  const metaEx = live ? dm.metaNotDemo(dm.LIVE, 'ad') : '';
+  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
   const model = settings.attribution_model || 'last_paid_click';
   const win = Number(settings.attribution_window_days) || 30;
   const inClause = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
-  const accIn = inClause ? `(SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inClause}))` : null;
+  const accIn = inClause ? `(SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inClause}) ${metaEx ? `AND ${metaEx.replace(/^ad\./, '')}` : ''})` : null;
   const salesWhere = inClause ? `WHERE l.client_id IN (${inClause})` : '';
+  const adAccW = adAccount ? ` AND ad.ad_account_id = '${adAccount}'` : '';
+  const metaExW = metaEx ? ` AND ${metaEx}` : '';
   // scoped query filters meta_ad by its ad_account_id (only that account's
   // client); adset has no client_id column so we scope through the account
+  // unscoped where: single-account scoping + live-mode demo exclusion
+  // (metaEx already carries the `ad.` alias: `NOT (ad.ad_account_id LIKE 'ACT-%')`)
+  const unscopedWhere = [
+    adAccount ? `ad.ad_account_id = '${adAccount}'` : null,
+    metaEx || null,
+  ].filter(Boolean);
   const ads = inClause
     ? tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
        COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
        LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)
-       WHERE ad.ad_account_id IN ${accIn}`)
+       WHERE ad.ad_account_id IN ${accIn}${adAccW}`)
     : tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
        COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
-       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)`);
+       LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)
+       ${unscopedWhere.length ? `WHERE ${unscopedWhere.join(' AND ')}` : ''}`);
   const adAccounts = inClause
     ? tx.all(`SELECT ad_account_id, name FROM meta_ad_account WHERE client_id IN (${inClause})`)
-    : tx.all(`SELECT ad_account_id, name FROM meta_ad_account`);
+    : (adAccount
+      ? tx.all(`SELECT ad_account_id, name FROM meta_ad_account WHERE ad_account_id = '${String(adAccount).replace(/'/g, '')}'`)
+      : tx.all(`SELECT ad_account_id, name FROM meta_ad_account`));
   const accById = {}; for (const a of adAccounts) accById[a.ad_account_id] = a.name;
   const adIdList = ads.map((a) => a.id).map((x) => `'${String(x).replace(/'/g, '')}'`).join(',');
   // when scoped, the unscoped all-ads fallback must NEVER run (even if the
   // client has zero ads) — otherwise another client's spend would leak in
   // conv = SUM(s.conversions) = Meta-reported conversions for that ad (PRD §5.7
   // Meta-vs-Track: compare Meta's number against our counted sales/leads).
+  const spendEx = live ? dm.spendNotDemo(dm.LIVE, 's') : '';
+  const spendExW = spendEx ? ` AND ${spendEx}` : '';
   const spends = inClause
     ? (adIdList
       ? tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk,
               COALESCE(SUM(s.conversions),0) conv
-          FROM spend_daily s WHERE s.ad_id IN (${adIdList}) GROUP BY s.ad_id`)
+          FROM spend_daily s WHERE s.ad_id IN (${adIdList})${spendExW} GROUP BY s.ad_id`)
       : [])
     : tx.all(`SELECT s.ad_id, SUM(s.spend_inr) spend, SUM(s.impressions) imp, SUM(s.clicks) clk,
-              COALESCE(SUM(s.conversions),0) conv FROM spend_daily s GROUP BY s.ad_id`);
+              COALESCE(SUM(s.conversions),0) conv FROM spend_daily s WHERE 1=1${spendExW} GROUP BY s.ad_id`);
   const spendByAd = {}; for (const s of spends) spendByAd[s.ad_id] = s;
 
-  // revenue attribution per ad
+  // revenue attribution per ad — keep the client scope AND the live-mode
+  // demo-lead exclusion in force at the same time (live + scoped client)
   const revByAd = {};
-  const salesWhereL = inClause ? `WHERE l.client_id IN (${inClause})` : '';
+  const salesParts = [];
+  if (inClause) salesParts.push(`l.client_id IN (${inClause})`);
+  if (liveLeadEx) salesParts.push(liveLeadEx);
   const sales = tx.all(`
     SELECT l.id lead_id, l.name, l.phone, l.client_id,
       (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) amount,
       (SELECT MIN(d.paid_at) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid_at
-    FROM lead l ${salesWhereL}`);
+    FROM lead l ${salesParts.length ? `WHERE ${salesParts.join(' AND ')}` : ''}`);
   for (const s of sales) {
     if (!s.amount) continue;
     const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, s.lead_id);
@@ -390,11 +419,16 @@ function adPerformance(tx, settings, clientIds) {
 }
 
 function wastedSpend(ap) { return ap.rows.filter((r) => r.wasted); }
-function newVsOld(tx, settings, clientIds) {
+function newVsOld(tx, settings, clientIds, live = false) {
+  const dm = require('./datamode');
+  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const parts = [];
+  if (clientIds && clientIds.length) parts.push(`l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})`);
+  if (liveLeadEx) parts.push(liveLeadEx);
+  const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
   const from = settings.report_from || null;
   const to = settings.report_to || null;
-  const inClause = clientIds && clientIds.length ? `WHERE l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
-  const all = tx.all(`SELECT l.id, l.created_at, (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) rev FROM lead l ${inClause}`);
+  const all = tx.all(`SELECT l.id, l.created_at, (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) rev FROM lead l ${where}`);
   const inRange = all.filter((r) => isWithinRange(r.created_at, from, to));
   const out = { in_range: [], older: [] };
   for (const r of inRange) out.in_range.push(r);
@@ -407,13 +441,18 @@ function newVsOld(tx, settings, clientIds) {
     older: out.older.map((x) => ({ id: x.id, created_at: x.created_at, rev: x.rev })),
   };
 }
-function metaVsTracker(tx, settings, clientIds) {
+function metaVsTracker(tx, settings, clientIds, adAccount, live = false) {
   // PRD §5.7 Meta-vs-Track: per ad, Meta-reported conversions (from the spend
   // pull) vs our counted leads, with a delta column so we see where Meta
   // over/under-reports. Person-level data never comes back from Meta.
-  const ap = adPerformance(tx, settings || {}, clientIds);
+  // adAccount (v9): scope the per-ad table to one ad account.
+  // live (v9): exclude demo ACT- accounts / demo leads from the comparison.
+  const ap = adPerformance(tx, settings || {}, clientIds, adAccount, live);
+  const dm = require('./datamode');
+  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
   // scope through the lead (event has no client_id of its own)
-  const scope = clientIds && clientIds.length ? `l.client_id IN (${clientIds.map((n) => Number(n)).join(',')}) AND` : '';
+  let scope = clientIds && clientIds.length ? `l.client_id IN (${clientIds.map((n) => Number(n)).join(',')}) AND` : '';
+  if (liveLeadEx) scope += `${liveLeadEx} AND`;
   const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id WHERE ${scope} e.type='meta_form_lead'`)?.c || 0;
   const rows = ap.rows
     .filter((r) => r.meta_conv > 0 || r.leads > 0)
@@ -431,24 +470,29 @@ function metaVsTracker(tx, settings, clientIds) {
     note: 'Meta "Conversions" (from the spend pull) vs our counted leads, per ad. delta = Meta − ours; a positive delta means Meta is over-reporting. Person-level data never comes back from Meta.',
   };
 }
-function sourceMix(tx, clientIds) {
-  const inClause = clientIds && clientIds.length ? `WHERE l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
+function sourceMix(tx, clientIds, live = false) {
+  const dm = require('./datamode');
+  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const parts = [];
+  if (clientIds && clientIds.length) parts.push(`l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})`);
+  if (liveLeadEx) parts.push(liveLeadEx);
+  const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
   const srcExpr = `CASE
     WHEN EXISTS(SELECT 1 FROM event e WHERE e.lead_id=l.id AND e.type='meta_form_lead') THEN 'Meta Instant Form'
     WHEN l.phone IS NOT NULL OR l.email IS NOT NULL THEN 'Landing page form'
     ELSE 'Organic / unknown'
   END`;
-  const rows = tx.all(`SELECT ${srcExpr} src, COUNT(*) c FROM lead l ${inClause} GROUP BY src`);
+  const rows = tx.all(`SELECT ${srcExpr} src, COUNT(*) c FROM lead l ${where} GROUP BY src`);
   // PRD "every number links to the leads behind it": attach the lead-id list
   // for each source bucket so the mix chips can drill into /leads?ids=…
   const bySrc = {};
-  for (const r of tx.all(`SELECT l.id, ${srcExpr} src FROM lead l ${inClause}`)) (bySrc[r.src] = bySrc[r.src] || []).push(r.id);
+  for (const r of tx.all(`SELECT l.id, ${srcExpr} src FROM lead l ${where}`)) (bySrc[r.src] = bySrc[r.src] || []).push(r.id);
   for (const r of rows) r.lead_ids = bySrc[r.src] || [];
   return rows;
 }
-function weeklySummary(tx, settings, clientIds) {
-  const fp = funnelReport(tx, null, settings, clientIds);
-  const ap = adPerformance(tx, settings, clientIds);
+function weeklySummary(tx, settings, clientIds, live = false) {
+  const fp = funnelReport(tx, null, settings, clientIds, live);
+  const ap = adPerformance(tx, settings, clientIds, null, live);
   const waste = wastedSpend(ap);
   return {
     generated_at: new Date().toISOString(),
@@ -459,6 +503,146 @@ function weeklySummary(tx, settings, clientIds) {
     total: ap.total,
     note: 'Auto-generated weekly summary. Revenue is net of refunds. Spend matches Meta Ads Manager within 1% when the Meta pull is up to date.',
   };
+}
+
+// ---------------------------------------------------------------- Master v9: real-data dashboard report
+// One scoped query set driving the account-switcher dashboard.
+//   adAccount  — a meta_ad_account.ad_account_id ('act_…'); '' = "All accounts"
+//   clientIds  — client login's own ids; null = all (team role)
+//   dataMode   — 'demo' (default; demo ACT- spend counts toward "All accounts")
+//                | 'live' (demo rows excluded by the datamode predicates)
+// Returns { accounts, kpis{d7,d30}, trend[30], topCampaigns[5], topAds[5],
+//          pull, accountSpends, revenue, currency, defaultAccount }.
+function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'demo' } = {}) {
+  const dm = require('./datamode');
+  const spendEx = dm.spendNotDemo(dataMode, 's');
+  const leadEx = dm.leadNotDemo(dataMode, 'l');
+  const dealEx = dm.dealNotDemo(dataMode, 'd');
+  const metaEx = dm.metaNotDemo(dataMode, '');
+  const clientScope = (col = 'client_id') => (clientIds && clientIds.length
+    ? `${col} IN (${clientIds.map((n) => Number(n)).join(',')})` : '1=1');
+  // Switcher list: the operator's REAL ad accounts only (act_…), with last-pull
+  // status per row. In demo mode the demo ACT- accounts are NOT offered here
+  // (design: switcher = real act_ only); demo spend still feeds the "All"
+  // aggregate below.
+  const accounts = tx.all(`
+    SELECT id, client_id, name, ad_account_id, currency, status, last_pull_at, last_error, auto_pull
+    FROM meta_ad_account
+    WHERE ad_account_id NOT LIKE 'ACT-%' AND ${clientScope('client_id')} ${metaEx ? `AND ${metaEx.replace(/\./g, '')}` : ''}
+    ORDER BY ad_account_id`);
+  // Spend scope for the numbers: a specific account, else every in-scope account.
+  // The datamode spendEx predicate is what removes demo ACT- spend in live mode.
+  const clean = (v) => String(v).replace(/'/g, '');
+  const adScope = adAccount
+    ? `s.ad_account_id = '${clean(adAccount)}'`
+    : `s.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE ${clientScope('client_id')})`;
+  const since = (days) => new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10);
+  const kpi = (from) => {
+    const o = tx.get(`
+      SELECT COALESCE(SUM(s.spend),0) spend, COALESCE(SUM(s.spend_inr),0) spend_inr,
+        COALESCE(SUM(s.impressions),0) impressions, COALESCE(SUM(s.reach),0) reach,
+        COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.conversions),0) conversions
+      FROM spend_daily s WHERE ${adScope}
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?`, from) || {};
+    return {
+      spend: o.spend || 0, spend_inr: o.spend_inr || 0,
+      impressions: o.impressions || 0, reach: o.reach || 0,
+      clicks: o.clicks || 0, conversions: o.conversions || 0,
+      ctr: o.impressions ? +(((o.clicks || 0) / o.impressions) * 100).toFixed(2) : null,
+      cpc: o.clicks ? +(((o.spend_inr || 0) / o.clicks).toFixed(2)) : null,
+    };
+  };
+  const kpis = { d7: kpi(since(7)), d30: kpi(since(30)) };
+  // 30-day daily trend (spend INR + clicks + impressions), zero-filled.
+  const tRows = tx.all(`SELECT s.date, COALESCE(SUM(s.spend_inr),0) spend,
+    COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.impressions),0) impressions
+    FROM spend_daily s WHERE ${adScope}
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ? GROUP BY s.date`, since(30));
+  const byDate = {}; for (const r of tRows) byDate[r.date] = r;
+  const trend = [];
+  for (let i = 29; i >= 0; i--) {
+    const date = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+    const r = byDate[date] || {};
+    trend.push({ date, spend: Math.round(r.spend || 0), clicks: r.clicks || 0, impressions: r.impressions || 0 });
+  }
+  // Per-campaign daily split (used when a single account is selected).
+  // LEFT JOINs: the ad tree may lag the first pull (spend lands before
+  // campaign names) — real spend must still chart, with "(untitled)" names.
+  const campTrend = adAccount
+    ? tx.all(`SELECT s.date, COALESCE(c.name,'(untitled)') campaign, COALESCE(SUM(s.spend_inr),0) spend
+        FROM spend_daily s
+        LEFT JOIN meta_ad m ON m.id=s.ad_id
+        LEFT JOIN meta_adset as_ ON as_.id=m.adset_id
+        LEFT JOIN meta_campaign c ON c.id=as_.campaign_id
+        WHERE ${adScope}
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ? GROUP BY s.date, c.id, c.name ORDER BY s.date`, since(30))
+    : [];
+  // Top campaigns / top ads by 7-day spend. LEFT JOINs: the ad tree can lag
+  // the first pull (spend_daily lands while campaigns/ads aren't stored yet),
+  // so real spend must still show — name/status fall back to "(unknown)" / ad_id.
+  const topCampaigns = tx.all(`
+    SELECT COALESCE(c.id,'na') id, COALESCE(c.name,'(unknown)') name, COALESCE(c.status,'') status,
+      COALESCE(SUM(s.spend_inr),0) spend, COALESCE(SUM(s.impressions),0) impressions
+    FROM spend_daily s
+    LEFT JOIN meta_ad m ON m.id=s.ad_id
+    LEFT JOIN meta_adset as_ ON as_.id=m.adset_id
+    LEFT JOIN meta_campaign c ON c.id=as_.campaign_id
+    WHERE ${adScope}
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?
+    GROUP BY c.id, c.name, c.status ORDER BY spend DESC LIMIT 5`, since(7));
+  const topAds = tx.all(`
+    SELECT s.ad_id ad_id, COALESCE(m.name,'(unknown)') name, COALESCE(m.status,'') status, m.creative_img,
+      COALESCE(SUM(s.spend_inr),0) spend, COALESCE(SUM(s.impressions),0) impressions,
+      COALESCE(SUM(s.clicks),0) clicks
+    FROM spend_daily s
+    LEFT JOIN meta_ad m ON m.id=s.ad_id
+    WHERE ${adScope}
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?
+    GROUP BY s.ad_id, m.name, m.status, m.creative_img ORDER BY spend DESC LIMIT 5`, since(7));
+  // Per-account 7d spend (drives the "largest account is the default" rule).
+  const accountSpends = tx.all(`
+    SELECT s.ad_account_id, COALESCE(SUM(s.spend_inr),0) spend
+    FROM spend_daily s
+    WHERE s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}
+    GROUP BY s.ad_account_id`, since(7));
+  const spendByAcc = {}; for (const r of accountSpends) spendByAcc[r.ad_account_id] = r.spend;
+  // "default = largest account" over the IN-SCOPE switcher accounts only
+  let defaultAccount = '';
+  for (const a of accounts) if ((spendByAcc[a.ad_account_id] || 0) > (spendByAcc[defaultAccount] || 0)) defaultAccount = a.ad_account_id;
+  // Pull status for the selected scope.
+  const pull = adAccount
+    ? ((tx.get(`SELECT last_pull_at, last_error FROM meta_ad_account WHERE ad_account_id=?`, adAccount)) || {})
+    : accounts.map((a) => ({ ad_account_id: a.ad_account_id, name: a.name, last_pull_at: a.last_pull_at, last_error: a.last_error, auto_pull: a.auto_pull }));
+  // Revenue for the ROAS slot: attributed sales in scope. In live mode pre-pilot
+  // this is 0 -> the dashboard renders "N/A — pilot live", never a fake ROAS.
+  const revenue = tx.get(`
+    SELECT COALESCE(SUM(d.amount),0) rev FROM deal d JOIN lead l ON l.id=d.lead_id
+    WHERE d.status='success' AND d.refunded_at IS NULL ${leadEx ? 'AND ' + leadEx : ''} ${dealEx ? 'AND ' + dealEx : ''}
+      ${adAccount ? `AND l.client_id IN (SELECT client_id FROM meta_ad_account WHERE ad_account_id='${clean(adAccount)}')` : ''}
+  `)?.rev || 0;
+  return {
+    accounts, kpis, trend, campTrend, topCampaigns, topAds,
+    pull, accountSpends, revenue, defaultAccount,
+    currency: adAccount ? (tx.get(`SELECT currency FROM meta_ad_account WHERE ad_account_id=?`, adAccount)?.currency || null) : null,
+  };
+}
+
+// Zero-dep SVG line/area chart for the spend trend. data: [{date, spend,…}].
+// theme-safe (uses the .spark-* CSS vars below); tooltips via <title>.
+function sparklineSvg(series, { w = 560, h = 160, metric = 'spend' } = {}) {
+  if (!series.length) return '';
+  const pad = 8, x0 = pad, x1 = w - pad, y0 = h - 24, y1 = 12;
+  const max = Math.max(1, ...series.map((d) => d[metric] || 0));
+  const px = (i) => series.length === 1 ? (x0 + x1) / 2 : x0 + ((x1 - x0) * i) / (series.length - 1);
+  const py = (v) => y0 - ((y0 - y1) * (v || 0)) / max;
+  const pts = series.map((d, i) => `${px(i)},${py(d[metric] || 0)}`).join(' ');
+  const area = `${x0},${y0} ${pts} ${px(series.length - 1)},${y0}`;
+  const ticks = [0, Math.floor(series.length / 2), series.length - 1]
+    .filter((i, n, a) => a.indexOf(i) === n)
+    .map((i) => `<text class="spark-lbl" x="${px(i)}" y="${h - 8}" text-anchor="middle">${esc(series[i].date.slice(5))}</text>`).join('');
+  const dots = series.map((d, i) => `<circle class="spark-dot" cx="${px(i)}" cy="${py(d[metric] || 0)}" r="2.5"><title>${esc(d.date)}: ${String(Math.round((d[metric] || 0) * 100) / 100)}</title></circle>`).join('');
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none" role="img" aria-label="daily ${metric} trend">
+    <polygon class="spark-area" points="${area}"/><polyline class="spark-line" points="${pts}"/>${dots}${ticks}</svg>`;
 }
 
 // Flatten a weekly summary into { title, sections } for the PDF writer
@@ -568,6 +752,17 @@ form.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .bar i{display:block;height:100%;background:var(--blue);border-radius:4px}
 .chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-size:12px;color:var(--mut);margin:2px 4px 2px 0}
 .chip b{color:var(--tx)}
+/* Master v9 — ad-account switcher (top bar) + spend-trend sparkline */
+.accsel{margin-left:6px}
+.accsel label{display:none}
+.accsel select{max-width:210px;background:var(--panel2);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:6px 10px;font-size:12px}
+.empty-state{background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:26px 20px;text-align:center;color:var(--mut);font-size:14px;margin-bottom:14px}
+.empty-state a{color:var(--blue)}
+.spark{display:block}
+.spark-line{fill:none;stroke:var(--blue);stroke-width:2;vector-effect:non-scaling-stroke}
+.spark-area{fill:rgba(79,140,255,.12)}
+.spark-dot{fill:var(--blue)}
+.spark-lbl{fill:var(--mut);font-size:10px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .sp{flex:1}
 .muted{color:var(--mut)} .small{font-size:12px}
@@ -588,26 +783,48 @@ form.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 footer{color:var(--mut);font-size:11px;text-align:center;padding:18px}
 `;
 }
-// Master v7 §1.4/§6: the honest demo-data label. Shown while the app runs in
-// mock mode (every figure is seed fixture data); once XACQORA_LIVE=1 flips the
-// build to real gateways/Meta, the band disappears and the numbers become real.
-function layoutDemoBand() {
+// Master v7 §1.4/§6 + v9: the honest demo-data label. Tied to DATA_MODE, not
+// XACQORA_LIVE: `demo` mode shows the yellow band (seed fixture figures); `live`
+// mode hides it because the seed rows are excluded from every screen and the
+// numbers are real. (Legacy liveMode() fallback only if the screen doesn't
+// resolve a data mode.)
+function layoutDemoBand(mode) {
+  if (mode === 'live') return '';
+  if (mode === 'demo')
+    return `<div class="demo-band" title="Demo mode: seed fixture figures are included on these screens. Switch to DATA_MODE=live (Admin → Data mode) to view real data only.">Demo data — seed figures included. Real data: Admin → Data mode → live.</div>`;
+  // no mode passed: legacy behaviour (mock vs live)
   if (require('./liveapi').liveMode()) return '';
   return `<div class="demo-band" title="Mock mode: every figure on these screens comes from the seed fixtures, not a live gateway or Meta pull.">Demo data — the live pilot will show real numbers.</div>`;
 }
-function layout({ title, nav, active, user, body, notes = '' }) {
+// Master v9 account switcher (top bar). accSelect = { path, options, current }:
+// options = [{ value, label }] (label is plain text; screens may append a
+// status marker like " · error"). Renders a self-submitting <select> driving
+// ?acc= on `path` (All accounts = empty value).
+function layoutAccSelect(accSelect) {
+  if (!accSelect || !accSelect.options || !accSelect.options.length) return '';
+  const opts = [`<option value="">All accounts</option>`,
+    ...accSelect.options.map((o) =>
+      `<option value="${esc(o.value)}"${o.value === accSelect.current ? ' selected' : ''}>${esc(o.label)}</option>`)].join('');
+  const hidden = (accSelect.hidden || []).map((f) => `<input type="hidden" name="${esc(f.name)}" value="${esc(f.value)}">`).join('');
+  return `<form class="accsel" method="get" action="${esc(accSelect.path)}" title="Scope the dashboard to one ad account"><label>Ad account</label>
+    ${hidden}<select name="acc" onchange="this.form.submit()">${opts}</select></form>`;
+}
+function layout({ title, nav, active, user, body, notes = '', band, accSelect }) {
   const links = nav.map((n) => `<a href="/${n.path}" class="${n.path === active ? 'on' : ''}">${esc(n.label)}</a>`).join('');
+  const demoBand = band !== undefined ? band : layoutDemoBand();
+  const switcher = accSelect ? layoutAccSelect(accSelect) : '';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)} · Xacqora Track</title><style>${css()}</style></head>
 <body>
 <div class="top">
   <div class="brand">XACQORA <span>TRACK</span></div>
   <div class="nav">${links}</div>
+  ${switcher}
   <div class="userbox"><b>${esc(user.name)}</b>${esc(user.role)}${user.clientNames ? ' · ' + esc(user.clientNames.join(', ')) : ''}<br><a href="/signout">Sign out</a></div>
 </div>
-${layoutDemoBand()}
+${demoBand}
 <main>${notes}${body}</main>
-<footer>Xacqora Track demo build · SQLite + Node ${process.versions.node} · all webhooks verified with secret · CAPI events deduplicated by event_id</footer>
+<footer>Xacqora Track · Node ${process.versions.node} · webhooks signature-verified · CAPI deduped by event_id</footer>
 </body></html>`;
 }
 const NAV = [
@@ -695,7 +912,7 @@ module.exports = {
   buildCapiEvent, buildCapiPayload, maskPhone, maskEmail, roleSeesFullContacts, toCsv, toExcel,
   DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
   attributeSale, adClicksInWindow, isWithinRange,
-  funnelReport, adPerformance, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary, weeklyPdfLines,
+  funnelReport, adPerformance, metaAccountReport, sparklineSvg, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary, weeklyPdfLines,
   allowedClients,
-  esc, fmtINR, fmtN, fmtPct, fmtDT, layout, NAV, navFor, mockMetaPull,
+  esc, fmtINR, fmtN, fmtPct, fmtDT, layout, layoutDemoBand, layoutAccSelect, NAV, navFor, mockMetaPull,
 };

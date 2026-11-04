@@ -147,7 +147,9 @@ async function runLiveMetaPull(acc, { from, to, token, signal }) {
     for (let i = 0; i < adsetIds.length; i += 50) {
       const chunk = adsetIds.slice(i, i + 50).join(',');
       const rows = await graphGetAll(`/${acct}/adsets`,
-        { fields: 'id,name,status,campaign.id', limit: 250, filter: JSON.stringify([{ field: 'id', operator: 'IN', value: chunk }]) },
+        // The fields param needs the BRACKET edge form `campaign{id}` — the
+        // dotted `campaign.id` 400s in v19.0 ("Expected "("...campaign.id").
+        { fields: 'id,name,status,campaign{id}', limit: 250, filter: JSON.stringify([{ field: 'id', operator: 'IN', value: chunk }]) },
         token, signal);
       adsets.push(...rows);
     }
@@ -165,10 +167,20 @@ async function runLiveMetaPull(acc, { from, to, token, signal }) {
   // `quality_conversions` fields are invalid (#100), so don't request them.
   const timeRange = JSON.stringify({ since: from, until: to });
   const fields = 'ad_id,spend,impressions,reach,clicks,conversions';
-  const rows = await graphGetAll(`/${acct}/insights`,
-    { level: 'ad', fields, time_range: timeRange, time_increment: 1, limit: 250 }, token, signal);
+  const [rows, currency] = await Promise.all([
+    graphGetAll(`/${acct}/insights`,
+      { level: 'ad', fields, time_range: timeRange, time_increment: 1, limit: 250 }, token, signal),
+    // the account's billing currency (KPI cards show "₹ + currency"); a
+    // failure here must not sink the spend pull — currency just stays blank.
+    // NOTE: the field is `currency`, not `currency_code` (v19.0 AdAccount:
+    // `currency_code` 400s with #100 nonexisting-field; verified by probe).
+    graphGet(`/${acct}`, { fields: 'name,currency' }, token, signal).catch(() => null),
+  ]);
   const spend = rows.map((r) => mapInsightRow(r, acct)).filter(Boolean);
-  return { campaigns: tree.campaigns, adsets: tree.adsets, ads: tree.ads, spend };
+  return {
+    campaigns: tree.campaigns, adsets: tree.adsets, ads: tree.ads, spend,
+    currency: currency && currency.currency ? String(currency.currency).toUpperCase() : null,
+  };
 }
 
 // Real CAPI POST to the pixel's dataset. Callers pass a fully-built payload

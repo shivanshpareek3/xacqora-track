@@ -2,6 +2,79 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-04 (v9 — real-data dashboard + DATA_MODE switch; UI overhaul next session)
+
+Two tasks from the master v9 spec: **(1)** the dashboard/reports are now
+centred on the operator's **real** Meta ad accounts, and **(2)** demo seed
+data is behind a `DATA_MODE` switch with professional empty states. The UI
+overhaul ("website feel" → SaaS) is scoped to the next session.
+
+### Task 1 — real-data dashboard
+- **`server/lib/shared.js → metaAccountReport`** — the report engine: 7d/30d
+  KPIs (spend in INR + billing currency, impressions, reach, clicks, CTR,
+  avg CPC), 30-day zero-filled trend, per-campaign split, top-5 campaigns /
+  top-5 ads (LEFT JOINs so the ad tree may lag the first pull and spend
+  still charts), pull status + per-account next auto-pull (3 h ticker),
+  ROAS only when attributed revenue is real — otherwise "N/A — pilot live"
+  (never a fake number).
+- **`server/screens.js → dashboard/reports`** — rebuilt around the switcher:
+  a top-bar ad-account select (real `act_` accounts only, with last-pull
+  status), the whole dashboard scoped to the chosen account; "Pull now" for
+  team roles. Reports got the same switcher.
+- **`meta_ad_account.currency`** — new column (both schemas + idempotent
+  migration), recorded from the ad account's `currency` field on each pull
+  (the API field is `currency`, **not** `currency_code` — that 400s #100).
+  KPI cards show INR + billing currency side by side.
+- **`server/lib/liveapi.js`** — ad-tree fetch now uses the bracket edge
+  field `campaign{id}` (v19.0's field parser rejects dotted `campaign.id`
+  with a 400 "Expected (") so campaigns resolve.
+
+### Task 2 — DATA_MODE demo/live switch
+- **`server/lib/datamode.js`** (new) — resolution
+  `settings.data_mode → env DATA_MODE → 'demo'`; NOT-predicates that hide
+  the seed's own conventions only (leads 101–126, deals 1–10, `ACT-…`
+  accounts/entities/spend, seed webhook refs) — **never auto-id ranges**,
+  so real pilot rows are untouched.
+- **Admin toggle** — `POST /admin/data-mode` (owner/admin), audit-logged
+  (`data_mode.toggle`); three buttons demo/live/default on the admin screen.
+- **Every screen** threads `dm.mode(tx)` + the band (`layoutDemoBand`):
+  demo shows seed+real with the yellow band; live shows real rows with
+  clean empty states ("No leads yet — your first lead lands when the Meta
+  Instant Form webhook goes live (pilot cutover). Ad spend below is
+  already real."). Band added on all ten screens incl. duplicates/admin/
+  portal/pilot/alerts; live mode also excludes seed webhook failures from
+  the alerts board (`lib/health.js`, engine-aware).
+- **Engines:** default prod = `DATA_MODE=live`; local dev `.env` = `demo`.
+- **One-time dev-DB cleanup** (`tmp/clean-sweep-leads.js`): 181 sweep/
+  replay artifacts (all-NULL leads, one degenerate `{"client_id":1}` event
+  each, 0 deals/touchpoints) removed from the gitignored dev DB; the 26
+  named seed leads intact. Production never accumulates these.
+
+### Bugs found + fixed while verifying
+- `revByAd` ReferenceError → client dashboard/portal 500 (declaration
+  dropped in an earlier edit, re-added in `adPerformance`).
+- `webhookNotDemo` used the alias unconditionally → `no such column: w.ref`
+  on integrations (demo OK, live 500); now strips an empty alias.
+- `COALESCE(c.id,'?')` in `metaAccountReport` — the PG engine's `?`→`$n`
+  translator treats `?` inside a string literal as a placeholder → every
+  dashboard/reports page 500s on Postgres. Now `'na'`. **Caught by the new
+  `test/datamode.js` running on PG.**
+
+### Tests + docs
+- **`test/datamode.js`** (new, both engines): resolution order, admin
+  toggle, demo empty-predicates, live seed-only exclusion (real auto-id
+  rows survive), KPI aggregation (live excludes `ACT-` spend).
+- **`docs/dashboard-real-data.md`**: source of truth for every dashboard
+  number + live/demo semantics + dev-DB hygiene note.
+- Both engines green: SQLite 8 suites + replay + sweep (0 failures);
+  Postgres 9 suites + replay (all PASS). **Known pre-existing:** the PG
+  sweep's 2FA step (S.3) fails reading the enrolled TOTP secret via
+  `scripts/dbq.js` on PG — unrelated to this change (2FA/TOTP untouched);
+  SQLite sweep 2FA passes.
+
+Next session: master v9 Task 3 — the UI overhaul (SaaS dashboard look,
+build on the existing CSS primitives; the demo band + switcher stay).
+
 ## 2026-11-04 (Meta live pull GREEN — real spend in the DB, both engines)
 
 The env→DB bridge (`9a423fd`) landed, but the first live pull failed with
