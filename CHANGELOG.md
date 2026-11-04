@@ -2,6 +2,55 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-04 (v9 Task 3 — UI overhaul: "website feel" → SaaS dashboard)
+
+The third master-v9 task: turn the classic server-rendered screens from a
+"website jaisa, confusing" look into a clean SaaS dashboard aesthetic,
+built **on the existing CSS primitives** — one shared stylesheet in
+`shared.js`, zero-dep, no framework, no build step.
+
+### What changed
+- **`server/lib/shared.js → css()`** — a full design-system rewrite of the
+  single stylesheet: a token palette (`:root` surfaces / text / status /
+  geometry tokens), a soft radial-accent background, glassy sticky top bar,
+  KPI cards (micro-caps label + tabular value + hairline accent bar),
+  hover-able tables, tinted pills, focus rings on inputs, softer shadows
+  and a consistent radius scale. Legacy token names are kept as aliases
+  (inline styles in `screens.js` reference `--blue`/`--green`/`--ok`…).
+- **`server/lib/shared.js → layout()`** — a two-tier app shell: a fixed left
+  sidebar (brand + nav grouped into Workspace / Insight / Integrations /
+  Ops / Admin) + a slim sticky top bar (ad-account switcher + user + sign
+  out) for signed-in screens; the compact single top bar is kept for auth
+  / 403 / 404. Responsive: the sidebar collapses to a horizontal row under
+  900 px. All 14 screens + the demo band + the ad-account switcher render
+  through the same shell; routing, paths and role-gating are untouched.
+- **`server/lib/shared.js → navFor()`** — nav links now carry a `group`;
+  the SPA's `/api/app/me` still reports the same paths, so the SPA is
+  unaffected (it builds its own sidebar).
+- **`server/screens.js`** — page titles + actions move to a `pagehead`
+  pattern (title row flush-left, actions flush-right), and the dashboard
+  KPI strip is a `g6` grid. No query, permission or money logic changed
+  (those stay human-reviewed).
+
+### Kept working (regression-checked)
+Demo band, ad-account switcher, all 14 classic screens, the `/app` SPA
+shell, and the Task 2 empty states all render through the new shell. The
+demo band, switcher, empty states and role-gating logic are byte-for-byte
+the same — only presentation moved.
+
+### Docs
+- **`docs/ui-design-system.md`** (new): where the classic look comes from
+  (the `css()` blob + `layout()` shell), the token model, and how to verify
+  it. The Phase F SPA (`public/app/app.css`) keeps its own independent
+  design system and is intentionally **not** part of this pass.
+
+### Tests
+- Both engines green after the pass: SQLite 8 suites + replay + sweep
+  (0 failures); Postgres 9 suites + replay (all PASS). **Known
+  pre-existing, unrelated:** the PG sweep's 2FA step (S.3) fails reading
+  the enrolled TOTP secret on the PG cluster (memory:
+  `pg-sweep-2fa-preexisting`).
+
 ## 2026-11-04 (v9 — real-data dashboard + DATA_MODE switch; UI overhaul next session)
 
 Two tasks from the master v9 spec: **(1)** the dashboard/reports are now

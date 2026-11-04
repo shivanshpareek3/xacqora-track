@@ -161,13 +161,13 @@ function dashboard(db, user, p) {
 
   const titleSuffix = selected ? (rep.accounts.find((a) => a.ad_account_id === selected)?.name || selected) : (scopeIds ? 'My account' : 'All accounts');
   const body = `
-  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:12px">
+  <div class="row pagehead" style="justify-content:space-between;align-items:center">
     <h1 style="margin:0">Dashboard ${titleSuffix !== 'All accounts' ? `· <span class="badge">${S.esc(titleSuffix)}</span>` : '<span class="badge">all real accounts</span>'}</h1>
     <div class="row" style="gap:6px"><span class="badge">window</span>
       <a class="btn sm ${win === 'd7' ? '' : 'sec'}" href="/dashboard.html?win=7${selected ? '&acc=' + encodeURIComponent(selected) : ''}">7d</a>
       <a class="btn sm ${win === 'd30' ? '' : 'sec'}" href="/dashboard.html?win=30${selected ? '&acc=' + encodeURIComponent(selected) : ''}">30d</a></div>
   </div>
-  <div class="grid g4" style="grid-template-columns:repeat(6,1fr)">${kpiCards}</div>
+  <div class="grid g6">${kpiCards}</div>
 
   <div class="grid g2" style="margin-top:14px">
     <div class="card"><h2>Spend trend <span class="badge">last 30 days, INR</span></h2>
@@ -248,12 +248,12 @@ function leads(db, user, p) {
     <td class="small muted">${r.ev}</td>
   </tr>`).join('');
   const body = `
+  <div class="row pagehead" style="justify-content:space-between;align-items:center">
+    <h1 style="margin:0">Leads <span class="badge">${rows.length} shown</span></h1>
+    <a class="btn sec" href="/import">Import CSV</a>
+  </div>
   <div class="card">
-    <div class="row" style="justify-content:space-between">
-      <h1 style="margin:0">Leads <span class="badge">${rows.length} shown</span></h1>
-      <a class="btn sec" href="/import">Import CSV</a>
-    </div>
-    <form class="inline" method="get" action="/leads" style="margin-top:12px">
+    <form class="inline" method="get" action="/leads" style="margin-top:0">
       <div><label>Search</label><input name="q" placeholder="phone / email / name" value="${S.esc(q)}"></div>
       <div><label>Stage</label><select name="stage"><option value="">All</option>${stages.map((s) => `<option ${s === stage ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
       <div><label>Client</label><select name="client"><option value="">All</option>${clients.map((c) => `<option value="${c.id}" ${String(c.id) === client ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></div>
@@ -386,13 +386,11 @@ function pipeline(db, user, p) {
     ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
     : tx.all(`SELECT id, name FROM client`);
   const body = `
-  <div class="card">
-    <div class="row" style="justify-content:space-between">
-      <h1 style="margin:0">Pipeline</h1>
-      <form method="get" action="/pipeline.html" class="inline">
-        <div><label>Client</label><select name="client"><option value="">All</option>${clients.map((c) => `<option value="${c.id}" ${String(c.id) === client ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></div>
-        <button class="btn sec">Apply</button></form>
-    </div>
+  <div class="row pagehead" style="justify-content:space-between;align-items:center">
+    <h1 style="margin:0">Pipeline</h1>
+    <form method="get" action="/pipeline.html" class="inline">
+      <div><label>Client</label><select name="client"><option value="">All</option>${clients.map((c) => `<option value="${c.id}" ${String(c.id) === client ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></div>
+      <button class="btn sec">Apply</button></form>
   </div>
   <div class="kanban">${cols}</div>`;
   return S.layout({ title: 'Pipeline', nav: S.navFor(user), active: 'pipeline.html', user, body, band: S.layoutDemoBand(dataMode) });
@@ -497,11 +495,11 @@ function reports(db, user, p) {
       <a class="btn sm sec" href="/export/${kind}${q}&fmt=excel">${label} · Excel</a></div>`;
   };
   const body = `
+  <div class="row pagehead" style="justify-content:space-between;align-items:center">
+    <h1 style="margin:0">Reports <span class="badge">attribution: ${modelNames[settings.attribution_model] || settings.attribution_model}, ${settings.attribution_window_days}d window</span></h1>
+  </div>
   <div class="card">
-    <div class="row" style="justify-content:space-between">
-      <h1 style="margin:0">Reports <span class="badge">attribution: ${modelNames[settings.attribution_model] || settings.attribution_model}, ${settings.attribution_window_days}d window</span></h1>
-    </div>
-    <form class="inline" method="get" action="/reports.html" style="margin-top:10px">
+    <form class="inline" method="get" action="/reports.html" style="margin-top:0">
       ${user.role !== 'client' ? `<div><label>Client</label><select name="client"><option value="">All clients</option>${allClients.map((c) => `<option value="${c.id}" ${clientFilter === String(c.id) ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></div>` : ''}
       <div><label>Model</label><select name="model">${models.map((m) => `<option value="${m}" ${m === settings.attribution_model ? 'selected' : ''}>${modelNames[m]}</option>`).join('')}</select></div>
       <div><label>Window</label><select name="window">${[7, 14, 30, 60].map((w) => `<option ${String(w) === settings.attribution_window_days ? 'selected' : ''}>${w}d</option>`).join('')}</select></div>
@@ -677,9 +675,12 @@ function duplicates(db, user, p) {
       <button class="btn sm sec">Merge</button></form></td>
   </tr>`).join('');
   const body = `
-  <div class="card"><div class="row" style="justify-content:space-between"><h1 style="margin:0">Duplicate review</h1>
-    <form method="get" class="inline" action="/duplicates.html"><select name="client">${clients.map((c) => `<option value="${c.id}" ${String(c.id) === String(cid) ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></form></div>
-    <div class="small muted" style="margin:10px 0">Same email, different phone — merge by a human. Same phone for different clients is never merged.</div>
+  <div class="row pagehead" style="justify-content:space-between;align-items:center">
+    <h1 style="margin:0">Duplicate review</h1>
+    <form method="get" class="inline" action="/duplicates.html"><label>Client</label><select name="client">${clients.map((c) => `<option value="${c.id}" ${String(c.id) === String(cid) ? 'selected' : ''}>${S.esc(c.name)}</option>`).join('')}</select></form>
+  </div>
+  <div class="card">
+    <div class="small muted">Same email, different phone — merge by a human. Same phone for different clients is never merged.</div>
   </div>
   <div class="card"><div class="tabwrap"><table><thead><tr><th>Keep</th><th>Merge into</th><th>Email</th><th>Action</th></tr></thead>
   <tbody>${rows || '<tr><td class="muted">No likely duplicates</td></tr>'}</tbody></table></div></div>`;
