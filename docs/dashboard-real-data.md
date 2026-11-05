@@ -54,6 +54,43 @@ field on each pull (the API field is `currency`, **not** `currency_code` —
 the latter 400s with `#100`). KPI cards show INR + the account's billing
 currency side by side.
 
+## Custom date range (v10 follow-on: pick any window, all genuine Meta data)
+
+The dashboard's `Last 7d / Last 30d` presets are still there, but you can
+now pick **any** window:
+
+- **URL:** `?from=YYYY-MM-DD&to=YYYY-MM-DD` (optional `&acc=<ad_account_id>`
+  to scope one account; defaults to the auto-selected largest account).
+  **`server/lib/shared.js → parseDashboardRange`** validates: `from <= to`,
+  span **<= 92 days** (Meta's per-request insights limit), and `from` not
+  earlier than **365 days** back. An invalid/over-cap range is silently
+  ignored, so the page always renders a real-data preset window.
+- **What renders over the chosen window:** the KPI cards (the first card is
+  labelled "custom range"), the per-day spend trend (zero-filled across the
+  whole window), the per-campaign split, and the top campaigns / top ads —
+  all computed from `spend_daily` for exactly `from..to`
+  (`metaAccountReport`'s `range` bundle, `shared.js`), with the same
+  account + data-mode scoping as the presets, so the numbers stay genuine
+  Meta spend (never demo rows).
+- **Genuine-data guarantee:** the dashboard only ever numbers from
+  `spend_daily`, and for a real `act_` account every row in that table is
+  Meta-pulled (the mock generator only mints rows for the seed `ACT-`
+  accounts, which live DATA_MODE excludes). When a chosen window has **no
+  pulled data yet**, the dashboard shows a clear CTA instead of blanks:
+  **"No Meta data yet for {range} — [Fetch this range from Meta]"**.
+- **Fetch / re-pull this range:** `GET /dashboard/refresh?acc=&from=&to=`
+  (team-only, `server/index.js`) live-fetches that window from the Meta Ads
+  Insights API for the chosen account (`meta.js → runMetaPull` now accepts
+  `payload.from`/`payload.to`; the 3 h ticker still pulls the default
+  last-7-days), stores it in `spend_daily`, audits `meta.range_pull`, then
+  redirects back to the dashboard. It never invents numbers — it pulls
+  real Meta rows, or records the pull failure in the account's
+  `last_error`. Self-select any 7-day window with From/To → Apply, and use
+  "Re-pull this range" to refresh that exact window later.
+
+`scripts/live-screenshots.js` captures `docs/screenshots/v10-live-dashboard-range.png`
+(a 7-day window on the largest account) as the range-mode proof shot.
+
 ## `test/datamode.js` (run on both engines)
 
 Proves, on a scratch DB: resolution order, the admin toggle write/delete,

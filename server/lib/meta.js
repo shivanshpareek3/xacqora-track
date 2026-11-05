@@ -34,13 +34,16 @@ async function runMetaPull(tx, payload) {
     return;
   }
 
-  // live: batched Marketing API pull over the last 7 days.
+  // live: batched Marketing API pull. Default = the last 7 days (the 3h ticker).
+  // payload.from / payload.to (YYYY-MM-DD) fetch an explicit window instead —
+  // the dashboard's "custom date range" live-fetch path (index.js /dashboard/refresh).
   // time_range dates MUST be YYYY-MM-DD (the insights API rejects a full ISO
   // timestamp with #100 "Must be a date representation in the format
   // YYYY-MM-DD").
+  const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
   try {
-    const to = now.slice(0, 10);
-    const from = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+    const to = isDay(payload.to) ? payload.to : now.slice(0, 10);
+    const from = isDay(payload.from) ? payload.from : new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
     const data = await live.runLiveMetaPull({ ad_account_id }, { from, to, token });
     upsertEntities(tx, ad_account_id, data);
     upsertSpend(tx, ad_account_id, data.spend);

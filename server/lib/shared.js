@@ -516,9 +516,39 @@ function weeklySummary(tx, settings, clientIds, live = false) {
 //   clientIds  — client login's own ids; null = all (team role)
 //   dataMode   — 'demo' (default; demo ACT- spend counts toward "All accounts")
 //                | 'live' (demo rows excluded by the datamode predicates)
+// v10 custom date range: validate a user-picked window (YYYY-MM-DD). Caps keep
+// the live Meta fetch cheap + bounded: from<=to, span <=92 days (Meta's per-
+// request insights limit), and from no earlier than 365 days ago. Returns
+// { from, to, ok } — ok:false means the caller should fall back to a preset.
+function parseDashboardRange(p) {
+  const today = new Date().toISOString().slice(0, 10);
+  const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s));
+  const from = String((p && p.from) || '').slice(0, 10);
+  const to = String((p && p.to) || '').slice(0, 10);
+  if (!isDay(from) || !isDay(to) || from > to) return { from: null, to: null, ok: false };
+  const spanDays = Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
+  if (spanDays > 92) return { from: null, to: null, ok: false };
+  const fromAge = Math.round((Date.parse(today) - Date.parse(from)) / 86400000);
+  if (fromAge > 365) return { from: null, to: null, ok: false };
+  return { from, to, ok: true };
+}
+// every YYYY-MM-DD from `from` through `to` inclusive (both are ISO date text,
+// engine-agnostic — no datetime('now'), no engine-specific functions).
+function eachDay(from, to) {
+  const out = [];
+  const d = new Date(from + 'T00:00:00Z');
+  const end = Date.parse(to + 'T00:00:00Z');
+  while (Date.parse(d.toISOString().slice(0, 10)) <= end) {
+    out.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
+}
 // Returns { accounts, kpis{d7,d30}, trend[30], topCampaigns[5], topAds[5],
-//          pull, accountSpends, revenue, currency, defaultAccount }.
-function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'demo' } = {}) {
+//          pull, accountSpends, revenue, currency, defaultAccount,
+//          range } where range is a user-picked-window bundle (see `range`
+//          option) or null when no valid range was requested.
+function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'demo', range = null } = {}) {
   const dm = require('./datamode');
   const spendEx = dm.spendNotDemo(dataMode, 's');
   const leadEx = dm.leadNotDemo(dataMode, 'l');
@@ -625,10 +655,77 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
     WHERE d.status='success' AND d.refunded_at IS NULL ${leadEx ? 'AND ' + leadEx : ''} ${dealEx ? 'AND ' + dealEx : ''}
       ${adAccount ? `AND l.client_id IN (SELECT client_id FROM meta_ad_account WHERE ad_account_id='${clean(adAccount)}')` : ''}
   `)?.rev || 0;
+  // ---- v10 custom date range: when a validated { from, to } is passed, build
+  // every KPI / the trend / the top tables over THAT exact window, scoped to
+  // the same account + data-mode predicates as the preset path (so the numbers
+  // are genuine Meta spend, never demo rows). All range SQL is
+  // `s.date >= ? AND s.date <= ?` on the TEXT date column — engine-agnostic.
+  const rangeOk = range && typeof range.from === 'string' && typeof range.to === 'string'
+    && range.from <= range.to && range.from !== '';
+  let rangeBundle = null;
+  if (rangeOk) {
+    const rf = range.from, rt = range.to;
+    const inRange = `s.date >= ? AND s.date <= ?`;
+    const kpiRange = () => {
+      const o = tx.get(`
+        SELECT COALESCE(SUM(s.spend),0) spend, COALESCE(SUM(s.spend_inr),0) spend_inr,
+          COALESCE(SUM(s.impressions),0) impressions, COALESCE(SUM(s.reach),0) reach,
+          COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.conversions),0) conversions
+        FROM spend_daily s WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange}`, rf, rt) || {};
+      return {
+        spend: o.spend || 0, spend_inr: o.spend_inr || 0,
+        impressions: o.impressions || 0, reach: o.reach || 0,
+        clicks: o.clicks || 0, conversions: o.conversions || 0,
+        ctr: o.impressions ? +(((o.clicks || 0) / o.impressions) * 100).toFixed(2) : null,
+        cpc: o.clicks ? +((o.spend_inr || 0) / o.clicks).toFixed(2) : null,
+      };
+    };
+    // zero-filled per-day trend across the whole window
+    const rtRows = tx.all(`SELECT s.date, COALESCE(SUM(s.spend_inr),0) spend,
+      COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.impressions),0) impressions
+      FROM spend_daily s WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange} GROUP BY s.date`, rf, rt);
+    const byDateR = {}; for (const r of rtRows) byDateR[r.date] = r;
+    const trendR = eachDay(rf, rt).map((date) => { const r = byDateR[date] || {}; return { date, spend: Math.round(r.spend || 0), clicks: r.clicks || 0, impressions: r.impressions || 0 }; });
+    // top campaigns / top ads over the chosen window (LEFT JOINs: tree may lag)
+    const topCampaignsR = tx.all(`
+      SELECT COALESCE(c.id,'na') id, COALESCE(c.name,'(unknown)') name, COALESCE(c.status,'') status,
+        COALESCE(SUM(s.spend_inr),0) spend, COALESCE(SUM(s.impressions),0) impressions
+      FROM spend_daily s
+      LEFT JOIN meta_ad m ON m.id=s.ad_id
+      LEFT JOIN meta_adset as_ ON as_.id=m.adset_id
+      LEFT JOIN meta_campaign c ON c.id=as_.campaign_id
+      WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange}
+      GROUP BY c.id, c.name, c.status ORDER BY spend DESC LIMIT 5`, rf, rt);
+    const topAdsR = tx.all(`
+      SELECT s.ad_id ad_id, COALESCE(m.name,'(unknown)') name, COALESCE(m.status,'') status, m.creative_img,
+        COALESCE(SUM(s.spend_inr),0) spend, COALESCE(SUM(s.impressions),0) impressions,
+        COALESCE(SUM(s.clicks),0) clicks
+      FROM spend_daily s
+      LEFT JOIN meta_ad m ON m.id=s.ad_id
+      WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange}
+      GROUP BY s.ad_id, m.name, m.status, m.creative_img ORDER BY spend DESC LIMIT 5`, rf, rt);
+    const campTrendR = adAccount
+      ? tx.all(`SELECT s.date, COALESCE(c.name,'(untitled)') campaign, COALESCE(SUM(s.spend_inr),0) spend
+          FROM spend_daily s
+          LEFT JOIN meta_ad m ON m.id=s.ad_id
+          LEFT JOIN meta_adset as_ ON as_.id=m.adset_id
+          LEFT JOIN meta_campaign c ON c.id=as_.campaign_id
+          WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange}
+          GROUP BY s.date, c.id, c.name ORDER BY s.date`, rf, rt)
+      : [];
+    const hasData = tx.get(`SELECT COUNT(*) c FROM spend_daily s WHERE ${adScope} ${spendEx ? "AND " + spendEx : "1=1"} AND ${inRange}`, rf, rt).c > 0;
+    rangeBundle = {
+      from: rf, to: rt, kpi: kpiRange(), trend: trendR, topCampaigns: topCampaignsR,
+      topAds: topAdsR, campTrend: campTrendR, hasData,
+      rangeLabel: `${rf} → ${rt}`,
+      currency: adAccount ? (tx.get(`SELECT currency FROM meta_ad_account WHERE ad_account_id=?`, adAccount)?.currency || null) : null,
+    };
+  }
   return {
     accounts, kpis, trend, campTrend, topCampaigns, topAds,
     pull, accountSpends, revenue, defaultAccount,
     currency: adAccount ? (tx.get(`SELECT currency FROM meta_ad_account WHERE ad_account_id=?`, adAccount)?.currency || null) : null,
+    range: rangeBundle,
   };
 }
 
@@ -1030,6 +1127,7 @@ module.exports = {
   DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
   attributeSale, adClicksInWindow, isWithinRange,
   funnelReport, adPerformance, metaAccountReport, sparklineSvg, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary, weeklyPdfLines,
+  parseDashboardRange, eachDay,
   allowedClients,
   esc, fmtINR, fmtN, fmtPct, fmtDT, layout, layoutDemoBand, layoutAccSelect, NAV, navFor, mockMetaPull,
 };

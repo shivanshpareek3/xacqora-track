@@ -44,37 +44,50 @@ function dashboard(db, user, p) {
   // ?acc=all = the explicit "All accounts (aggregate)" choice; any other ?acc
   // must be one of the caller's in-scope real accounts (invalid/foreign ->
   // falls back to the largest, never a cross-client leak).
-  const base = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode });
+  // v10: user-picked custom date range (?from=&to=, YYYY-MM-DD). Validated +
+  // capped by S.parseDashboardRange (from<=to, span<=92d, no earlier than 365d
+  // back); an invalid/over-cap range is ignored so the page always renders a
+  // real-data preset window. When valid, KPIs/trend/top-tables are computed
+  // over that exact window (rep.range) from genuine Meta spend.
+  const rangeReq = S.parseDashboardRange(p);
+  const rangeOpt = rangeReq.ok ? { from: rangeReq.from, to: rangeReq.to } : undefined;
+  const base = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode, range: rangeOpt });
   const accParam = p.acc === undefined ? null : String(p.acc);
   let selected;
   if (accParam === null) selected = base.defaultAccount;                    // default = largest
   else if (accParam === '' || accParam === 'all') selected = '';            // aggregate
   else selected = base.accounts.some((a) => a.ad_account_id === accParam) ? accParam : base.defaultAccount;
-  const rep = selected ? S.metaAccountReport(tx, { adAccount: selected, clientIds: scopeIds, dataMode }) : base;
+  const rep = selected
+    ? S.metaAccountReport(tx, { adAccount: selected, clientIds: scopeIds, dataMode, range: rangeOpt })
+    : base;
+  const range = rep.range; // the custom-window bundle, or null (preset mode)
   const kpis = rep.kpis;
   const win = p.win === '30' ? 'd30' : 'd7';
-  const k = kpis[win];
+  const k = range ? range.kpi : kpis[win];
+  const winLabel = range ? 'custom range' : (win === 'd7' ? '7d' : '30d');
   const money2 = (n) => (n == null ? '—' : '₹' + Math.round(n).toLocaleString('en-IN'));
-  const roasOk = rep.revenue > 0 && kpis.d30.spend_inr > 0;
+  const roasOk = rep.revenue > 0 && k.spend_inr > 0;
   const kpiCards = [
-    { l: `${win === 'd7' ? '7' : '30'}d spend (INR)`, v: money2(k.spend_inr), sub: rep.currency ? `+ ${k.spend.toLocaleString('en-IN')} ${rep.currency}` : '' },
+    { l: `${winLabel} spend (INR)`, v: money2(k.spend_inr), sub: [range ? range.rangeLabel : '', rep.currency ? `+ ${k.spend.toLocaleString('en-IN')} ${rep.currency}` : ''].filter(Boolean).join(' · ') },
     { l: 'Impressions', v: S.fmtN(k.impressions) },
     { l: 'Reach', v: S.fmtN(k.reach) },
     { l: 'Clicks · CTR', v: `${S.fmtN(k.clicks)} · ${k.ctr != null ? k.ctr + '%' : '—'}` },
     { l: 'Avg CPC', v: k.cpc != null ? money2(k.cpc) : '—' },
-    { l: 'ROAS', v: roasOk ? (kpis.d30.spend_inr ? Math.round(rep.revenue / kpis.d30.spend_inr * 100) / 100 : '—') : '<span class="muted">N/A — pilot live</span>', noraos: !roasOk },
+    { l: 'ROAS', v: roasOk ? (k.spend_inr ? Math.round(rep.revenue / k.spend_inr * 100) / 100 : '—') : '<span class="muted">N/A — pilot live</span>', noraos: !roasOk },
   ].map((x) => `<div class="kpi"><div class="l">${x.l}</div><div class="v" ${x.noraos ? 'style="font-size:16px"' : ''}>${x.v}</div>${x.sub ? `<div class="small muted">${S.esc(x.sub)}</div>` : ''}</div>`).join('');
 
-  // ---- 30-day spend trend (account-level; per-campaign when one account) ----
-  const trendChart = S.sparklineSvg(rep.trend, { metric: 'spend' });
+  // ---- spend trend (30-day preset, or the chosen custom range) ----
+  const trendSeries = range ? range.trend : rep.trend;
+  const trendChart = S.sparklineSvg(trendSeries, { metric: 'spend' });
   const trendNote = selected
     ? `<div class="small muted" style="margin-top:6px">Per-campaign daily (click "All accounts" to view the aggregate):</div>`
     : `<div class="small muted" style="margin-top:6px">Daily spend across all real ad accounts.</div>`;
-  // campaign split for a single account
+  // campaign split for a single account (custom range when one is chosen)
   let campSplit = '';
-  if (rep.campTrend.length) {
+  const campSeries = range ? range.campTrend : rep.campTrend;
+  if (campSeries.length) {
     const byCamp = {};
-    for (const r of rep.campTrend) byCamp[r.campaign] = (byCamp[r.campaign] || 0) + r.spend;
+    for (const r of campSeries) byCamp[r.campaign] = (byCamp[r.campaign] || 0) + r.spend;
     const camps = Object.entries(byCamp).sort((a, b) => b[1] - a[1]).slice(0, 5);
     const max = Math.max(1, ...camps.map((c) => c[1]));
     campSplit = `<div style="margin-top:10px">${camps.map((c) => `
@@ -111,12 +124,14 @@ function dashboard(db, user, p) {
     <div class="row" style="margin-top:8px;gap:8px"><a class="btn sm sec" href="/meta.html">Manage accounts →</a>
       <span class="small muted">Failures show here + on <a href="/alerts.html">Alerts</a> (classified, retried with backoff).</span></div></div>`;
 
-  // ---- top campaigns / top ads ----
-  const campRows = rep.topCampaigns.map((c) => `<tr>
+  // ---- top campaigns / top ads (over the chosen window in range mode) ----
+  const topCampSrc = range ? range.topCampaigns : rep.topCampaigns;
+  const topAdsSrc = range ? range.topAds : rep.topAds;
+  const campRows = topCampSrc.map((c) => `<tr>
     <td><b>${S.esc(c.name)}</b></td><td><span class="pill ${c.status === 'ACTIVE' ? 'g' : 'o'}">${S.esc(c.status || '—')}</span></td>
     <td>${money2(c.spend)}</td><td class="small">${S.fmtN(c.impressions)} imp</td></tr>`).join('');
   const adThumb = (img) => `<img class="lead-img" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='52' height='52'><rect width='52' height='52' rx='8' fill='%23252c40'/></svg>" style="width:34px;height:34px" alt="">`;
-  const adRows = rep.topAds.map((a) => `<tr>
+  const adRows = topAdsSrc.map((a) => `<tr>
     <td>${adThumb(a.creative_img)} <b>${S.esc(a.name || a.ad_id)}</b><div class="small muted">${S.esc(a.ad_id)} · ${S.esc(a.creative_img || '')}</div></td>
     <td><span class="pill ${a.status === 'ACTIVE' ? 'g' : 'o'}">${S.esc(a.status || '—')}</span></td>
     <td>${money2(a.spend)}</td><td class="small">${S.fmtN(a.impressions)} imp</td><td class="small">${S.fmtN(a.clicks)} clk</td></tr>`).join('');
@@ -152,34 +167,74 @@ function dashboard(db, user, p) {
 
   // ---- switcher options (real act_ accounts, status marker) ----
   const dotMark = (a) => a.last_error ? ' · error' : (a.last_pull_at ? '' : ' · never pulled');
+  // The range picker (header) must carry the current window through an account
+  // switch, so the switcher's hidden fields keep from/to (range mode) or win.
+  const switcherHidden = range
+    ? [{ name: 'from', value: range.from }, { name: 'to', value: range.to }]
+    : [{ name: 'win', value: win === 'd7' ? '7' : '30' }];
   const switcher = {
     path: 'dashboard.html',
     current: selected,
     options: rep.accounts.map((a) => ({ value: a.ad_account_id, label: `${a.name || a.ad_account_id}${dotMark(a)}` })),
-    hidden: [{ name: 'win', value: win === 'd7' ? '7' : '30' }],
+    hidden: switcherHidden,
   };
 
+  // ---- custom date-range picker (v10): presets + a From/To form ----
+  // Presets clear the range; the From/To form submits ?from=&to= (+?acc=) which
+  // re-renders the KPIs/trend/top-tables over that exact window. The refresh
+  // button live-fetches the chosen window from Meta when it isn't in the DB yet.
+  const accQ = selected ? '&acc=' + encodeURIComponent(selected) : '';
+  const refreshHref = `/dashboard/refresh${accQ ? '?acc=' + encodeURIComponent(selected) : ''}` +
+    (range ? `&from=${range.from}&to=${range.to}` : '');
+  const rangeControl = `
+    <form method="get" action="/dashboard.html" class="inline" style="gap:6px;align-items:center">
+      ${selected ? '<input type="hidden" name="acc" value="' + S.esc(selected) + '">' : ''}
+      <label class="small muted">From</label><input type="date" name="from" value="${S.esc(range ? range.from : p.from || '')}">
+      <label class="small muted">To</label><input type="date" name="to" value="${S.esc(range ? range.to : p.to || '')}">
+      <button class="btn sm">Apply</button>
+    </form>`;
+  const rangeBadge = range
+    ? `<span class="badge" style="color:var(--accent)">custom: ${S.esc(range.rangeLabel)}</span>` : '';
+
   const titleSuffix = selected ? (rep.accounts.find((a) => a.ad_account_id === selected)?.name || selected) : (scopeIds ? 'My account' : 'All accounts');
+  const noDataCta = range && !range.hasData ? `
+  <div class="card" style="margin-top:0;border-color:var(--warn,#c79b2f)">
+    <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
+      <div><b>No Meta data yet for ${S.esc(range.rangeLabel)}</b>
+        <div class="small muted">That window hasn't been pulled from Meta into this app. Fetch it now — the numbers shown will be the real Meta figures for those exact days (no estimate, no demo data).</div></div>
+      ${canPull ? `<a class="btn" href="${refreshHref}">Fetch this range from Meta →</a>` : `<span class="small muted">ask a team member to pull it</span>`}
+    </div>
+  </div>` : '';
+  const repullNote = range && range.hasData ? `
+    <div class="row" style="justify-content:space-between;align-items:center;margin:10px 0 4px">
+      <span class="small muted">Showing genuine Meta spend for <b>${S.esc(range.rangeLabel)}</b>${canPull ? '' : ' (team-only pull)'}</span>
+      ${canPull ? `<a class="btn sm sec" href="${refreshHref}">Re-pull this range</a>` : ''}
+    </div>` : '';
   const body = `
-  <div class="row pagehead" style="justify-content:space-between;align-items:center">
+  <div class="row pagehead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
     <h1 style="margin:0">Dashboard ${titleSuffix !== 'All accounts' ? `· <span class="badge">${S.esc(titleSuffix)}</span>` : '<span class="badge">all real accounts</span>'}</h1>
-    <div class="row" style="gap:6px"><span class="badge">window</span>
-      <a class="btn sm ${win === 'd7' ? '' : 'sec'}" href="/dashboard.html?win=7${selected ? '&acc=' + encodeURIComponent(selected) : ''}">7d</a>
-      <a class="btn sm ${win === 'd30' ? '' : 'sec'}" href="/dashboard.html?win=30${selected ? '&acc=' + encodeURIComponent(selected) : ''}">30d</a></div>
+    <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
+      <span class="badge">window</span>
+      <a class="btn sm ${!range && win === 'd7' ? '' : 'sec'}" href="/dashboard.html?win=7${accQ}">Last 7d</a>
+      <a class="btn sm ${!range && win === 'd30' ? '' : 'sec'}" href="/dashboard.html?win=30${accQ}">Last 30d</a>
+      ${rangeControl}
+    </div>
   </div>
-  <div class="grid g6">${kpiCards}</div>
+  ${noDataCta}
+  <div class="grid g6" style="margin-top:10px">${kpiCards}</div>
+  ${repullNote}
 
   <div class="grid g2" style="margin-top:14px">
-    <div class="card"><h2>Spend trend <span class="badge">last 30 days, INR</span></h2>
+    <div class="card"><h2>Spend trend <span class="badge">${range ? S.esc(range.rangeLabel) : (win === 'd7' ? 'last 7 days' : 'last 30 days')} · INR</span></h2>
       ${trendChart || '<div class="empty-state">No spend yet — run a Meta pull to start charting.</div>'}
       ${trendNote}${campSplit}</div>
     ${pullCard}
   </div>
 
   <div class="grid g2" style="margin-top:0">
-    <div class="card"><h2>Top campaigns <span class="badge">by ${win === 'd7' ? '7d' : '30d'} spend</span></h2>
+    <div class="card"><h2>Top campaigns <span class="badge">by ${range ? S.esc(range.rangeLabel) : (win === 'd7' ? '7d' : '30d')} spend</span></h2>
       <div class="tabwrap"><table>${campRows || '<tr><td class="muted">No campaigns pulled yet</td></tr>'}</table></div></div>
-    <div class="card"><h2>Top ads <span class="badge">by ${win === 'd7' ? '7d' : '30d'} spend</span></h2>
+    <div class="card"><h2>Top ads <span class="badge">by ${range ? S.esc(range.rangeLabel) : (win === 'd7' ? '7d' : '30d')} spend</span></h2>
       <div class="tabwrap"><table>${adRows || '<tr><td class="muted">No ads pulled yet</td></tr>'}</table></div></div>
   </div>
 

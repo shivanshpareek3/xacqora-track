@@ -482,6 +482,46 @@ async function handleRequest(req, res) {
           return guard(user.role === 'client'
             ? screens.portal(db, user, Object.fromEntries(u.searchParams.entries()))
             : screens.dashboard(db, user, Object.fromEntries(u.searchParams.entries())));
+        // v10: the dashboard's "Fetch/Re-pull this range from Meta" button.
+        // Team-only; live-fetches the chosen [from,to] window for one ad
+        // account (or every in-scope account when acc is empty), stores it in
+        // spend_daily, then redirects back to the dashboard so the KPIs now
+        // reflect that exact range. This is the genuine-data path — it pulls
+        // real Meta rows, never invents numbers.
+        case 'dashboard':
+          if (parts[1] === 'refresh') {
+            if (!user) { res.writeHead(302, { Location: '/signin' }); res.end(); return; }
+            if (!sec.isTeam(user)) { send(res, 403, 'team-only'); res.end(); return; }
+            const accReq = String(u.searchParams.get('acc') || '');
+            const range = S.parseDashboardRange({ from: u.searchParams.get('from'), to: u.searchParams.get('to') });
+            const from = range.ok ? range.from : '';
+            const to = range.ok ? range.to : '';
+            const metaLib = require('./lib/meta');
+            const tx = makeTx(db, user); // RLS backstop: the pull lands in the user's scope
+            // Which accounts to pull: the one chosen, else every in-scope real account.
+            const inScope = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : null;
+            let targets = tx.all(`SELECT id, ad_account_id FROM meta_ad_account
+              WHERE ad_account_id NOT LIKE 'ACT-%' ${inScope ? `AND client_id IN (${inScope.map((n) => Number(n)).join(',')})` : ''}`);
+            if (accReq && accReq !== 'all') {
+              const keep = targets.filter((a) => a.ad_account_id === accReq);
+              if (keep.length) targets = keep; else { // foreign/invalid acc -> redirect on, no pull
+                res.writeHead(302, { Location: `/dashboard.html?acc=${encodeURIComponent(accReq)}${from ? `&from=${from}&to=${to}` : ''}` }); res.end(); return;
+              }
+            }
+            const runSeq = (list) => list.reduce(
+              (chain, a) => chain.then(() =>
+                metaLib.runMetaPull(makeTx(db, user), { ad_account_id: a.ad_account_id, from, to })
+                  .catch((e) => { db.prepare(`UPDATE meta_ad_account SET last_error=? WHERE ad_account_id=?`).run(String(e.message).slice(0, 200), a.ad_account_id); })),
+              Promise.resolve());
+            const dest = `/dashboard.html${accReq && accReq !== 'all' ? `?acc=${encodeURIComponent(accReq)}` : ''}${from ? `&from=${from}&to=${to}` : ''}`;
+            runSeq(targets).then(() => {
+              audit(db, user, 'meta.range_pull', 'ad_account',
+                `${from || 'last-7d'} → ${to || 'today'} · ${targets.length} account(s)`);
+            }).finally(() => { res.writeHead(302, { Location: dest }); res.end(); });
+            return;
+          }
+          send(res, 404, 'not found');
+          return;
         case 'leads': {
           if (!user) { res.writeHead(302, { Location: '/signin' }); res.end(); return; }
           const p = Object.fromEntries(u.searchParams.entries());

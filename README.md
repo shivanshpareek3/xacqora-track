@@ -87,7 +87,7 @@ Sign in, Meta spend, Weekly summary.
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 - `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
 - `docs/meta-live-connect.md` — Meta live connect (pull only, CAPI dry-run): the 3-point "what to grab from Meta" list, `.env`→DB token bridge, live-pull test + ≤1% spend gate, `/alerts` token-expiry + friendly failure lines
-- `docs/dashboard-real-data.md` — v9+v10: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, and the dev-DB hygiene model (v10: the sweep runs on a scratch DB + the `__sweep_test` marker guard, so test runs never dirty the dev DB)
+- `docs/dashboard-real-data.md` — v9+v10: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, the dev-DB hygiene model (v10: the sweep runs on a scratch DB + the `__sweep_test` marker guard, so test runs never dirty the dev DB), and the dashboard **custom date range** (`?from=&to=`, live-fetched from Meta via `/dashboard/refresh`, 92-day cap)
 
 ## Tests
 

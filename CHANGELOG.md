@@ -2,6 +2,52 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-05 (v10 follow-on — dashboard custom date range: pick any window, all genuine Meta data)
+
+Arpit's dashboard ask: keep `Last 7d / Last 30d`, but let him **pick any
+date window** ("custom date ka bhi option… 7 days mein khud select karu")
+and guarantee **only genuine Meta numbers, no fake/dummy data**. He
+reported the fixed 7d/30d looked "galat" because he could not match Meta
+Ads Manager's own picked days, and the pull only ever fetched the last 7
+days.
+
+- **`server/lib/shared.js`:** `metaAccountReport` now takes a `range:
+  {from, to}` option and returns a `range` bundle — KPIs, a zero-filled
+  per-day trend, the campaign split, and top campaigns/top ads — all over
+  the exact `[from, to]` window with the same account + data-mode scoping
+  (so it stays genuine Meta spend, demo rows still excluded). New helpers
+  `parseDashboardRange` (validates `from<=to`, span <=92d, not >365d back;
+  over-cap silently ignored) + `eachDay` (zero-filled date list), both
+  exported. All range SQL is `s.date >= ? AND s.date <= ?` on the TEXT
+  date column — engine-agnostic (no `?`-in-literal / `datetime('now')`
+  pitfalls).
+- **`server/lib/meta.js`:** `runMetaPull` accepts `payload.from`/`payload.to`
+  (YYYY-MM-DD) to fetch an explicit window; the 3h ticker's default
+  last-7-days behaviour is unchanged.
+- **`server/index.js`:** new team-only `GET /dashboard/refresh?acc=&from=&to=`
+  route — live-fetches the chosen window from the Meta Ads Insights API for
+  the chosen (or every in-scope) account, stores it, audits
+  `meta.range_pull`, then 302s back to the dashboard. The genuine-data
+  path: it pulls real rows, never invents numbers.
+- **`server/screens.js → dashboard`:** the window controls are now
+  `Last 7d / Last 30d` presets + a **From/To date picker**. When a range
+  is set, KPIs/trend/top tables come from `rep.range`, the first KPI is
+  labelled "custom range" with the range shown, and a **"No Meta data yet
+  for {range} — [Fetch this range from Meta]"** CTA (or a "Re-pull this
+  range" link) appears. The account switcher now carries `from`/`to`
+  through so changing accounts keeps the chosen window.
+- **`scripts/live-screenshots.js`:** captures
+  `docs/screenshots/v10-live-dashboard-range.png` (a 7-day window) as the
+  range-mode proof shot.
+- **`docs/dashboard-real-data.md`:** new "Custom date range" section.
+
+Verified live on the running dev server (owner, live DATA_MODE): a
+`?from=&to=` dashboard renders "custom range" KPIs equal to the genuine
+`spend_daily` total for that account+window; `/dashboard/refresh` 302s
+back + writes a `meta.range_pull` audit row; a client is denied 403.
+Both engines green (8 suites + scratch-DB sweep + replay, SQLite &
+Postgres; sweep 0 failures).
+
 ## 2026-11-05 (v10 follow-on — real ad-account NAMES persisted + displayed)
 
 Closes the last gap in "sirf real Meta accounts + unke **real naam**": the

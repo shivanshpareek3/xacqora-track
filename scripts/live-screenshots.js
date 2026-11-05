@@ -29,8 +29,13 @@ const SHELL = process.env.CHROME_SHELL ||
   path.join(process.env.HOME, 'Library/Caches/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-mac-x64/chrome-headless-shell');
 
 // The 5 live-mode screens, as the OWNER (team role), classic server-rendered.
+// v10: the dashboard is captured TWICE — the default 7d preset and a custom
+// 7-day window (?from=&to=) to prove the range picker + genuine-range KPIs.
+const today = new Date().toISOString().slice(0, 10);
+const rangeFrom = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
 const SCREENS = [
   { name: 'dashboard', url: '/dashboard.html', wait: 2000 },
+  { name: 'dashboard-range', url: `/dashboard.html?from=${rangeFrom}&to=${today}`, wait: 2200 },
   { name: 'leads',     url: '/leads',          wait: 1500 },
   { name: 'meta',      url: '/meta.html',      wait: 1500 },
   { name: 'reports',   url: '/reports.html',   wait: 2000 },
