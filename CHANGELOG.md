@@ -2,6 +2,35 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-05 (v10 follow-on — real ad-account NAMES persisted + displayed)
+
+Closes the last gap in "sirf real Meta accounts + unke **real naam**": the
+switcher + Meta hub were showing the raw ad-account **IDs** (`act_1377…`)
+where Arpit's real account names (Meta shows e.g. "Redanza Skin Care")
+should be. Root cause: the `metalive` bootstrap created the rows with
+`name = ad_account_id` (the `.env` had no per-account name), and the live
+pull fetched `AdAccount.name` but **dropped it** on return, so it was never
+written back.
+
+- **`server/lib/liveapi.js → runLiveMetaPull`:** now returns `accountName`
+  (the real `AdAccount.name`; the `/acct` call already requested `name`).
+- **`server/lib/meta.js`:** after each live pull, persists the real name
+  onto `meta_ad_account` (only when Meta returns one and it differs from the
+  id) — so every future pull keeps the name current.
+- **`scripts/meta-name-sync.js` (new one-shot):** for accounts created
+  before this fix, fetch each `act_…` account's name+currency with its own
+  encrypted token and write them back. Idempotent, offline-safe, token never
+  printed. On the dev DB it renamed all 7: Piyush Ahuja, Abhishek Pal - FML,
+  FML New, CardGenius 2, Upcurvv-FML, FML X ABHISHEK PAL, The Job Workshop.
+- **`server/screens.js → meta.html`:** the account row now leads with the
+  real name (ID + currency as the muted sub-line) and drops the seed
+  client-name bracket that read as "dummy".
+- Re-captured the 5 `docs/screenshots/v10-live-*.png` — dashboard switcher
+  and Meta hub now show the real account names.
+
+Both engines still green (reports / datamode / metalive / security / spa
+suites + the scratch-DB sweep, SQLite + Postgres; sweep 0 failures).
+
 ## 2026-11-05 (v10 — real-data guarantee: test artifacts gone for good + live-only UI)
 
 Arpit's v10 requirement: the frontend must show **only his real Meta ad

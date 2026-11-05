@@ -560,7 +560,7 @@ function meta(db, user, p) {
   const spendEx = dm.spendNotDemo(dataMode, 's');
   const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id ${metaEx ? `WHERE ${metaEx}` : ''}`);
   const accRows = accounts.map((a) => `<tr>
-    <td>${S.esc(a.name)} <span class="small muted">(${S.esc(a.client_name || '')})</span></td>
+    <td><b>${S.esc(a.name || a.ad_account_id)}</b></td>
     <td class="small muted">${S.esc(a.ad_account_id)}${a.currency ? ` · ${S.esc(a.currency)}` : ''}</td>
     <td><span class="pill ${a.status === 'connected' ? 'g' : 'o'}">${S.esc(a.status)}</span></td>
     <td class="small muted">${S.fmtDT(a.last_pull_at)}</td>

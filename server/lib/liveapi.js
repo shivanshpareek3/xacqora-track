@@ -180,6 +180,10 @@ async function runLiveMetaPull(acc, { from, to, token, signal }) {
   return {
     campaigns: tree.campaigns, adsets: tree.adsets, ads: tree.ads, spend,
     currency: currency && currency.currency ? String(currency.currency).toUpperCase() : null,
+    // the ad account's REAL display name (AdAccount.name) — Arpit's v10
+    // requirement: the switcher + Meta hub must show his real account names,
+    // not the raw id. The /{acct} call already fetches `name` (line above).
+    accountName: currency && currency.name ? String(currency.name).trim() || null : null,
   };
 }
 

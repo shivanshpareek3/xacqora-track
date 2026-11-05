@@ -47,6 +47,12 @@ async function runMetaPull(tx, payload) {
     // record the account's billing currency (KPI cards: "₹ + currency"); a
     // null just leaves the existing value untouched.
     if (data.currency) tx.run(`UPDATE meta_ad_account SET currency=? WHERE ad_account_id=? AND currency IS NULL`, data.currency, ad_account_id);
+    // v10: record the account's REAL Meta display name (AdAccount.name) so the
+    // switcher + Meta hub show the operator's actual account names, not the raw
+    // id the bootstrap fell back to. Only overwrite with a name Meta returns
+    // (never the id echoed back).
+    if (data.accountName && data.accountName !== ad_account_id)
+      tx.run(`UPDATE meta_ad_account SET name=? WHERE ad_account_id=?`, data.accountName, ad_account_id);
     tx.run(`UPDATE meta_ad_account SET last_pull_at=?, last_error=NULL WHERE ad_account_id=?`, now, ad_account_id);
   } catch (e) {
     // PRD risk rule: alert on failures
