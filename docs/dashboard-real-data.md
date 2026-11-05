@@ -67,17 +67,33 @@ node test/datamode.js                                  # SQLite
 DATABASE_URL=postgres://... node test/datamode.js      # Postgres (scratch db xacqora_datamode)
 ```
 
-## Dev-DB hygiene (one-time)
+## Dev-DB hygiene (v10: the dev DB never gets test-artifacts again)
 
-Repeated `test/sweep.sh` runs against the live ingest pipeline POST the
-degenerate body `{"client_id":1}` to `/api/ingest/meta_leadgen`, which lands
-as all-NULL leads (no phone/email/name, `source_unknown=1`, one degenerate
-`meta_form_lead` event each) in the dev DB. They are not seed.js rows and
-are NOT what `DATA_MODE` filters (the filter targets seed conventions only);
-they are cleaned with the guarded one-shot `tmp/clean-sweep-leads.js`
-(deletes all-NULL leads strictly above the seed range with zero deals and
-zero touchpoints — never touches named leads). Production never accumulates
-these.
+Earlier, repeated `test/sweep.sh` runs POSTed the degenerate body
+`{"client_id":1}` through the live ingest pipeline into the **shared dev DB**,
+minting all-NULL leads (no phone/email/name, `source_unknown=1`, one
+degenerate `meta_form_lead` event each). They are not seed.js rows and are
+NOT what `DATA_MODE` filters (that targets seed conventions only), so they
+kept showing up in live mode. Fixed at the root (v10):
+
+- **Prevention (root cause):** `test/sweep.sh` now runs on a **throwaway
+  scratch DB** (a `xacqora-sweep-scratch.sqlite3` file, or a
+  `xacqora_sweep_<pid>` Postgres database) + its own server, seeded fresh and
+  dropped on exit. A test run can no longer write to the running dev/prod DB.
+  (`test/replay.js` → `xacqora-test.sqlite3` and `scripts/staging.sh` →
+  `xacqora_staging` were already isolated.)
+- **Marker guard (defense-in-depth):** the sweep's S.6 flood POSTs and the
+  integrations "Send test event" button now tag their payload with
+  `__sweep_test:true`. `server/index.js` → `handleIngest` logs such payloads
+  as test-only (`webhook_log` row, `test=1`) and does **not** enqueue them, so
+  they verify the secret/rate-limit path without ever minting a lead.
+- **Cleanup for pre-existing rows:** `node scripts/clean-test-artifacts.js`
+  (dry-run by default; `--delete` backs up via `scripts/backup.js` first).
+  It deletes only all-NULL leads strictly above the seed range (>126) with
+  zero deals/touchpoints whose events are all degenerate (the
+  `__sweep_test` marker or the exact `{"client_id":N}` body) — the 26 named
+  seed leads and anything with a real identity are structurally excluded, and
+  re-running is a no-op. Production never accumulates these.
 
 ## Related
 

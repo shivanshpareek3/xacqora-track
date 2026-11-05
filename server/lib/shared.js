@@ -450,10 +450,15 @@ function metaVsTracker(tx, settings, clientIds, adAccount, live = false) {
   const ap = adPerformance(tx, settings || {}, clientIds, adAccount, live);
   const dm = require('./datamode');
   const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
-  // scope through the lead (event has no client_id of its own)
-  let scope = clientIds && clientIds.length ? `l.client_id IN (${clientIds.map((n) => Number(n)).join(',')}) AND` : '';
-  if (liveLeadEx) scope += `${liveLeadEx} AND`;
-  const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id WHERE ${scope} e.type='meta_form_lead'`)?.c || 0;
+  // scope through the lead (event has no client_id of its own). Build the
+  // WHERE from a parts list + ' AND ' join — a trailing-AND string concat
+  // stuck against NOT(...) produces "ANDNOT" (a syntax error) when the
+  // live-mode exclusion is appended with no leading space.
+  const whereParts = [];
+  if (clientIds && clientIds.length) whereParts.push(`l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})`);
+  if (liveLeadEx) whereParts.push(liveLeadEx);
+  whereParts.push(`e.type='meta_form_lead'`);
+  const metaLeadTotal = tx.get(`SELECT COUNT(*) c FROM event e JOIN lead l ON l.id=e.lead_id WHERE ${whereParts.join(' AND ')}`)?.c || 0;
   const rows = ap.rows
     .filter((r) => r.meta_conv > 0 || r.leads > 0)
     .map((r) => ({

@@ -649,7 +649,9 @@ function integrations(db, user, p) {
   <script>
     document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{
       const r=await fetch('/api/ingest/'+b.dataset.test+'/test',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({client_id:Number(b.dataset.client)})});
+        // __sweep_test: log-only marker — the button verifies the endpoint without
+        // minting a test lead into a shared dev/prod DB (v10).
+        body:JSON.stringify({client_id:Number(b.dataset.client),__sweep_test:true})});
       alert('Test event sent: '+r.status+' — refresh log');location.reload();});
   </script>`;
   return S.layout({ title: 'Integrations', nav: S.navFor(user), active: 'integrations.html', user, body, band: S.layoutDemoBand(dataMode) });

@@ -23,6 +23,13 @@ gate is a pilot blocker, not a footnote.
 - [ ] `docs/adapter-verification.md` has **zero pending markers** for Razorpay +
       Cashfree (they were re-verified 2026-11-02; the 5 other adapters stay
       UNVERIFIED with retry dates — do not treat them as live).
+- [ ] Dev DB kabhi test-artifact se dirty nahi hota (v10): the test sweep runs on a
+      **scratch DB** (its own throwaway database + server, dropped on exit) and
+      the sweep/test-button ingest payloads carry a `__sweep_test` marker the
+      ingest layer logs **without minting a lead** — so `test/sweep.sh` never
+      writes to the running dev/prod DB. If nameless all-NULL leads ever
+      reappear, clean them with `node scripts/clean-test-artifacts.js`
+      (dry-run by default; `--delete` backs up first).
 
 ---
 

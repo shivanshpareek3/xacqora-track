@@ -167,6 +167,15 @@ async function handleIngest(platform, kind, res, bodyJson, raw, req, clientHint)
 
   const map = epMap(tx, client_id, platform);
   const test = kind === 'test' || bodyJson?.__test === true;
+  // v10 marker guard: harness payloads tagged `__sweep_test` (the sweep's S.6
+  // flood loop, the integrations "Send test event" button) are logged as
+  // test-only and NOT enqueued — they verify the secret/rate-limit path
+  // without minting a lead into a shared dev/prod DB.
+  if (bodyJson?.__sweep_test === true) {
+    logIngest(tx, platform, client_id, 'test', '__sweep_test marker: logged only, no lead', raw, null, true);
+    json(res, { ok: true, client_id, queued: false, sweep_test: true });
+    return;
+  }
   try {
     // enqueue so a slow platform or a 5,000-event spike never drops events
     const jobPayload = { platform, client_id, payload: bodyJson ?? parseLoose(raw), map, dedup_key: dedupKey(platform, bodyJson), test };

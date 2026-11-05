@@ -2,6 +2,78 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-05 (v10 — real-data guarantee: test artifacts gone for good + live-only UI)
+
+Arpit's v10 requirement: the frontend must show **only his real Meta ad
+accounts** — no dummy. v9 had the mechanism (`DATA_MODE=live`), but two
+things kept leaking demo: (1) local dev still defaulted to `demo`, and
+(2) 181 nameless test-artifact leads had accumulated in the dev DB from
+sweep runs and escaped the seed-based filter. This closes both at the root.
+
+### Task 1 — test artifacts, permanent cleanup + prevention
+- **Root cause found:** `test/sweep.sh` was the only harness POSTing through
+  the **live ingest pipeline into the shared dev DB** (replay.js →
+  `xacqora-test.sqlite3` and staging.sh → `xacqora_staging` were already
+  isolated). Its S.6 rate-limit flood POSTed degenerate `{"client_id":1}`
+  bodies; the `meta_leadgen` adapter minted one all-NULL `source_unknown`
+  lead each time → the 181 rows.
+- **`test/sweep.sh` (rewritten setup):** now runs on a **throwaway scratch
+  DB + its own server** — a `xacqora-sweep-scratch.sqlite3` file (SQLite) or
+  a `xacqora_sweep_<pid>` database (Postgres), seeded fresh, dropped on exit
+  (EXIT + INT/TERM traps). It refuses to reuse a busy port (a foreign server
+  would not be on the scratch DB). The S.6 loop POSTs are tagged
+  `__sweep_test`.
+- **`server/index.js → handleIngest` (marker guard):** a payload carrying
+  `__sweep_test:true` is logged as test-only (`webhook_log`, `test=1`) and
+  **not enqueued** — it verifies the secret/rate-limit path without minting a
+  lead. Placed after the rate-limit checks so S.6's 429 still fires.
+- **`server/screens.js` (integrations "Send test event"):** the daily-dev
+  button now sends the `__sweep_test` marker too.
+- **`scripts/clean-test-artifacts.js` (new):** one-time cleanup of
+  pre-existing artifacts. Dry-run by default; `--delete` backs up via
+  `scripts/backup.js` first. Deletes only all-NULL leads strictly above the
+  seed range (>126) with zero deals/touchpoints whose events are all
+  degenerate (the marker, or the exact `{"client_id":N}` body). The 26 named
+  seed leads + anything with a real identity are excluded by construction;
+  re-running is a no-op. Engine-aware.
+
+### Task 2 — the operator's live-only view, verified
+- **`.env`: `DATA_MODE=live`** (local dev now matches prod intent).
+- **`scripts/live-screenshots.js` (new):** drives the already-running live
+  server (no reseed, no new DB) to capture 5 shareable owner screenshots —
+  `docs/screenshots/v10-live-{dashboard,leads,meta,reports,alerts}.png`.
+- Confirmed on the running server: dashboard KPIs are real ad-account spend
+  (`act_…` ids, INR + billing currency), Reports shows real ad spend with
+  ROAS "N/A — pilot live", the leads page shows the clean empty state, and
+  the alerts board no longer lists demo `ACT-` pull failures.
+
+### Bugs found + fixed while verifying
+- **`shared.js → metaVsTracker` (real v9 live-mode 500):** the client-scoped
+  WHERE was built by string-concatenating a trailing `AND` onto
+  `liveLeadEx`, producing `...ANDNOT (l.id BETWEEN …)` — a syntax error that
+  only fired when **clientIds + live mode** both applied (owner Reports).
+  Now a parts-list + ` AND ` join.
+- **`health.js` (alerts demo leak in live mode):** seed `ACT-…` ad-account
+  `last_error` rows showed on the ops board as pull failures. Now excluded
+  in live mode via `metaNotDemo` (the public `/health` JSON stays
+  system-scoped — monitoring reflects true state).
+
+### Tests + docs
+- `test/datamode.js` + all 8 prior suites + replay + the **new scratch-DB
+  sweep** green on **both engines** (SQLite + Postgres). The sweep now proves
+  the point directly: after a full sweep the dev DB still has 26 seed leads
+  and 0 artifacts.
+- `docs/dashboard-real-data.md` — the "Dev-DB hygiene" section rewritten to
+  the v10 scratch-DB + marker-guard model (replaces the old one-shot note).
+- `docs/pilot-live-checklist.md` — entry-conditions line added: the dev DB
+  never gets test-artifacts (scratch DB + marker guard) + the cleanup command.
+
+**Arpit's Task 3 (token close-out):** revoke/regenerate the Meta system-user
+token in Business Suite (it was pasted into chat earlier), drop the new
+long-lived token into `.env` `META_ACCESS_TOKEN`, restart, then confirm
+`/meta` → "Pull now" is green for all 7 accounts. Old token is now invalid
+so the transcript copy carries no risk.
+
 ## 2026-11-04 (v9 Task 3 — UI overhaul: "website feel" → SaaS dashboard)
 
 The third master-v9 task: turn the classic server-rendered screens from a

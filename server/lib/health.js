@@ -48,9 +48,13 @@ function health(tx, db, dataMode) {
   const queueStale = tx.get(`SELECT COUNT(*) c FROM job
     WHERE queue_name='webhook' AND status='pending' AND next_run_at < ?`, nowSec - 600).c;
 
-  // 3. Meta pull failures (ad accounts carrying a last_error from a live pull)
-  const metaFails = tx.all(`SELECT ad_account_id, name, last_error, last_pull_at FROM meta_ad_account
-    WHERE last_error IS NOT NULL AND last_error != '' ORDER BY id`);
+  // 3. Meta pull failures (ad accounts carrying a last_error from a live pull).
+  //    In live data-mode, drop the seed's ACT- ad accounts so their mock/token
+  //    errors don't read as real pull failures on the ops board.
+  const metaEx = dataMode === 'live'
+    ? require('./datamode').metaNotDemo('live', '') : '';
+  const metaFails = tx.all(`SELECT ad_account_id, name, last_error, last_pull_at FROM meta_ad_account a
+    WHERE last_error IS NOT NULL AND last_error != '' ${metaEx ? `AND ${metaEx}` : ''} ORDER BY id`);
 
   // 4. CAPI send failures — CAPI-type events still unsent (sent_to_meta=0)
   const capiStuck = tx.get(`SELECT COUNT(*) c FROM event

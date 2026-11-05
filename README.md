@@ -87,14 +87,22 @@ Sign in, Meta spend, Weekly summary.
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 - `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
 - `docs/meta-live-connect.md` — Meta live connect (pull only, CAPI dry-run): the 3-point "what to grab from Meta" list, `.env`→DB token bridge, live-pull test + ≤1% spend gate, `/alerts` token-expiry + friendly failure lines
-- `docs/dashboard-real-data.md` — v9: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, dev-DB hygiene
+- `docs/dashboard-real-data.md` — v9+v10: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, and the dev-DB hygiene model (v10: the sweep runs on a scratch DB + the `__sweep_test` marker guard, so test runs never dirty the dev DB)
 
 ## Tests
 
 ```bash
 npm test        # replays each sample payload through the live ingest API on a throwaway DB
 npm run tracker # demo landing page target
-bash test/sweep.sh     # all 14 screens + isolation + masking + 2FA + export + rate-limit + backup gates
+bash test/sweep.sh     # 14 screens + isolation + masking + 2FA + export + rate-limit + backup gates.
+                       # v10: runs on a throwaway scratch DB + its own server (SQLite file or PG
+                       # scratch database, dropped on exit) — it can NEVER write to the dev DB.
+# dev-DB hygiene (v10):
+node scripts/clean-test-artifacts.js       # dry-run: list the all-NULL sweep-artifact leads (id>126,
+                                           # no deals/touchpoints, degenerate events)
+node scripts/clean-test-artifacts.js --delete  # backup first, then delete them (idempotent)
+node scripts/live-screenshots.js           # 5 owner screenshots of the RUNNING live server ->
+                                           # docs/screenshots/v10-live-*.png (for Arpit / the manager)
 node test/security.js  # AES-GCM secrets, RFC 6238 TOTP vectors, rate limit, client-access rules
 node test/isolation.js # DB-layer client-isolation proof: canary renders + query-dump audit
 node test/xt-queue.js  # xt.js survives the API being down (nothing lost)

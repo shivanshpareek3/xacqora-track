@@ -7,15 +7,79 @@ PORT="${PORT:-4123}"
 BASE="http://localhost:$PORT"
 O="$BASE_DIR/tmp/xt-$PORT.txt"; C="$BASE_DIR/tmp/xt-$PORT-c.txt"; rm -rf "$BASE_DIR/tmp"; mkdir -p "$BASE_DIR/tmp"
 
-# start a dedicated server on PORT (low rate limits so the S.6 429 test is quick)
-EXIST_ON_PORT=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/signin" 2>/dev/null)
-if [ "$EXIST_ON_PORT" != "200" ] && [ "$EXIST_ON_PORT" != "302" ]; then
-  # Phase P: on Postgres the dev db must be seeded first (users/leads/deals)
-  [ -n "${DATABASE_URL:-}" ] && node scripts/seed.js >/dev/null 2>&1
-  ( PORT="$PORT" XT_RATE_PER_MIN_IP=10 XT_RATE_PER_MIN_ENDPOINT=1000 node server/index.js &>/tmp/xt-$PORT.log & )
-  sleep 2
+# ---------------------------------------------------------------------------
+# v10 root-cause fix: the sweep runs on a THROWAWAY scratch DB + its own
+# server, so a test run can never write to the shared dev/running DB. (The old
+# sweep POSTed degenerate `{"client_id":1}` payloads through the live ingest
+# pipeline into the dev DB, minting the nameless source_unknown leads that
+# had to be scrubbed.) Both engines are covered:
+#   * SQLite  -> a scratch file (XACQORA_DB_FILE), created + seeded fresh
+#   * Postgres-> a scratch database (DATABASE_URL re-pointed), created + seeded
+# The sweep always owns its own server on $PORT and refuses to reuse a
+# foreign one (a foreign server would not be pointed at the scratch DB).
+# ---------------------------------------------------------------------------
+SCRATCH_PID=""; PGU=""; PGH=""; PGP=""; SWEEP_SCRATCH_PG=""
+# PGBIN (restore-drill convention) selects the pg tool dir; default = PATH.
+PSQL="${PGBIN:+$PGBIN/}psql"
+cleanup_scratch() {
+  [ -n "$SCRATCH_PID" ] && kill "$SCRATCH_PID" 2>/dev/null
+  rm -f "$BASE_DIR/xacqora-sweep-scratch.sqlite3" "$BASE_DIR/xacqora-sweep-scratch.sqlite3-wal" "$BASE_DIR/xacqora-sweep-scratch.sqlite3-shm"
+  if [ -n "$SWEEP_SCRATCH_PG" ] && [ -n "$PGU" ]; then
+    "$PSQL" -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 \
+      -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$SWEEP_SCRATCH_PG' AND pid<>pg_backend_pid();" >/dev/null 2>&1
+    "$PSQL" -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $SWEEP_SCRATCH_PG;" >/dev/null 2>&1
+  fi
+}
+trap cleanup_scratch EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM   # signal -> exit -> EXIT trap does the cleanup
+
+if [ -n "${DATABASE_URL:-}" ]; then
+  # Postgres: create a scratch db owned by the app role (has CREATEDB), point
+  # the whole sweep + its own server at it, seed it, drop it on exit.
+  # Newline-delimited parse so an empty password doesn't shift the fields.
+  PGPARSE="$(node -e 'const u=process.env.DATABASE_URL||"";const m=/^postgres(?:ql)?:\/\/([^:]+)(?::([^@]*))?@([^:]+):(\d+)\/(.+)$/.exec(u);if(m)process.stdout.write(m[1]+"\n"+(m[2]||"")+"\n"+m[3]+"\n"+m[4]);' 2>/dev/null)"
+  PGU="$(printf '%s' "$PGPARSE" | sed -n '1p')"
+  PGPW="$(printf '%s' "$PGPARSE" | sed -n '2p')"
+  PGH="$(printf '%s' "$PGPARSE" | sed -n '3p')"
+  PGP="$(printf '%s' "$PGPARSE" | sed -n '4p')"
+  if [ -z "$PGU" ]; then echo "FAIL: cannot parse DATABASE_URL for the PG scratch db"; exit 2; fi
+  [ -n "$PGPW" ] && export PGPASSWORD="$PGPW"
+  SWEEP_SCRATCH_PG="xacqora_sweep_$$"
+  "$PSQL" -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 \
+    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$SWEEP_SCRATCH_PG' AND pid<>pg_backend_pid();" >/dev/null 2>&1
+  "$PSQL" -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $SWEEP_SCRATCH_PG;" >/dev/null 2>&1
+  "$PSQL" -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $SWEEP_SCRATCH_PG;" >/dev/null 2>&1 \
+    || { echo "FAIL: could not create PG scratch db $SWEEP_SCRATCH_PG"; exit 2; }
+  export DATABASE_URL="postgres://$PGU${PGPW:+:$PGPW}@${PGH}:${PGP}/${SWEEP_SCRATCH_PG}"
+  export PG_BACKUP_USER="${PG_BACKUP_USER:-xacq_backup}"
+  echo "sweep: PG scratch db '$SWEEP_SCRATCH_PG' (seeded, dropped on exit)"
+elif [ -z "${XACQORA_DB_FILE:-}" ]; then
+  # SQLite: a scratch file. (If the caller pinned XACQORA_DB_FILE, respect it.)
+  export XACQORA_DB_FILE="$BASE_DIR/xacqora-sweep-scratch.sqlite3"
+  echo "sweep: SQLite scratch file $XACQORA_DB_FILE (fresh, removed on exit)"
 fi
-echo "sweeping on $BASE (signin -> $(curl -s -o /dev/null -w "%{http_code}" $BASE/signin))"
+# Seed the scratch DB (schema + demo data: users, clients, webhook_endpoint
+# sec-meta_leadgen, demo leads). idempotent; safe on a brand-new DB.
+# Run through the app's env loader in the SAME process so the seed encrypts
+# its secrets with the exact key the sweep's server will use to decrypt
+# (XACQORA_SECRET_KEY from .env; real shell env vars still win). Without this
+# the S.6 secret check 401s instead of reaching the 429.
+node -e 'require("./server/lib/env").loadEnvFile(); require("./scripts/seed.js");' >/dev/null 2>&1
+
+# Own the port exclusively: a foreign server would not be on the scratch DB.
+if [ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/signin" 2>/dev/null)" = "200" ] || \
+   [ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/signin" 2>/dev/null)" = "302" ]; then
+  echo "FAIL: port $PORT is busy (a foreign server, not the sweep's scratch one). Stop it or run: PORT=4199 $0"; exit 2
+fi
+# Low rate limits so the S.6 429 test is quick; the scratch DB overrides the dev .env.
+# DATA_MODE=demo pins the sweep to the seed fixture: its masking/isolation/export
+# assertions are written against the demo data (owner sees full seed phones/
+# emails/leads, client is masked + isolated). Live mode would hide the seed rows
+# and those checks would be vacuous — so the sweep always runs on demo data.
+PORT="$PORT" XT_RATE_PER_MIN_IP=10 XT_RATE_PER_MIN_ENDPOINT=1000 DATA_MODE=demo node server/index.js &>/tmp/xt-$PORT.log &
+SCRATCH_PID=$!
+sleep 2
+echo "sweeping on $BASE (scratch db, own server pid $SCRATCH_PID; signin -> $(curl -s -o /dev/null -w "%{http_code}" $BASE/signin))"
 
 # sign in as owner + client
 curl -s -c "$O" -o /dev/null -X POST -d "email=owner@xacqora.local&password=xacqora" "$BASE/signin"
@@ -85,7 +149,8 @@ sleep 0.2
 if [ -n "${DATABASE_URL:-}" ]; then
   auditCount=$(node scripts/dbq.js "SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'" | tail -1 | tr -d '\r ')
 else
-  auditCount=$(node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('xacqora.sqlite3');console.log(d.prepare(\"SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'\").get().c);" 2>/dev/null)
+  # v10: the sweep's SQLite scratch db (XACQORA_DB_FILE), never the dev db
+  auditCount=$(node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(process.env.XACQORA_DB_FILE||'xacqora.sqlite3',({readOnly:true}));console.log(d.prepare(\"SELECT COUNT(*) c FROM audit_log WHERE action='export.csv'\").get().c);" 2>/dev/null)
 fi
 echo "audit_log export.csv rows: $auditCount (expect >0)"
 [ "${auditCount:-0}" = "0" ] && { echo "FAIL exports not written to audit log"; FAILS=$((FAILS+1)); }
@@ -93,8 +158,10 @@ echo "audit_log export.csv rows: $auditCount (expect >0)"
 echo '--- S.6: per-IP + per-endpoint rate limit (429) ---'
 rl429=0
 for i in $(seq 1 40); do
+  # __sweep_test: the ingest layer logs these as test + does NOT mint a lead
+  # (v10 guard). Defense-in-depth — the sweep also runs on a scratch DB.
   code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" \
-    -H "X-Forwarded-For: 1.2.3.4" -d '{"client_id":1}' "$BASE/api/ingest/meta_leadgen?secret=sec-meta_leadgen")
+    -H "X-Forwarded-For: 1.2.3.4" -d '{"client_id":1,"__sweep_test":true}' "$BASE/api/ingest/meta_leadgen?secret=sec-meta_leadgen")
   [ "$code" = "429" ] && { rl429=$i; break; }
 done
 echo "rate-limited after request #$rl429"
