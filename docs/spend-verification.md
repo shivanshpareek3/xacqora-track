@@ -23,6 +23,35 @@ recorded nothing. Fixed with an idempotent migration in `server/db.js`
 (SQLite + PG branches). This is why the user saw "drift still showing"
 after pressing Re-check: **the check had never once succeeded in dev.**
 
+## The REAL 30-day bug (found the same day, superseding "no bug")
+
+After the complete-days window fix, the **7d KPI matched Meta at 0.00% on all
+7 accounts**, but the **30d KPI was under-counting by 53–99%** (e.g. Abhishek
+Pal - FML: app 30d = ₹4,28,713 vs Meta API `last_30d` = ₹15,42,007; Piyush
+₹9.72 vs ₹70,613). Root cause, proven live:
+
+- The 7 real `act_` accounts had only just been mapped (v11), and the 3h
+  ticker's Meta pull default is **the last 7 days** — so `spend_daily` held
+  only ~5–7 days of history for them.
+- The dashboard "Last 30d" KPI sums `spend_daily` over 30 days; with only a
+  week present it silently showed a ~week's total as if it were a month's.
+
+**Fix (this commit):**
+1. **One-time 30-day backfill** for all 7 accounts (Meta live, 0 errors) —
+   after it, app 30d = Meta 30d at **0.00% on every account** (Abhishek
+   ₹15,42,007 ✓ · FML X ₹8,71,226 ✓ · FML New ₹2,03,486 ✓ · CardGenius
+   ₹53,303 ✓ · Upcurvv ₹88,933 ✓ · Job Workshop AED 13,743 ✓ · Piyush
+   ₹70,613 ✓).
+2. **`scripts/meta-backfill.js`** (new, reusable): safe one-shot 30-day
+   backfill for a freshly-mapped account — refuses to run in mock mode (a
+   mock backfill would seed fake spend), skips MOCK-token accounts, and is
+   idempotent (upserts). Run it after mapping any new ad account.
+3. The 3h ticker keeps its 7-day default on purpose: older days are final and
+   accumulate in `spend_daily`; a 30-day ticker would 4× the API load and risk
+   silent truncation on busy accounts.
+
+## The original window fix (superseded section kept for the record)
+
 ## The fix (all committed with this task)
 
 1. **KPI basis = complete days** (`server/lib/shared.js`): the 7d/30d KPIs,

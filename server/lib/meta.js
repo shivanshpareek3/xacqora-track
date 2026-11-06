@@ -34,9 +34,16 @@ async function runMetaPull(tx, payload) {
     return;
   }
 
-  // live: batched Marketing API pull. Default = the last 7 days (the 3h ticker).
+  // live: batched Marketing API pull. Default = the last 7 days (the 3h
+  // ticker). Older days are final and already in spend_daily (never deleted,
+  // only upserted), so the 3h job only needs to refresh the recent 7 days —
+  // a 30-day default would 4x the API load on the hot ticker and risk
+  // silent truncation on busy accounts. The "Last 30d" KPI instead relies on
+  // spend_daily accumulating a full month of history (seeded on first map by
+  // scripts/meta-backfill.js, which does the one-time 30-day fetch).
   // payload.from / payload.to (YYYY-MM-DD) fetch an explicit window instead —
-  // the dashboard's "custom date range" live-fetch path (index.js /dashboard/refresh).
+  // the dashboard's "custom date range" live-fetch path (index.js
+  // /dashboard/refresh) and the backfill's 30-day seed.
   // time_range dates MUST be YYYY-MM-DD (the insights API rejects a full ISO
   // timestamp with #100 "Must be a date representation in the format
   // YYYY-MM-DD").

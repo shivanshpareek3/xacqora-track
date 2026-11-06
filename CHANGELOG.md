@@ -2,6 +2,34 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-06 (v13 spend-accuracy fix 2: the 30-day KPI was under-counting)
+
+The user pushed back on the first spend fix: 7d was fine, but Abhishek
+Pal - FML's real spend is much bigger than what "Last 30d" showed. A live
+Meta probe (`tmp/meta-real-spend.js`, account-level `date_preset=last_7d`
+/ `last_30d` — the same basis as Ads Manager) proved it:
+- 7d: app = Meta, 0.00% on all 7 accounts
+- **30d: app under-counted by 53–99%** (Abhishek ₹4,28,713 vs Meta ₹15,42,007;
+  Piyush ₹9.72 vs ₹70,613).
+Root cause: the 7 `act_` accounts were just mapped (v11) and the 3h ticker
+only pulls the **last 7 days**, so `spend_daily` held a week of history —
+the 30d KPI silently summed that week as if it were the month.
+
+Fix:
+1. **One-time 30-day backfill** for all 7 accounts (Meta live, 0 errors) —
+   after: app 30d = Meta 30d at 0.00% on every account.
+2. **`scripts/meta-backfill.js`** (new): reusable safe 30-day backfill —
+   refuses to run in mock mode (would seed fake spend), skips MOCK-token
+   accounts, idempotent upserts. Run after mapping any new ad account.
+3. `server/lib/meta.js`: ticker default kept at 7 days, with a comment
+   explaining why (older days are final + accumulate; 30d relies on
+   accumulated history + the backfill seed).
+4. `docs/spend-verification.md`: new "REAL 30-day bug" section + both
+   windows' proof table. New screenshots `spend-v13-7d.png` (₹3,81,089) +
+   `spend-v13-30d.png` (₹15,42,007 — Meta exact).
+
+Both engines green (9 suites + replay + sweep, 0 failures) after the change.
+
 ## 2026-11-06 (v13 spend-accuracy fix — dashboard KPIs now match Meta Ads Manager)
 
 User report: dashboard KPIs "don't match Ads Manager, Re-check still shows
