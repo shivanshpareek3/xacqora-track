@@ -29,7 +29,7 @@ function health(tx, db, dataMode) {
   //    In live data-mode, exclude the seed's demo webhook rows so the ops
   //    board doesn't report test fixture failures as real.
   const whEx = dataMode === 'live'
-    ? require('./datamode').webhookNotDemo('live', 'w') : '';
+    ? require('./datamode').webhookEx('live', 'w') : ''; // v11: seed + demo-client webhook rows
   const failed = tx.all(`SELECT id, client_id, platform, ref, error, ingested_at FROM webhook_log w
     WHERE status='failed' ${whEx ? `AND ${whEx}` : ''} ORDER BY id DESC LIMIT 50`);
   const cutoff24h = now - 24 * 3600000;
@@ -52,7 +52,7 @@ function health(tx, db, dataMode) {
   //    In live data-mode, drop the seed's ACT- ad accounts so their mock/token
   //    errors don't read as real pull failures on the ops board.
   const metaEx = dataMode === 'live'
-    ? require('./datamode').metaNotDemo('live', '') : '';
+    ? require('./datamode').metaAccEx('live', 'a') : ''; // v11: seed + demo-client accounts
   const metaFails = tx.all(`SELECT ad_account_id, name, last_error, last_pull_at FROM meta_ad_account a
     WHERE last_error IS NOT NULL AND last_error != '' ${metaEx ? `AND ${metaEx}` : ''} ORDER BY id`);
 

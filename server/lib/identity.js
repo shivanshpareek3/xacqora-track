@@ -111,7 +111,7 @@ function recordTouchpoint(tx, row) {
 // live (v9): when true, demo/seed leads are excluded from the comparison.
 function likelyDuplicates(tx, clientId, live = false) {
   const dm = require('./datamode');
-  const exLead = live ? ` AND ${dm.leadNotDemo(dm.LIVE, 'l')}` : '';
+  const exLead = live ? ` AND ${dm.leadEx(dm.LIVE, 'l')}` : ''; // v11: seed + demo-client leads
   const leads = tx.all(`SELECT l.* FROM lead l WHERE l.client_id=?${exLead}`, clientId);
   const byEmail = {};
   for (const l of leads) {

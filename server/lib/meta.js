@@ -64,6 +64,27 @@ async function runMetaPull(tx, payload) {
   }
 }
 
+// Read-only live fetch of one account's insights for a window — for the
+// dashboard's accuracy spot-check. Does NOT upsert the DB (a check must not
+// mutate the pipeline it's auditing). Returns the summed spend in the
+// account's NATIVE currency units over [from,to], plus the currency. In mock
+// mode (no live token) it throws so the route can report "not checked" rather
+// than fabricate a comparison against the mock generator.
+async function fetchMetaSpendTotal(tx, { ad_account_id, from, to }) {
+  const acc = tx.get(`SELECT * FROM meta_ad_account WHERE ad_account_id=?`, ad_account_id);
+  if (!acc) return null;
+  const token = plainToken(acc.token || '');
+  if (!live.liveMode() || !token || token === 'MOCK') {
+    throw new Error('mock mode (no live token) — run in live mode to check against Meta');
+  }
+  const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
+  const toD = isDay(to) ? to : new Date().toISOString().slice(0, 10);
+  const fromD = isDay(from) ? from : new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+  const data = await live.runLiveMetaPull({ ad_account_id }, { from: fromD, to: toD, token });
+  const metaSpend = (data.spend || []).reduce((a, r) => a + (Number(r.spend) || 0), 0);
+  return { metaSpend: +metaSpend.toFixed(2), currency: data.currency || acc.currency || null, from: fromD, to: toD };
+}
+
 function upsertEntities(tx, adAccount, data) {
   for (const c of data.campaigns) tx.run(`INSERT INTO meta_campaign (id, ad_account_id, name, status) VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING`, c.id, adAccount, c.name, c.status);
   for (const a of data.adsets) tx.run(`INSERT INTO meta_adset (id, ad_account_id, campaign_id, name, status) VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING`, a.id, adAccount, a.campaign_id, a.name, 'ACTIVE');
@@ -158,4 +179,4 @@ function ensureCapiLogTable(db) {
   )`);
 }
 
-module.exports = { runMetaPull, pushCapiEvent, ensureCapiLogTable };
+module.exports = { runMetaPull, fetchMetaSpendTotal, pushCapiEvent, ensureCapiLogTable };

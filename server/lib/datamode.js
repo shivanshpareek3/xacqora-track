@@ -11,8 +11,10 @@
 //
 // Resolution order (first present wins):
 //   1. settings.data_mode   — the admin toggle (POST /admin/data-mode, audited)
-//   2. process.env.DATA_MODE — .env / Vercel dashboard (prod default: live)
-//   3. 'demo'               — safe default for local dev
+//   2. process.env.DATA_MODE — .env / Vercel dashboard (v11: live default)
+//   3. 'live'               — v11: when neither is set the app is live-only.
+//                              Demo (seed data) is opt-in, via .env DATA_MODE=demo
+//                              or the admin toggle, and is never the default.
 //
 // The demo predicates key off the seed's OWN conventions (explicit lead ids
 // 101–126, deal ids 1–10, `ACT-…` ad-account + entity ids, seed webhook refs)
@@ -36,11 +38,14 @@ const EMPTY = {
   revenue: 'No revenue yet — attribution runs on gateway payments (Razorpay/Cashfree webhooks), which switch on at pilot cutover.',
 };
 
-// mode(tx): settings.data_mode -> env DATA_MODE -> 'demo'
+// mode(tx): settings.data_mode -> env DATA_MODE -> 'live' (v11 default).
+// Explicitly setting demo (env or the admin toggle) is the only way to see
+// seed data; an unset env no longer falls back to demo.
 function mode(tx) {
   const s = tx.get(`SELECT value FROM settings WHERE key='data_mode'`)?.value;
   if (s === LIVE || s === DEMO) return s;
-  return String(process.env.DATA_MODE || '').toLowerCase() === LIVE ? LIVE : DEMO;
+  const env = String(process.env.DATA_MODE || '').toLowerCase();
+  return env === DEMO ? DEMO : LIVE;
 }
 function isLive(tx) { return mode(tx) === LIVE; }
 
@@ -87,8 +92,62 @@ function webhookNotDemo(m, al = 'w') {
   const p = al ? `${al}.` : '';
   return `NOT (${p}ref LIKE '${SEED.webhookRef}%' OR ${p}raw LIKE '${SEED.webhookRaw}%' OR ${p}test=1)`;
 }
+// v11: whole-CLIENT demo hiding. Seed clients are marked `client.demo=1`, so in
+// live mode every row that belongs to a demo client is hidden — not just the
+// seed lead/deal ids, but that client's ad accounts + their spend_daily rows
+// too. Keyed off the `client.demo` flag, never off auto-ids, so a real client
+// is never excluded. `al` = table alias with its own client_id (lead/deal/
+// meta_ad_account); spend_daily has no client_id, so it is excluded through the
+// account's client (spendClientNotDemo).
+function clientNotDemo(m, al = 'l') {
+  if (m !== LIVE) return '';
+  const p = al ? `${al}.` : '';
+  return `NOT EXISTS (SELECT 1 FROM client c WHERE c.id=${p}client_id AND c.demo=1)`;
+}
+function spendClientNotDemo(m, al = 's') {
+  if (m !== LIVE) return '';
+  const p = al ? `${al}.` : '';
+  return `NOT EXISTS (SELECT 1 FROM meta_ad_account ma JOIN client c ON c.id=ma.client_id WHERE ma.ad_account_id=${p}ad_account_id AND c.demo=1)`;
+}
+// v11 combined live predicates: the seed-convention row filter PLUS the whole
+// client.demo=1 hiding, in one clause per table. These are what the screens
+// append (so demo mode stays byte-identical: every helper returns '' there).
+//   lead / deal -> NOT(seed ids) AND NOT(demo client)
+//   spend       -> NOT(seed ACT- rows) AND NOT(demo-client account's spend)
+//   meta_ad_account -> NOT(seed ACT- accounts) AND NOT(demo client)
+//   meta_* entities (campaign/adset/ad: no client_id column) ->
+//                    NOT(seed ACT- entities) AND NOT(demo-client account)
+const _and = (parts) => parts.filter(Boolean).join(' AND ');
+function leadEx(m, al = 'l') { return m === LIVE ? _and([leadNotDemo(m, al), clientNotDemo(m, al)]) : ''; }
+function dealEx(m, al = 'd') { return m === LIVE ? _and([dealNotDemo(m, al), clientNotDemo(m, al)]) : ''; }
+function spendEx(m, al = 's') { return m === LIVE ? _and([spendNotDemo(m, al), spendClientNotDemo(m, al)]) : ''; }
+function metaAccEx(m, al = 'a') { return m === LIVE ? _and([metaNotDemo(m, al), clientNotDemo(m, al)]) : ''; }
+function metaEntityEx(m, al = '') { return m === LIVE ? _and([metaNotDemo(m, al), spendClientNotDemo(m, al)]) : ''; }
+function webhookEx(m, al = 'w') { return m === LIVE ? _and([webhookNotDemo(m, al), clientNotDemo(m, al)]) : ''; }
 
-module.exports = { LIVE, DEMO, SEED, EMPTY, mode, isLive, leadNotDemo, dealNotDemo, spendNotDemo, metaNotDemo, webhookNotDemo, setDataMode,
+// ids of the clients a caller should show in the switcher: live = the
+// non-demo (real) clients within baseScope; demo = every in-scope client.
+// baseScope null = team role (all); otherwise the caller's own client ids.
+function realClientIds(tx, m, baseScope) {
+  const inScope = baseScope && baseScope.length ? `AND c.id IN (${baseScope.map((n) => Number(n)).join(',')})` : '';
+  const demoClause = m === LIVE ? `AND (c.demo IS NULL OR c.demo = 0)` : '';
+  const rows = tx.all(`SELECT c.id, c.name FROM client c WHERE 1=1 ${inScope} ${demoClause} ORDER BY c.id`);
+  return rows.map((r) => Number(r.id));
+}
+// The client switcher's option list: [{ id, name, is_demo }] within the
+// caller's baseScope. Live mode drops the demo-flagged clients entirely
+// (their whole dataset is hidden); demo mode lists every in-scope client.
+function clientOptions(tx, m, baseScope) {
+  const inScope = baseScope && baseScope.length ? `AND c.id IN (${baseScope.map((n) => Number(n)).join(',')})` : '';
+  const demoClause = m === LIVE ? `AND (c.demo IS NULL OR c.demo = 0)` : '';
+  const rows = tx.all(`SELECT c.id, c.name, c.demo FROM client c WHERE 1=1 ${inScope} ${demoClause} ORDER BY c.id`);
+  return rows.map((r) => ({ id: Number(r.id), name: r.name, is_demo: !!Number(r.demo) }));
+}
+
+module.exports = { LIVE, DEMO, SEED, EMPTY, mode, isLive, leadNotDemo, dealNotDemo, spendNotDemo, metaNotDemo, webhookNotDemo,
+  clientNotDemo, spendClientNotDemo, realClientIds, clientOptions, setDataMode,
+  // v11 combined live predicates (seed + whole-client demo hiding).
+  leadEx, dealEx, spendEx, metaAccEx, metaEntityEx, webhookEx,
   // thin boolean wrappers: pass `live` (bool) instead of the mode string
   liveLeadEx(live, al) { return live ? leadNotDemo(LIVE, al) : ''; },
   liveDealEx(live, al) { return live ? dealNotDemo(LIVE, al) : ''; },

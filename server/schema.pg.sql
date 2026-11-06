@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS client (
   id SERIAL PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspace(id),
   name TEXT NOT NULL, currency TEXT DEFAULT 'INR', timezone TEXT DEFAULT 'Asia/Kolkata',
   offer_price DOUBLE PRECISION DEFAULT 0,
+  -- v11: 1 = a seed/demo client (hidden in DATA_MODE=live, shown in demo).
+  demo INTEGER DEFAULT 0,
   created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT );
@@ -85,6 +87,21 @@ CREATE TABLE IF NOT EXISTS spend_daily (
   PRIMARY KEY (ad_id, date, ad_account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_spend_date ON spend_daily(date, ad_account_id);
+
+-- v11: the accuracy spot-check — per real ad account, the app's STORED window
+-- spend vs a FRESH Meta fetch of the same window, both in the account's NATIVE
+-- currency units, with the drift % (gate: <=1%). No client_id -> no RLS policy
+-- (like fx_rate). Recorded when the dashboard's "Re-check vs Meta" button runs
+-- a fresh fetch — NOT on every ticker pull.
+CREATE TABLE IF NOT EXISTS meta_accuracy_check (
+  ad_account_id TEXT PRIMARY KEY,
+  window_from TEXT NOT NULL, window_to TEXT NOT NULL,
+  app_spend DOUBLE PRECISION NOT NULL DEFAULT 0,    -- stored total, native currency units
+  meta_spend DOUBLE PRECISION NOT NULL DEFAULT 0,   -- fresh Meta total, native currency units
+  drift_pct DOUBLE PRECISION,
+  currency TEXT,
+  checked_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS funnel (
   id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES client(id),

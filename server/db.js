@@ -47,6 +47,8 @@ function open() {
     // live-verified; `currency_code` does not exist and 400s with #100).
     // Recorded so the dashboard KPIs can show billing currency + INR together.
     sys.exec(`ALTER TABLE meta_ad_account ADD COLUMN IF NOT EXISTS currency TEXT`);
+    // v11: mark a seed/demo client so its whole dataset hides in DATA_MODE=live.
+    sys.exec(`ALTER TABLE client ADD COLUMN IF NOT EXISTS demo INTEGER DEFAULT 0`);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -105,6 +107,9 @@ function open() {
   // dashboard KPI cards.
   const ma2 = cols('meta_ad_account');
   if (!ma2.includes('currency')) db.exec(`ALTER TABLE meta_ad_account ADD COLUMN currency TEXT`);
+  // v11: mark a seed/demo client so its whole dataset hides in DATA_MODE=live.
+  const cl = cols('client');
+  if (!cl.includes('demo')) db.exec(`ALTER TABLE client ADD COLUMN demo INTEGER DEFAULT 0`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,

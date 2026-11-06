@@ -5,7 +5,11 @@ CREATE TABLE IF NOT EXISTS workspace (
 CREATE TABLE IF NOT EXISTS client (
   id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspace(id),
   name TEXT NOT NULL, currency TEXT DEFAULT 'INR', timezone TEXT DEFAULT 'Asia/Kolkata',
-  offer_price REAL DEFAULT 0, created_at TEXT DEFAULT (datetime('now'))
+  offer_price REAL DEFAULT 0,
+  -- v11: 1 = a seed/demo client whose whole dataset (ad accounts, leads,
+  -- deals, spend) is hidden in DATA_MODE=live and shown only in demo mode.
+  demo INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS funnel (
   id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES client(id),
@@ -87,6 +91,20 @@ CREATE TABLE IF NOT EXISTS spend_daily (
   PRIMARY KEY (ad_id, date, ad_account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_spend_date ON spend_daily(date, ad_account_id);
+-- v11: the accuracy spot-check — per real ad account, the app's STORED 7-day
+-- spend (what the dashboard KPI shows) vs a FRESH Meta fetch of the same
+-- window, both in the account's NATIVE currency units, with the drift %.
+-- Gate: <=1% means the pipeline is honest. Recorded when the dashboard's
+-- "Re-check vs Meta" button runs a fresh fetch — NOT on every ticker pull.
+CREATE TABLE IF NOT EXISTS meta_accuracy_check (
+  ad_account_id TEXT PRIMARY KEY,
+  window_from TEXT NOT NULL, window_to TEXT NOT NULL,
+  app_spend REAL NOT NULL DEFAULT 0,     -- stored 7d total, native currency units
+  meta_spend REAL NOT NULL DEFAULT 0,    -- fresh Meta 7d total, native currency units
+  drift_pct REAL,
+  currency TEXT,
+  checked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS fx_rate (
   date TEXT PRIMARY KEY, currency TEXT NOT NULL, inr_per_unit REAL NOT NULL
 );

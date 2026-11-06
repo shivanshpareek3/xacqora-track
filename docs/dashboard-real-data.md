@@ -17,23 +17,52 @@ the dashboard comes from, and what "live" vs "demo" changes.
 ```
 resolution (first present wins):
   1. settings.data_mode   ← admin toggle  POST /admin/data-mode  (audit-logged: data_mode.toggle)
-  2. env DATA_MODE        ← .env (dev default: demo) / Vercel dashboard (prod default: live)
-  3. 'demo'               ← safe default when neither is set
+  2. env DATA_MODE        ← .env (dev: live) / Vercel dashboard (prod: live)
+  3. 'live'               ← v11 default when neither is set (demo is opt-in only)
 ```
 
-- **demo** (default, local dev): seed + real rows together, with the yellow
-  "Demo data — seed figures included" band under the top bar.
-- **live** (default in prod): every seed row is excluded from every screen
-  (leads, deals, meta entities, spend, webhook log). Screens that would
+- **live** (default, local dev + prod): every demo row is excluded from
+  every screen. "Demo" now has two layers (v11): the seed `ACT-` fixtures
+  (below) **and** any client flagged `client.demo=1` (the seed "Coach Ravi"
+  + "Kaya Coach" rows) — so a demo client's real-looking `act_` accounts,
+  leads, deals and `spend_daily` rows all hide too. Screens that would
   otherwise show a demo figure instead show a clean empty state ("No leads
   yet — your first lead lands when the Meta Instant Form webhook goes live
   (pilot cutover). Ad spend below is already real."). **ROAS is never
   faked**: with no attributed revenue yet it renders "N/A — pilot live".
+- **demo** (opt-in, via `.env DATA_MODE=demo` or the admin toggle): seed +
+  real rows together, with the yellow "Demo data — seed figures included"
+  band under the top bar. This is the only way to see demo data.
 
-The demo predicates key off the seed's own conventions — **never off ranges
-of auto-generated ids** — so real gateway leads (which get sequential
-auto-ids after the seed's) are never excluded. Single source of truth:
-`server/lib/datamode.js → SEED`.
+The demo predicates key off the seed's own conventions (`client.demo=1`
+flag + explicit ids/prefixes) — **never off ranges of auto-generated ids** —
+so real gateway leads and real `act_` accounts are never excluded. Single
+source of truth: `server/lib/datamode.js → SEED` + the combined live helpers
+(`leadEx` / `dealEx` / `spendEx` / `metaAccEx` / `metaEntityEx` /
+`webhookEx`), which layer seed-convention hiding and whole-demo-client
+hiding in one clause. Demo-mode SQL is byte-identical to the pre-v11 code.
+
+## Real-client mapping + accuracy spot-check (v11)
+
+The dashboard is now a **per-client** real view. `scripts/map-real-clients.js`
+(one-shot, idempotent, both engines) points the operator's 7 real `act_`
+accounts at their real clients and sets `client.demo=1` on the two seed
+clients, so `DATA_MODE=live` hides their whole dataset. The dashboard's
+top-bar client switcher lists real clients only (in live mode); picking a
+client scopes KPIs / trend / top campaigns+ads / ROAS / funnel / recent leads
+to that client's real accounts.
+
+An **accuracy spot-check** table sits under the KPI cards: per real account,
+the app's stored 7-day spend (native currency units) vs the total the
+operator's Meta Ads Manager shows, with the drift % (gate ≤1%). "Re-check vs
+Meta" (`GET /meta/check?acc=`, team-only) live-fetches the last 7 days and
+records the drift in the `meta_accuracy_check` table — it does **not**
+upsert `spend_daily`, so a check never mutates the pipeline it audits.
+
+`docs/screenshots/v11-mapping-{dash-switcher,dash-client3,reports-mvt,leads-empty}.png`
+capture the owner, live view: the client switcher (real clients only), a
+per-client dashboard + accuracy card, the Meta-vs-Track report on real ad
+rows, and the clean leads empty-state.
 
 ## Where each dashboard number comes from
 

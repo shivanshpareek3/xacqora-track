@@ -38,6 +38,17 @@ function dashboard(db, user, p) {
   // client logins are scoped to their own data; team roles see all internal clients
   const scopeIds = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : null;
 
+  // v11: a CLIENT-level select in the top-bar switcher (?client=). team roles
+  // may pick any real client; a client login is locked to their own. In live
+  // mode the switcher lists real (non-demo) clients only — dm.clientOptions
+  // drops the client.demo=1 rows. Selecting a client scopes the account list,
+  // KPIs, trend, top campaigns/ads, ROAS and funnel to that client's real
+  // accounts (never a cross-client leak).
+  const clientParam = user.role === 'client' ? String(scopeIds?.[0] || '') : String(p.client || '');
+  const clientOpts = dm.clientOptions(tx, dataMode, scopeIds);
+  const clientSel = clientOpts.some((c) => String(c.id) === clientParam) ? Number(clientParam) : 0;
+  const repClientIds = clientSel ? [clientSel] : scopeIds; // the scope for THIS report
+
   // ---- real-data report (Meta spend front and center) ----
   // Design: opening the dashboard with no ?acc auto-selects the LARGEST
   // account by 7-day spend (base.defaultAccount), so real numbers show first.
@@ -51,14 +62,14 @@ function dashboard(db, user, p) {
   // over that exact window (rep.range) from genuine Meta spend.
   const rangeReq = S.parseDashboardRange(p);
   const rangeOpt = rangeReq.ok ? { from: rangeReq.from, to: rangeReq.to } : undefined;
-  const base = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode, range: rangeOpt });
+  const base = S.metaAccountReport(tx, { adAccount: '', clientIds: repClientIds, dataMode, range: rangeOpt });
   const accParam = p.acc === undefined ? null : String(p.acc);
   let selected;
   if (accParam === null) selected = base.defaultAccount;                    // default = largest
   else if (accParam === '' || accParam === 'all') selected = '';            // aggregate
   else selected = base.accounts.some((a) => a.ad_account_id === accParam) ? accParam : base.defaultAccount;
   const rep = selected
-    ? S.metaAccountReport(tx, { adAccount: selected, clientIds: scopeIds, dataMode, range: rangeOpt })
+    ? S.metaAccountReport(tx, { adAccount: selected, clientIds: repClientIds, dataMode, range: rangeOpt })
     : base;
   const range = rep.range; // the custom-window bundle, or null (preset mode)
   const kpis = rep.kpis;
@@ -137,10 +148,12 @@ function dashboard(db, user, p) {
     <td>${money2(a.spend)}</td><td class="small">${S.fmtN(a.impressions)} imp</td><td class="small">${S.fmtN(a.clicks)} clk</td></tr>`).join('');
 
   // ---- bottom: funnel + recent leads (compact, demo-aware empty states) ----
+  // scoped to the chosen client (repClientIds) so the funnel/recent-leads
+  // match the KPIs above, never the whole workspace.
   const live = dataMode === 'live';
-  const fp = S.funnelReport(tx, null, settings, scopeIds, live);
-  const totalLeads = scopeIds
-    ? tx.get(`SELECT COUNT(*) c FROM lead WHERE client_id IN (${scopeIds.map((n) => Number(n)).join(',')})`)?.c || 0
+  const fp = S.funnelReport(tx, null, settings, repClientIds, live);
+  const totalLeads = repClientIds
+    ? tx.get(`SELECT COUNT(*) c FROM lead WHERE client_id IN (${repClientIds.map((n) => Number(n)).join(',')})`)?.c || 0
     : tx.get(`SELECT COUNT(*) c FROM lead`)?.c || 0;
   const funnelSteps = [
     { l: 'Leads', v: fp.leads, max: fp.leads || 1, c: 'b' },
@@ -154,8 +167,8 @@ function dashboard(db, user, p) {
     </div>`).join('');
   const leadsEmpty = dataMode === 'live' ? `<div class="empty-state">${S.esc(dm.EMPTY.leads)}</div>` : '';
   const recentRows = (() => {
-    const ex = dm.leadNotDemo(dataMode, 'l');
-    const where = scopeIds ? `WHERE l.client_id IN (${scopeIds.map((n) => Number(n)).join(',')}) ${ex ? 'AND ' + ex : ''}` : (ex ? `WHERE ${ex}` : '');
+    const ex = dm.leadEx(dataMode, 'l'); // v11: seed + demo-client leads hide in live
+    const where = repClientIds ? `WHERE l.client_id IN (${repClientIds.map((n) => Number(n)).join(',')}) ${ex ? 'AND ' + ex : ''}` : (ex ? `WHERE ${ex}` : '');
     return tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
       FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 8`);
   })().map((r) => `<tr>
@@ -169,14 +182,20 @@ function dashboard(db, user, p) {
   const dotMark = (a) => a.last_error ? ' · error' : (a.last_pull_at ? '' : ' · never pulled');
   // The range picker (header) must carry the current window through an account
   // switch, so the switcher's hidden fields keep from/to (range mode) or win.
+  // v11: ?client= rides through too, so an account switch keeps the chosen
+  // client (and vice-versa a client switch keeps the current window).
   const switcherHidden = range
     ? [{ name: 'from', value: range.from }, { name: 'to', value: range.to }]
     : [{ name: 'win', value: win === 'd7' ? '7' : '30' }];
+  if (clientSel) switcherHidden.unshift({ name: 'client', value: String(clientSel) });
   const switcher = {
     path: 'dashboard.html',
     current: selected,
     options: rep.accounts.map((a) => ({ value: a.ad_account_id, label: `${a.name || a.ad_account_id}${dotMark(a)}` })),
     hidden: switcherHidden,
+    // v11 client-level select (top bar): real clients only in live mode.
+    clientOptions: user.role !== 'client' ? clientOpts.map((c) => ({ value: String(c.id), label: c.name })) : [],
+    clientCurrent: clientSel ? String(clientSel) : '',
   };
 
   // ---- custom date-range picker (v10): presets + a From/To form ----
@@ -189,6 +208,7 @@ function dashboard(db, user, p) {
   const rangeControl = `
     <form method="get" action="/dashboard.html" class="inline" style="gap:6px;align-items:center">
       ${selected ? '<input type="hidden" name="acc" value="' + S.esc(selected) + '">' : ''}
+      ${clientSel ? '<input type="hidden" name="client" value="' + clientSel + '">' : ''}
       <label class="small muted">From</label><input type="date" name="from" value="${S.esc(range ? range.from : p.from || '')}">
       <label class="small muted">To</label><input type="date" name="to" value="${S.esc(range ? range.to : p.to || '')}">
       <button class="btn sm">Apply</button>
@@ -196,7 +216,9 @@ function dashboard(db, user, p) {
   const rangeBadge = range
     ? `<span class="badge" style="color:var(--accent)">custom: ${S.esc(range.rangeLabel)}</span>` : '';
 
-  const titleSuffix = selected ? (rep.accounts.find((a) => a.ad_account_id === selected)?.name || selected) : (scopeIds ? 'My account' : 'All accounts');
+  const clientName = clientOpts.find((c) => c.id === clientSel)?.name;
+  const titleSuffix = selected ? (rep.accounts.find((a) => a.ad_account_id === selected)?.name || selected)
+    : (clientSel ? clientName : (scopeIds ? 'My account' : 'All accounts'));
   const noDataCta = range && !range.hasData ? `
   <div class="card" style="margin-top:0;border-color:var(--warn,#c79b2f)">
     <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
@@ -210,6 +232,34 @@ function dashboard(db, user, p) {
       <span class="small muted">Showing genuine Meta spend for <b>${S.esc(range.rangeLabel)}</b>${canPull ? '' : ' (team-only pull)'}</span>
       ${canPull ? `<a class="btn sm sec" href="${refreshHref}">Re-pull this range</a>` : ''}
     </div>` : '';
+
+  // ---- v11 accuracy spot-check: app-spend (7d, what the KPI shows) vs the
+  // operator's Ads-Manager figure per real account, with the drift % (gate
+  // <=1%). Team-only "Re-check vs Meta" button live-fills the Meta column. ----
+  const accRows = S.accuracyCheck(tx, dataMode, repClientIds);
+  const cur = (n, c) => n == null ? '—' : `${c ? c + ' ' : '₹'}${Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+  const accBody = accRows.length ? accRows.map((r) => {
+    const driftCell = r.drift == null ? `<span class="muted small">—</span>`
+      : r.gateOk
+        ? `<span class="pill g">${r.drift}%</span>`
+        : `<span class="pill r">${r.drift}%</span>`;
+    return `<tr>
+      <td><b>${S.esc(r.client_name || '—')}</b><div class="small muted">${S.esc(r.name || r.ad_account_id)}</div></td>
+      <td class="small muted">${S.esc(r.ad_account_id)}${r.currency ? ` · ${S.esc(r.currency)}` : ''}</td>
+      <td>${cur(r.app7d, r.currency)}</td>
+      <td>${r.meta7d == null ? `<span class="muted small">${r.checked_at ? 'check failed — see Meta hub' : 'not checked'}</span>` : cur(r.meta7d, r.currency)}</td>
+      <td>${driftCell}</td>
+      <td class="small muted">${r.checked_at ? `${S.esc(r.window)} · ${S.fmtDT(r.checked_at)}` : ''}</td>
+      ${canPull ? `<td>${r.id ? `<a class="btn sm sec" href="/meta/check?acc=${r.id}" title="Live-fetch last 7d from Meta + record the drift">Re-check</a>` : ''}</td>` : ''}
+    </tr>`;
+  }).join('') : `<tr><td colspan="${canPull ? 7 : 6}" class="muted">No real ad accounts yet — fill META_AD_ACCOUNT_IDS in .env and restart</td></tr>`;
+  const accuracyCard = `
+  <div class="card"><h2>Accuracy spot-check <span class="badge">app 7d spend vs Meta Ads Manager · gate ≤ 1% drift</span></h2>
+    <div class="tabwrap"><table>
+      <thead><tr><th>Client</th><th>ACT_ account</th><th>7d spend (app)</th><th>7d spend (Ads Manager)</th><th>drift %</th><th>checked</th>${canPull ? '<th></th>' : ''}</tr></thead>
+      <tbody>${accBody}</tbody></table></div>
+    <div class="small muted">Figures are in each account's billing currency (INR / AED …) — the same units Meta's Ads Manager shows. "Re-check" live-fetches the last 7 days from Meta for that account and records the drift (it does NOT re-pull the app's spend). A green pill means the app's number matches Ads Manager within 1%.</div>
+  </div>`;
   const body = `
   <div class="row pagehead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
     <h1 style="margin:0">Dashboard ${titleSuffix !== 'All accounts' ? `· <span class="badge">${S.esc(titleSuffix)}</span>` : '<span class="badge">all real accounts</span>'}</h1>
@@ -223,6 +273,8 @@ function dashboard(db, user, p) {
   ${noDataCta}
   <div class="grid g6" style="margin-top:10px">${kpiCards}</div>
   ${repullNote}
+
+  ${accuracyCard}
 
   <div class="grid g2" style="margin-top:14px">
     <div class="card"><h2>Spend trend <span class="badge">${range ? S.esc(range.rangeLabel) : (win === 'd7' ? 'last 7 days' : 'last 30 days')} · INR</span></h2>
@@ -269,7 +321,7 @@ function leads(db, user, p) {
   const client = user.role === 'client' ? String(scopeIds[0] || '') : (p.client || '');
   let where = `1=1`;
   const args = [];
-  const exLead = dm.leadNotDemo(dataMode, 'l');
+  const exLead = dm.leadEx(dataMode, 'l'); // v11: seed + demo-client leads hide in live
   if (exLead) { where += ` AND ${exLead}`; } // live mode: hide seed/demo leads
   if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
   if (stage) { where += ` AND l.stage = ?`; args.push(stage); }
@@ -288,10 +340,11 @@ function leads(db, user, p) {
     FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE ${where}
     ORDER BY l.id DESC LIMIT 500`, ...args);
   const stages = S.DEFAULT_STAGES;
-  // a client login only sees its own client in the filter; team roles see all
+  // a client login only sees its own client; team roles see real clients only
+  // in live mode (demo clients are hidden — v11), every client in demo mode.
   const clients = user.role === 'client'
     ? tx.all(`SELECT id, name FROM client WHERE id IN (${scopeIds.map((n) => Number(n)).join(',')})`)
-    : tx.all(`SELECT id, name FROM client`);
+    : dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const rowsHtml = rows.map((r) => `<tr>
     <td><a href="/lead/${r.id}">${S.esc(r.name || '—')} ${r.source_unknown ? '<span class="pill m">unknown source</span>' : ''}</a></td>
     <td class="small muted">${S.esc(r.client_name || '')}</td>
@@ -420,7 +473,7 @@ function pipeline(db, user, p) {
   const sec = require('./lib/security');
   const dm = require('./lib/datamode');
   const dataMode = dm.mode(tx);
-  const exLead = dm.leadNotDemo(dataMode, 'l');
+  const exLead = dm.leadEx(dataMode, 'l'); // v11: seed + demo-client leads hide in live
   // a client login is locked to its own clients; the ?client= filter cannot widen it
   let client = p.client || '';
   if (user.role === 'client') client = String((user.client_ids || '').split(',')[0] || '');
@@ -439,7 +492,7 @@ function pipeline(db, user, p) {
       }).join('');
   const clients = user.role === 'client'
     ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
-    : tx.all(`SELECT id, name FROM client`);
+    : dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const body = `
   <div class="row pagehead" style="justify-content:space-between;align-items:center">
     <h1 style="margin:0">Pipeline</h1>
@@ -472,7 +525,11 @@ function reports(db, user, p) {
   const repAcc = S.metaAccountReport(tx, { adAccount: '', clientIds: scopeIds, dataMode });
   const accReq = String(p.acc || '');
   const acc = repAcc.accounts.some((a) => a.ad_account_id === accReq) ? accReq : '';
-  const allClients = tx.all(`SELECT id, name FROM client`);
+  // v11: the client picker lists real (non-demo) clients only in live mode — a
+  // demo client's whole dataset is hidden, so it must not be pickable either.
+  const allClients = user.role === 'client'
+    ? tx.all(`SELECT id, name FROM client WHERE id IN (${(scopeIds || []).map((n) => Number(n)).join(',') || '0'})`)
+    : dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const live = dataMode === 'live';
   const ap = S.adPerformance(tx, settings, scopeIds, acc, live);
   const fp = S.funnelReport(tx, null, settings, scopeIds, live);
@@ -611,8 +668,8 @@ function meta(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
   const dm = require('./lib/datamode');
   const dataMode = dm.mode(tx);
-  const metaEx = dm.metaNotDemo(dataMode, 'a');
-  const spendEx = dm.spendNotDemo(dataMode, 's');
+  const metaEx = dm.metaAccEx(dataMode, 'a'); // v11: seed ACT- + demo-client accounts
+  const spendEx = dm.spendEx(dataMode, 's');   // v11: seed ACT- spend + demo-client spend
   const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id ${metaEx ? `WHERE ${metaEx}` : ''}`);
   const accRows = accounts.map((a) => `<tr>
     <td><b>${S.esc(a.name || a.ad_account_id)}</b></td>
@@ -667,10 +724,12 @@ function integrations(db, user, p) {
     ['whatsapp', 'WhatsApp (WATI/Interakt/AiSensy)', 'Messages sent & replies'],
     ['google_sheets', 'Google Sheets / CSV', 'Old leads & sales backfill'],
   ];
-  const clients = tx.all(`SELECT id, name FROM client`);
+  const clients = user.role === 'client'
+    ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
+    : dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const client1 = clients[0];
   const endpoints = tx.all(`SELECT * FROM webhook_endpoint`);
-  const whEx = dm.webhookNotDemo(dataMode, '');
+  const whEx = dm.webhookEx(dataMode, 'w'); // v11: seed + demo-client webhook rows
   const log = tx.all(`SELECT * FROM webhook_log ${whEx ? `WHERE ${whEx}` : ''} ORDER BY id DESC LIMIT 30`);
   const logRows = log.map((r) => `<tr><td class="small muted">${S.fmtDT(r.ingested_at)}</td><td>${S.esc(r.platform)}</td>
     <td class="small muted">${S.esc(r.ref || '')}</td>
@@ -718,7 +777,8 @@ function duplicates(db, user, p) {
   const dm = require('./lib/datamode');
   const dataMode = dm.mode(tx);
   const { likelyDuplicates } = require('./lib/identity');
-  const clients = tx.all(`SELECT id, name FROM client`);
+  // v11: real clients only in live mode (demo clients are hidden everywhere)
+  const clients = dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const cid = p.client || clients[0]?.id;
   const dups = cid ? likelyDuplicates(tx, cid, dataMode === 'live') : [];
   const rows = dups.map((d) => `<tr>
@@ -832,7 +892,7 @@ function portal(db, user, p) {
   const myClients = user.role === 'client' ? (user.client_ids || '').split(',').filter(Boolean) : [];
   const cid = myClients[0];
   let where = user.role === 'client' ? `WHERE l.client_id=${cid}` : 'WHERE 1=1';
-  const exLead = dm.leadNotDemo(dataMode, 'l');
+  const exLead = dm.leadEx(dataMode, 'l'); // v11: seed + demo-client leads hide in live
   if (exLead) where += ` AND ${exLead}`; // live mode: portal shows real leads only
   const leads = tx.all(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id ${where} ORDER BY l.id DESC LIMIT 50`);
   const leadsRows = leads.map((r) => `<tr><td><a href="/lead/${r.id}">${S.esc(r.name || '—')}</a></td>
@@ -886,7 +946,9 @@ function pilot(db, user, p) {
   const tx = makeTx(db, user);
   const dm = require('./lib/datamode');
   const dataMode = dm.mode(tx);
-  const clients = tx.all(`SELECT id, name FROM client ORDER BY id`);
+  // v11: real clients only in live mode — a demo client's dataset is hidden
+  // everywhere, so the pilot gate suite must not offer it either.
+  const clients = dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
   const g = P.runGates(tx);
   const checked = p.url ? P.checkAdUrl(decodeURIComponent(p.url)) : null;
   const timing = P.weeklyTiming(tx);

@@ -2,6 +2,80 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-05 (v11 — real-client ad-account mapping + live-mode demo-client hiding)
+
+Arpit's mapping-task ask: the dashboard kept centering **dummy data** — the 7
+real `act_` ad accounts were all pinned to the seed "Coach Ravi" client, so
+live mode still showed seed numbers on the front page. Map each real `act_`
+account to its real client, keep the demo clients in the DB but mark them so
+`DATA_MODE=live` hides their whole dataset (accounts + leads + deals + spend,
+not just leads), flip the default to `live` (demo is now an opt-in flag), and
+give the dashboard a per-client real view with an accuracy spot-check.
+
+Task 1 — audit: `tmp/audit-mapping.js` prints `.env META_AD_ACCOUNT_IDS`,
+every `meta_ad_account` row (kind / client / last pull), and `spend_daily`
+counts + date range + 7d/all-time INR per account. Confirmed the root cause
+(all real `act_` under seed client 1).
+
+Task 2 — mapping + demo-client hiding:
+- `client.demo` column added to `server/schema.sql` + `server/schema.pg.sql`
+  + the SQLite/PG migrations in `server/db.js` (idempotent `ADD COLUMN`).
+- `scripts/map-real-clients.js` (new, one-shot, idempotent, both engines):
+  creates the operator's 6 real clients, points the 7 `act_` accounts at them
+  (Abhishek pal owns 2: `act_1042839737275035` + `act_500594992542527`;
+  Cracckfyi / Swraj jain / Upcurvv / The Job work shop / Piyush ahuja own 1
+  each), and sets `client.demo=1` on "Coach Ravi — Webinar Funnel" +
+  "Kaya Coach — Workshop". Real-client rows matched by name, accounts by
+  `ad_account_id`, so re-running never duplicates.
+- `server/lib/datamode.js`: `clientNotDemo` (NOT EXISTS on the row's
+  client_id) + `spendClientNotDemo` (NOT EXISTS through the ad_account_id's
+  client, for `spend_daily` which has no client_id) layer the whole-client
+  hiding on top of the seed-convention predicates; combined live helpers
+  `leadEx`/`dealEx`/`spendEx`/`metaAccEx`/`metaEntityEx`/`webhookEx`,
+  `realClientIds` + `clientOptions` (the switcher's option list). `mode()`
+  now defaults to **live** (demo opt-in via `.env`/toggle); demo-mode
+  predicates still return `''` so demo SQL stays byte-identical.
+
+Task 3 — per-client dashboard + accuracy spot-check:
+- `server/lib/shared.js`: `metaAccountReport` + `adPerformance` +
+  `funnelReport` + `metaVsTracker` + `sourceMix` take the combined live
+  predicates; `accuracyCheck`/`recordAccuracyCheck` added for the spot-check.
+- `server/screens.js dashboard`: a top-bar **client** select (`?client=`,
+  real-only in live) scopes KPIs / 30-day trend / top campaigns+ads / ROAS /
+  funnel / recent leads to one client's real accounts; an **accuracy
+  spot-check** table renders per in-scope real account — the app's stored 7d
+  spend vs the operator's Ads-Manager figure, with drift % (green pill when
+  ≤1%); the client picker switches carry `?client=` through.
+- `server/index.js`: team-only `GET /meta/check?acc=` live-fetches the last 7
+  days from Meta for one account (`lib/meta.js → fetchMetaSpendTotal`),
+  records the drift in the new `meta_accuracy_check` table, and **does not**
+  upsert `spend_daily` (a check must not mutate the pipeline it audits);
+  failures land in `last_error`.
+- All report screens + `leads`/`pipeline`/`meta`/`integrations`/`portal`/
+  `duplicates`/`pilot`/import + the leads/health/identity predicates moved to
+  the combined helpers so a demo client's dataset hides everywhere in live.
+
+Task 4 — verify:
+- Piyush Ahuja `act_1377451727314532` "Pull now": the pull ran clean
+  (`last_error` null, `last_pull_at` advanced) — the account is connected but
+  its real spend is a tiny ₹9.72 all-time (16 rows, one day), i.e. an
+  inactive / near-zero-spend account, **not** a pull failure.
+- Live mode: owner + every client screen show zero demo names/numbers; the
+  client switcher lists real clients only. Demo mode: everything comes back.
+- 4 screenshots: `docs/screenshots/v11-mapping-{dash-switcher,dash-client3,
+  reports-mvt,leads-empty}.png`.
+- Both engines green: SQLite + Postgres, all suites (gates, isolation,
+  liveapi, metalive, reports, security, spa, xt-queue, datamode) + replay +
+  scratch-DB sweep (0 failures). `test/datamode.js` + `test/isolation.js`
+  updated for the live default + the demo-client fixtures.
+
+Docs: `docs/dashboard-real-data.md` (v11 section + live-default semantics),
+README module-docs index + Tests notes.
+
+`.env` (real token) is gitignored and never committed, per the working rule.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
 ## 2026-11-05 (v10 follow-on — dashboard custom date range: pick any window, all genuine Meta data)
 
 Arpit's dashboard ask: keep `Last 7d / Last 30d`, but let him **pick any

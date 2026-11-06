@@ -201,9 +201,14 @@ function isWithinRange(iso, from, to) {
 function funnelReport(tx, clientId, settings, clientIds, live = false) {
   // clientId null -> all clients (dashboard); a number -> one client; clientIds -> portal set.
   // live (v9 DATA_MODE): when true, seed/demo leads are excluded so the funnel
-  // reflects real gateway leads only. Default false keeps every prior caller.
+  // reflects real gateway leads only. v11: rows of client.demo=1 clients are
+  // excluded too (the combined dm.leadEx / dm.spendEx predicates), so
+  // demo-client leads/deals/spend never mix in. Default false keeps every
+  // prior caller (demo SQL is byte-identical: both return '' there).
   const dm = require('./datamode');
-  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const liveLeadEx = live ? dm.leadEx(dm.LIVE, 'l') : '';
+  // spend scoping through the ad account's client (spend_daily has no client_id)
+  const liveSpendEx = live ? dm.spendEx(dm.LIVE, 's') : '';
   const inList = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
   let filter = clientId != null ? `WHERE l.client_id = ${Number(clientId)}` : inList ? `WHERE l.client_id IN (${inList})` : '';
   if (liveLeadEx && filter) filter += ` AND ${liveLeadEx}`;
@@ -238,12 +243,13 @@ function funnelReport(tx, clientId, settings, clientIds, live = false) {
   }
 
   const st = (name) => rows.filter((r) => r.stage === name).length;
-  // scope spend to the same clients
-  const spendWhere = inList ? `WHERE s.ad_id IN (SELECT a.id FROM meta_ad a JOIN meta_adset as_ ON as_.id=a.adset_id WHERE as_.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inList})))` : '';
-  const spend = (inList
-    ? tx.get(`SELECT COALESCE(SUM(s.spend_inr),0) v FROM spend_daily s ${spendWhere}`)
-    : tx.get(`SELECT COALESCE(SUM(spend_inr),0) v FROM spend_daily`)
-  )?.v || 0;
+  // scope spend to the same clients; in live mode drop demo-client spend too
+  // (liveSpendEx = 'NOT(seed ACT- rows) AND NOT(demo-client account)' or '')
+  const spendWhereEx = liveSpendEx ? ` AND ${liveSpendEx}` : '';
+  const spendWhere = inList
+    ? `WHERE s.ad_id IN (SELECT a.id FROM meta_ad a JOIN meta_adset as_ ON as_.id=a.adset_id WHERE as_.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inList})))${spendWhereEx}`
+    : `WHERE 1=1${spendWhereEx}`;
+  const spend = tx.get(`SELECT COALESCE(SUM(s.spend_inr),0) v FROM spend_daily s ${spendWhere}`)?.v || 0;
   const leadsCount = rows.length;
   const registered = st('Registered') + st('Attended') + st('Hot') + st('Call Booked') + st('Paid') + st('Lost');
   const attended = st('Attended') + st('Hot') + st('Call Booked') + st('Paid');
@@ -282,25 +288,31 @@ function funnelReport(tx, clientId, settings, clientIds, live = false) {
 function adPerformance(tx, settings, clientIds, adAccount, live = false) {
   // adAccount (Master v9): optional ad_account_id ('act_…'). When set, every
   // ad + spend query is narrowed to that single account. '' / undefined = off.
-  // live (v9 DATA_MODE): when true, the demo ACT- ad accounts / leads / deals
-  // are excluded so ad performance reflects real data only. Default false.
+  // live (v9): exclude demo ACT- accounts / demo leads; (v11): also every row
+  // that belongs to a client.demo=1 client, via the composite predicates below.
   const dm = require('./datamode');
-  const metaEx = live ? dm.metaNotDemo(dm.LIVE, 'ad') : '';
-  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  // v11 combined live predicates (demo SQL stays byte-identical: all '' when
+  // !live). meta_ad_account carries a client_id (metaAccEx); the meta_*
+  // entity tables do not, so their demo-client exclusion rides through
+  // ad_account_id (metaEntityEx).
+  const metaAccEx = live ? dm.metaAccEx(dm.LIVE) : '';           // aliased `a`
+  const metaEntityEx = live ? dm.metaEntityEx(dm.LIVE, 'ad') : ''; // aliased `ad`
+  const liveLeadEx = live ? dm.leadEx(dm.LIVE, 'l') : '';
   const model = settings.attribution_model || 'last_paid_click';
   const win = Number(settings.attribution_window_days) || 30;
   const inClause = clientIds && clientIds.length ? clientIds.map((n) => Number(n)).join(',') : null;
-  const accIn = inClause ? `(SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${inClause}) ${metaEx ? `AND ${metaEx.replace(/^ad\./, '')}` : ''})` : null;
+  const accIn = inClause ? `(SELECT ad_account_id FROM meta_ad_account a WHERE a.client_id IN (${inClause}) ${metaAccEx ? `AND ${metaAccEx}` : ''})` : null;
   const salesWhere = inClause ? `WHERE l.client_id IN (${inClause})` : '';
   const adAccW = adAccount ? ` AND ad.ad_account_id = '${adAccount}'` : '';
-  const metaExW = metaEx ? ` AND ${metaEx}` : '';
+  const metaExW = metaEntityEx ? ` AND ${metaEntityEx}` : '';
   // scoped query filters meta_ad by its ad_account_id (only that account's
   // client); adset has no client_id column so we scope through the account
   // unscoped where: single-account scoping + live-mode demo exclusion
-  // (metaEx already carries the `ad.` alias: `NOT (ad.ad_account_id LIKE 'ACT-%')`)
+  // (metaEntityEx carries the `ad.` alias: `NOT (ad.ad_account_id LIKE 'ACT-%')`
+  // AND the demo-client NOT EXISTS)
   const unscopedWhere = [
     adAccount ? `ad.ad_account_id = '${adAccount}'` : null,
-    metaEx || null,
+    metaEntityEx || null,
   ].filter(Boolean);
   const ads = inClause
     ? tx.all(`SELECT ad.id, ad.name, ad.adset_id, ad.status, ad.creative_img,
@@ -311,18 +323,20 @@ function adPerformance(tx, settings, clientIds, adAccount, live = false) {
        COALESCE(c.name,'(removed)') campaign_name FROM meta_ad ad
        LEFT JOIN meta_campaign c ON c.id = (SELECT m2.campaign_id FROM meta_adset m2 WHERE m2.id = ad.adset_id LIMIT 1)
        ${unscopedWhere.length ? `WHERE ${unscopedWhere.join(' AND ')}` : ''}`);
+  const metaAccBare = live ? dm.metaAccEx(dm.LIVE, 'a') : '';
   const adAccounts = inClause
-    ? tx.all(`SELECT ad_account_id, name FROM meta_ad_account WHERE client_id IN (${inClause})`)
+    ? tx.all(`SELECT a.ad_account_id, a.name FROM meta_ad_account a WHERE a.client_id IN (${inClause})${metaAccBare ? ` AND ${metaAccBare}` : ''}`)
     : (adAccount
       ? tx.all(`SELECT ad_account_id, name FROM meta_ad_account WHERE ad_account_id = '${String(adAccount).replace(/'/g, '')}'`)
-      : tx.all(`SELECT ad_account_id, name FROM meta_ad_account`));
+      : tx.all(`SELECT ad_account_id, name FROM meta_ad_account a${metaAccBare ? ` WHERE ${metaAccBare}` : ''}`));
   const accById = {}; for (const a of adAccounts) accById[a.ad_account_id] = a.name;
   const adIdList = ads.map((a) => a.id).map((x) => `'${String(x).replace(/'/g, '')}'`).join(',');
   // when scoped, the unscoped all-ads fallback must NEVER run (even if the
   // client has zero ads) — otherwise another client's spend would leak in
   // conv = SUM(s.conversions) = Meta-reported conversions for that ad (PRD §5.7
   // Meta-vs-Track: compare Meta's number against our counted sales/leads).
-  const spendEx = live ? dm.spendNotDemo(dm.LIVE, 's') : '';
+  // v11: demo-client spend hides too (dm.spendEx = seed ACT- + demo-client).
+  const spendEx = live ? dm.spendEx(dm.LIVE, 's') : '';
   const spendExW = spendEx ? ` AND ${spendEx}` : '';
   const spends = inClause
     ? (adIdList
@@ -421,7 +435,7 @@ function adPerformance(tx, settings, clientIds, adAccount, live = false) {
 function wastedSpend(ap) { return ap.rows.filter((r) => r.wasted); }
 function newVsOld(tx, settings, clientIds, live = false) {
   const dm = require('./datamode');
-  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const liveLeadEx = live ? dm.leadEx(dm.LIVE, 'l') : '';
   const parts = [];
   if (clientIds && clientIds.length) parts.push(`l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})`);
   if (liveLeadEx) parts.push(liveLeadEx);
@@ -446,10 +460,11 @@ function metaVsTracker(tx, settings, clientIds, adAccount, live = false) {
   // pull) vs our counted leads, with a delta column so we see where Meta
   // over/under-reports. Person-level data never comes back from Meta.
   // adAccount (v9): scope the per-ad table to one ad account.
-  // live (v9): exclude demo ACT- accounts / demo leads from the comparison.
+  // live (v9/v11): exclude demo ACT- accounts / demo leads, plus every row of
+  // a client.demo=1 client (adPerformance + the composite lead predicate).
   const ap = adPerformance(tx, settings || {}, clientIds, adAccount, live);
   const dm = require('./datamode');
-  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const liveLeadEx = live ? dm.leadEx(dm.LIVE, 'l') : '';
   // scope through the lead (event has no client_id of its own). Build the
   // WHERE from a parts list + ' AND ' join — a trailing-AND string concat
   // stuck against NOT(...) produces "ANDNOT" (a syntax error) when the
@@ -477,7 +492,7 @@ function metaVsTracker(tx, settings, clientIds, adAccount, live = false) {
 }
 function sourceMix(tx, clientIds, live = false) {
   const dm = require('./datamode');
-  const liveLeadEx = live ? dm.leadNotDemo(dm.LIVE, 'l') : '';
+  const liveLeadEx = live ? dm.leadEx(dm.LIVE, 'l') : '';
   const parts = [];
   if (clientIds && clientIds.length) parts.push(`l.client_id IN (${clientIds.map((n) => Number(n)).join(',')})`);
   if (liveLeadEx) parts.push(liveLeadEx);
@@ -550,27 +565,36 @@ function eachDay(from, to) {
 //          option) or null when no valid range was requested.
 function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'demo', range = null } = {}) {
   const dm = require('./datamode');
-  const spendEx = dm.spendNotDemo(dataMode, 's');
-  const leadEx = dm.leadNotDemo(dataMode, 'l');
-  const dealEx = dm.dealNotDemo(dataMode, 'd');
-  const metaEx = dm.metaNotDemo(dataMode, '');
+  // v11: the combined live predicates (dm.spendEx / leadEx / dealEx /
+  // metaAccEx) layer the whole-client demo hiding (client.demo=1) on top of
+  // the seed-convention filter, so a demo client's REAL-LIKE act_ accounts +
+  // their spend also hide in live mode. Each is '' in demo mode -> byte-identical.
+  const spendEx = dm.spendEx(dataMode, 's');
+  const leadEx = dm.leadEx(dataMode, 'l');
+  const dealEx = dm.dealEx(dataMode, 'd');
   const clientScope = (col = 'client_id') => (clientIds && clientIds.length
     ? `${col} IN (${clientIds.map((n) => Number(n)).join(',')})` : '1=1');
   // Switcher list: the operator's REAL ad accounts only (act_…), with last-pull
   // status per row. In demo mode the demo ACT- accounts are NOT offered here
   // (design: switcher = real act_ only); demo spend still feeds the "All"
-  // aggregate below.
+  // aggregate below. In live mode a demo client's act_ accounts are also
+  // dropped (clientNotDemo) — the switcher shows real clients' real accounts.
+  // The accounts clause is applied to the unaliased meta_ad_account table, so
+  // the empty-alias predicates already read correctly (bare `client_id`); the
+  // NOT EXISTS subquery's own c.id/c.demo dots are left intact.
+  const accEx = dm.metaAccEx(dataMode, '');
   const accounts = tx.all(`
     SELECT id, client_id, name, ad_account_id, currency, status, last_pull_at, last_error, auto_pull
     FROM meta_ad_account
-    WHERE ad_account_id NOT LIKE 'ACT-%' AND ${clientScope('client_id')} ${metaEx ? `AND ${metaEx.replace(/\./g, '')}` : ''}
+    WHERE ad_account_id NOT LIKE 'ACT-%' AND ${clientScope('client_id')} ${accEx ? `AND ${accEx}` : ''}
     ORDER BY ad_account_id`);
   // Spend scope for the numbers: a specific account, else every in-scope account.
-  // The datamode spendEx predicate is what removes demo ACT- spend in live mode.
+  // The datamode spendEx predicate is what removes demo ACT- spend AND the
+  // demo-client act_ spend in live mode.
   const clean = (v) => String(v).replace(/'/g, '');
   const adScope = adAccount
     ? `s.ad_account_id = '${clean(adAccount)}'`
-    : `s.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE ${clientScope('client_id')})`;
+    : `s.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE ${clientScope('client_id')} ${accEx ? `AND ${accEx}` : ''})`;
   const since = (days) => new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10);
   const kpi = (from) => {
     const o = tx.get(`
@@ -727,6 +751,67 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
     currency: adAccount ? (tx.get(`SELECT currency FROM meta_ad_account WHERE ad_account_id=?`, adAccount)?.currency || null) : null,
     range: rangeBundle,
   };
+}
+
+// v11 accuracy spot-check — per in-scope REAL ad account: the 7-day spend the
+// APP has stored (what the dashboard KPI shows) vs a FRESH Meta fetch of the
+// same window, both in the account's NATIVE currency units, with the drift %.
+// Gate: drift <= 1% means the pipeline is honest. Live-mode demo-client / seed
+// accounts are excluded (metaAccEx / spendEx) so the table is real data only.
+// `meta7d`/`drift`/`checked_at` are null until a "Re-check vs Meta" has run.
+function accuracyCheck(tx, dataMode, clientIds) {
+  const dm = require('./datamode');
+  const andCl = (parts) => parts.filter(Boolean).join(' AND ');
+  const accEx = dm.metaAccEx(dataMode, 'a');
+  const spendEx = dm.spendEx(dataMode, 's');
+  const scope = clientIds && clientIds.length ? `AND a.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
+  const since7 = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+  // app-side stored 7-day total per account in NATIVE currency units
+  // (spend_daily.spend is the raw Meta figure, before the fx_rate INR multiply)
+  const appByAcc = {};
+  for (const r of tx.all(`SELECT s.ad_account_id, COALESCE(SUM(s.spend),0) v
+    FROM spend_daily s WHERE s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}
+    GROUP BY s.ad_account_id`, since7)) appByAcc[r.ad_account_id] = +(r.v).toFixed(2);
+  // last recorded fresh-Meta figure + drift (meta_accuracy_check, no client_id)
+  const chk = {};
+  for (const r of tx.all(`SELECT * FROM meta_accuracy_check`)) chk[r.ad_account_id] = r;
+  const rows = tx.all(`SELECT a.id, a.ad_account_id, a.name, a.currency, a.client_id, a.last_pull_at, a.last_error,
+      c.name client_name
+    FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id
+    WHERE a.ad_account_id NOT LIKE 'ACT-%' ${scope} ${accEx ? `AND ${accEx}` : ''}
+    ORDER BY a.client_id, a.ad_account_id`).map((a) => {
+    const app7d = appByAcc[a.ad_account_id] || 0;
+    const c = chk[a.ad_account_id];
+    const meta7d = c ? +(c.meta_spend || 0) : null;
+    const drift = (c && c.meta_spend != null && c.meta_spend !== 0)
+      ? Math.round(Math.abs((c.app_spend - c.meta_spend) / c.meta_spend) * 1000) / 10
+      : null;
+    const cur = c && c.currency ? c.currency : a.currency;
+    return {
+      ...a, app7d, meta7d, drift, currency: cur,
+      checked_at: c ? c.checked_at : null,
+      window: c ? `${c.window_from} → ${c.window_to}` : null,
+      gateOk: drift != null ? drift <= 1 : null,
+    };
+  });
+  return rows;
+}
+// Record a completed accuracy check for one account (called by the dashboard's
+// "Re-check vs Meta" route after a fresh live fetch). Both figures are in the
+// account's native currency units; drift is |app - meta| / meta * 100.
+function recordAccuracyCheck(tx, { ad_account_id, from, to, app_spend, meta_spend, currency, checked_at }) {
+  const app = +Number(app_spend).toFixed(2);
+  const meta = +Number(meta_spend).toFixed(2);
+  const drift = meta !== 0 ? Math.round(Math.abs((app - meta) / meta) * 1000) / 10 : null;
+  tx.run(`INSERT INTO meta_accuracy_check
+      (ad_account_id, window_from, window_to, app_spend, meta_spend, drift_pct, currency, checked_at)
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(ad_account_id) DO UPDATE SET
+      window_from=excluded.window_from, window_to=excluded.window_to,
+      app_spend=excluded.app_spend, meta_spend=excluded.meta_spend,
+      drift_pct=excluded.drift_pct, currency=excluded.currency, checked_at=excluded.checked_at`,
+    ad_account_id, from, to, app, meta, drift, currency || null, checked_at || new Date().toISOString());
+  return drift;
 }
 
 // Zero-dep SVG line/area chart for the spend trend. data: [{date, spend,…}].
@@ -904,7 +989,8 @@ form.inline{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
 .spark-lbl{fill:var(--mut2);font-size:10px}
 /* ad-account switcher (top bar) */
 .accsel{margin-left:4px}
-.accsel label{display:none}
+.accsel>label{display:none} /* the account select's label is visual noise */
+.accsel div>label{display:inline;font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;color:var(--mut);margin-right:2px} /* v11: the CLIENT label DOES show */
 .accsel select{max-width:230px;background:var(--panel2);border:1px solid var(--line);color:var(--tx);border-radius:var(--r-xs);padding:6px 10px;font-size:12px;font-weight:500}
 /* layout helpers */
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
@@ -980,8 +1066,19 @@ function layoutAccSelect(accSelect) {
     ...accSelect.options.map((o) =>
       `<option value="${esc(o.value)}"${o.value === accSelect.current ? ' selected' : ''}>${esc(o.label)}</option>`)].join('');
   const hidden = (accSelect.hidden || []).map((f) => `<input type="hidden" name="${esc(f.name)}" value="${esc(f.value)}">`).join('');
-  return `<form class="accsel" method="get" action="${esc(accSelect.path)}" title="Scope the dashboard to one ad account"><label>Ad account</label>
-    ${hidden}<select name="acc" onchange="this.form.submit()">${opts}</select></form>`;
+  // v11: an optional CLIENT-level select above the account select. Selecting a
+  // client scopes the dashboard to that client's accounts (their ad account,
+  // spend, leads, deals); "All clients" = empty value. Both live in one form
+  // so switching either re-renders with the other's current value carried.
+  const clientOpts = accSelect.clientOptions || [];
+  const clientSel = clientOpts.length
+    ? `<div><label>Client</label><select name="client" onchange="this.form.submit()">
+        <option value="">All clients</option>
+        ${clientOpts.map((o) => `<option value="${esc(o.value)}"${String(o.value) === String(accSelect.clientCurrent) ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}
+      </select></div>`
+    : '';
+  return `<form class="accsel" method="get" action="${esc(accSelect.path)}" title="Scope the dashboard to a client + ad account"><label>Ad account</label>
+    ${hidden}${clientSel}<select name="acc" onchange="this.form.submit()">${opts}</select></form>`;
 }
 function layout({ title, nav, active, user, body, notes = '', band, accSelect }) {
   const demoBand = band !== undefined ? band : layoutDemoBand();
@@ -1127,6 +1224,7 @@ module.exports = {
   DEFAULT_STAGES, STAGE_EVENTS, autoStage, stageOrder,
   attributeSale, adClicksInWindow, isWithinRange,
   funnelReport, adPerformance, metaAccountReport, sparklineSvg, wastedSpend, newVsOld, metaVsTracker, sourceMix, weeklySummary, weeklyPdfLines,
+  accuracyCheck, recordAccuracyCheck,
   parseDashboardRange, eachDay,
   allowedClients,
   esc, fmtINR, fmtN, fmtPct, fmtDT, layout, layoutDemoBand, layoutAccSelect, NAV, navFor, mockMetaPull,

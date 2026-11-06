@@ -31,7 +31,16 @@ ensureCapiLogTable(db);
 {
   const sys = makeTx(db, null);
   const ml = require('./lib/metalive');
-  const clientId = Number(process.env.META_CLIENT_ID) || 1;
+  // v11: a demo-marked client (client.demo=1, e.g. the seed "Coach Ravi") must
+  // NEVER be the default target for new env-created accounts — that would
+  // silently re-hide a real act_ account in DATA_MODE=live (the exact bug the
+  // real-client mapping fixes). If META_CLIENT_ID is unset, pin new rows to the
+  // first REAL client instead of a hardcoded 1.
+  let clientId = Number(process.env.META_CLIENT_ID);
+  if (!clientId) {
+    const rc = sys.get(`SELECT id FROM client WHERE (demo IS NULL OR demo=0) ORDER BY id LIMIT 1`);
+    clientId = rc ? rc.id : 1;
+  }
   if (process.env.META_ACCESS_TOKEN && !sys.get(`SELECT id FROM client WHERE id=?`, clientId)) {
     console.log(`[meta-live] target client id ${clientId} not found in this DB — skipping sync (seed first, e.g. node scripts/seed.js; the next start will sync).`);
   } else {
@@ -554,6 +563,41 @@ async function handleRequest(req, res) {
               });
             }
             res.writeHead(302, { Location: '/meta.html' }); res.end();
+          } else if (parts[1] === 'check') {
+            // v11 accuracy spot-check: live-fetch the last 7 days from Meta for
+            // one real ad account, compare against the app's stored 7d total
+            // (native currency units) and record the drift (gate <=1%). Does
+            // NOT upsert spend_daily — a check must not mutate the pipeline it
+            // audits. Team-only; async (a real Meta fetch), then 302 back to
+            // the dashboard so the table now shows the fresh drift.
+            if (!sec.isTeam(user)) { send(res, 403, 'team-only'); res.end(); return; }
+            const accId = Number(u.searchParams.get('acc')) || 0;
+            const row = accId ? db.prepare(`SELECT * FROM meta_ad_account WHERE id=?`).get(accId) : null;
+            const dest = `/dashboard.html${row ? `?acc=${encodeURIComponent(row.ad_account_id)}` : ''}`;
+            if (!row) { res.writeHead(302, { Location: dest }); res.end(); return; }
+            const metaLib = require('./lib/meta');
+            const S2 = S;
+            const tx2 = makeTx(db, user);
+            const since7 = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+            const today = new Date().toISOString().slice(0, 10);
+            metaLib.fetchMetaSpendTotal(tx2, { ad_account_id: row.ad_account_id, from: since7, to: today })
+              .then((res) => {
+                const dm = require('./lib/datamode');
+                const spendEx = dm.spendEx(dm.LIVE, 's');
+                const appSpend = Number(tx2.get(`SELECT COALESCE(SUM(s.spend),0) v FROM spend_daily s WHERE s.ad_account_id=? AND s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}`, row.ad_account_id, since7)?.v || 0);
+                S2.recordAccuracyCheck(tx2, {
+                  ad_account_id: row.ad_account_id, from: res.from, to: res.to,
+                  app_spend: appSpend, meta_spend: res.metaSpend, currency: res.currency,
+                });
+                audit(db, user, 'meta.accuracy_check', 'ad_account', String(row.id), `${row.ad_account_id} app=${appSpend} meta=${res.metaSpend}`);
+              })
+              .catch((e) => {
+                db.prepare(`UPDATE meta_ad_account SET last_error=? WHERE id=?`).run(
+                  ('accuracy: ' + String(e.message).slice(0, 240)).slice(0, 300), row.id);
+                audit(db, user, 'meta.accuracy_check_failed', 'ad_account', String(row.id), String(e.message).slice(0, 200));
+              })
+              .finally(() => { res.writeHead(302, { Location: dest }); res.end(); });
+            return;
           } else {
             send(res, 404, 'not found');
           }
@@ -863,7 +907,9 @@ function exportRoute(res, user, parts, u) {
     if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
     const stage = u.searchParams.get('stage');
     if (stage) { where += ` AND l.stage=?`; args.push(stage); }
-    const exLead = dm.leadNotDemo(live ? dm.LIVE : dm.DEMO, 'l');
+    // v11: combined predicate — hides seed leads AND any lead of a client.demo=1
+    // client, so the demo client's leads can't leak into a live export.
+    const exLead = dm.leadEx(live ? dm.LIVE : dm.DEMO, 'l');
     if (exLead) { where = where ? `${where} AND ${exLead}` : `WHERE ${exLead}`; }
     const leadRows = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.city, l.stage, l.owner, l.client_id, c.name client,
       (SELECT COALESCE(SUM(d.amount),0) FROM deal d WHERE d.lead_id=l.id AND d.status='success' AND d.refunded_at IS NULL) paid
@@ -1016,7 +1062,12 @@ function collectMapParam(json) {
 
 // ---------------------------------------------------------------- import page
 function importPage(res, user) {
-  const clients = db.prepare(`SELECT id, name FROM client`).all();
+  // v11: real clients only in live mode — imports must never land on a hidden
+  // demo client. (clientOptions = real in live, every in-scope client in demo.)
+  const dm = require('./lib/datamode');
+  const itx = makeTx(db, user);
+  const clients = dm.clientOptions(itx, dm.mode(itx), user && user.role === 'client'
+    ? (user.client_ids || '').split(',').filter(Boolean) : null).map((c) => ({ id: c.id, name: c.name }));
   const opts = clients.map((c) => `<option value="${c.id}">${S.esc(c.name)}</option>`).join('');
   const body = `
   <div class="card" style="max-width:640px">

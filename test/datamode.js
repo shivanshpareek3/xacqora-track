@@ -48,34 +48,45 @@ tx.run(lead, 300, 1, '+91 900000300', 'Real Pilot Lead', 'New');                
 const deal = `INSERT INTO deal (id, lead_id, client_id, amount, status, paid_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`;
 for (const id of [1, 10]) tx.run(deal, id, 101, 1, 4999, 'success', '2026-11-01 10:00:00');    // seed demo
 tx.run(deal, 50, 300, 1, 4999, 'success', '2026-11-02 10:00:00');                               // real
-// meta entities: demo ACT- account + ad; real act_ account + ad
-// last_pull_at: a fixed UTC string (datetime('now') is SQLite-only; keep it
-// engine-agnostic — the value only matters that it is parseable as "recent").
+// v11: a second, DEMO client (id 2) whose account/leads/deals must all hide
+// in live mode via client.demo=1, plus a real client (id 1 stays real).
+tx.run(`INSERT INTO client (id, workspace_id, name) VALUES (2, 1, 'Demo Client') ON CONFLICT(id) DO NOTHING`);
+tx.run(`UPDATE client SET demo=1 WHERE id=2`);
+// v11: demo-client rows that must hide in live via client.demo=1, even though
+// their ids/look real (a lowercase act_ account, an auto-id lead) — the
+// seed-convention predicates above CANNOT catch them.
 const PULL_AT = '2026-11-04T06:00:00.000Z';
 tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, currency, last_pull_at)
   VALUES (1, 1, 'Seed Coach', 'ACT-100001', 'INR', ?) ON CONFLICT(id) DO NOTHING`, PULL_AT);
 tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, currency, last_pull_at)
   VALUES (2, 1, 'Foremost', 'act_7001', 'INR', ?) ON CONFLICT(id) DO NOTHING`, PULL_AT);
+tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, currency, last_pull_at)
+  VALUES (3, 2, 'Demo Client Act', 'act_9001', 'INR', ?) ON CONFLICT(id) DO NOTHING`, PULL_AT);
 tx.run(`INSERT INTO meta_ad (id, ad_account_id, name, status) VALUES
   ('ACT-100001-1','ACT-100001','Seed Ad','ACTIVE'),
-  ('act_7001-1','act_7001','Real Ad','ACTIVE')
+  ('act_7001-1','act_7001','Real Ad','ACTIVE'),
+  ('act_9001-1','act_9001','Demo Client Ad','ACTIVE')
   ON CONFLICT(id) DO NOTHING`);
 const sd = `INSERT INTO spend_daily (ad_id, date, ad_account_id, spend_inr, impressions, clicks)
   VALUES (?,?,?,?,?,?) ON CONFLICT(ad_id, date, ad_account_id) DO NOTHING`;
 tx.run(sd, 'ACT-100001-1', '2026-11-01', 'ACT-100001', 5000, 100, 10); // demo spend
 tx.run(sd, 'act_7001-1', '2026-11-01', 'act_7001', 9000, 200, 20);     // real spend
+tx.run(sd, 'act_9001-1', '2026-11-01', 'act_9001', 3000, 50, 5);       // demo-client spend (hides via client.demo)
+tx.run(lead, 301, 2, '+91 900000301', 'Demo Client Real-Id Lead', 'Paid'); // auto-id lead under demo client
 tx.run(`INSERT INTO webhook_log (client_id, platform, ref, raw, test) VALUES
   (1, 'meta_leadgen', 'pay_seedfail', '{"seed":true}', 1),
   (1, 'razorpay', 'pay_REAL', '{"ok":true}', 0) ON CONFLICT DO NOTHING`);
 
 // ---------------------------------------------------------------- 1. resolution order
-assert.strictEqual(dm.mode(tx), dm.DEMO, 'no settings + no env -> demo');
+// v11: unset settings + unset env -> LIVE (demo is opt-in only, never the
+// default). env=demo is the only way to get demo without a settings row.
+assert.strictEqual(dm.mode(tx), dm.LIVE, 'no settings + no env -> live (v11 default)');
 delete process.env.DATA_MODE;
 process.env.DATA_MODE = 'live';
 assert.strictEqual(dm.mode(tx), dm.LIVE, 'env DATA_MODE=live -> live');
 delete process.env.DATA_MODE;
 process.env.DATA_MODE = 'demo';
-assert.strictEqual(dm.mode(tx), dm.DEMO, 'env DATA_MODE=demo -> demo');
+assert.strictEqual(dm.mode(tx), dm.DEMO, 'env DATA_MODE=demo -> demo (opt-in)');
 delete process.env.DATA_MODE;
 
 // ---------------------------------------------------------------- 2. admin toggle
@@ -83,8 +94,14 @@ assert.strictEqual(dm.setDataMode(tx, 'live'), 'live');
 assert.strictEqual(tx.get(`SELECT value FROM settings WHERE key='data_mode'`).value, 'live'); // row upserted
 assert.strictEqual(dm.mode(tx), dm.LIVE, 'settings.data_mode beats env/absent');
 assert.strictEqual(dm.setDataMode(tx, 'default'), 'default');
-assert.strictEqual(dm.mode(tx), dm.DEMO, 'default deletes the row -> env/default demo');
+// v11: "default" deletes the settings row so the env value (here: none set)
+// wins; with no env the app is live-only by default.
+assert.strictEqual(dm.mode(tx), dm.LIVE, 'default deletes the row -> env/default live');
 assert.strictEqual(dm.setDataMode(tx, 'bogus'), 'invalid');
+// an explicit settings=demo still forces demo even though live is the default
+assert.strictEqual(dm.setDataMode(tx, 'demo'), 'demo');
+assert.strictEqual(dm.mode(tx), dm.DEMO, 'settings.data_mode=demo forces demo');
+dm.setDataMode(tx, 'default'); // back to the v11 live default for the KPI checks below
 
 // ---------------------------------------------------------------- 3. demo mode = all predicates empty
 assert.strictEqual(dm.leadNotDemo(dm.DEMO), '');
@@ -95,18 +112,44 @@ assert.strictEqual(dm.webhookNotDemo(dm.DEMO, ''), '');
 assert.strictEqual(dm.liveLeadEx(false), '', 'live wrapper: demo -> no clause');
 
 // ---------------------------------------------------------------- 4. live predicates hide only seed rows
+// seed predicates alone see the demo-client rows as REAL (auto-id leads,
+// lowercase act_ accounts) — that is the gap client.demo=1 is meant to
+// close, so each seed-only count below includes the demo-client rows.
 assert.strictEqual(
   tx.get(`SELECT COUNT(*) c FROM lead l WHERE ${dm.leadNotDemo(dm.LIVE, 'l')}`).c,
-  1, 'live hides seed leads 101/126, keeps real lead 300');
+  2, 'seed lead predicate keeps 300 (real) + 301 (demo-client, auto-id)');
 assert.strictEqual(
   tx.get(`SELECT COUNT(*) c FROM deal d WHERE ${dm.dealNotDemo(dm.LIVE, 'd')}`).c,
   1, 'live hides seed deals 1/10, keeps real deal 50');
+// seed predicates alone see the demo-client rows as REAL (lowercase act_ ids,
+// auto-id leads) — that is the gap client.demo=1 is meant to close.
 assert.strictEqual(
   tx.get(`SELECT COUNT(*) c FROM spend_daily s WHERE ${dm.spendNotDemo(dm.LIVE, 's')}`).c,
-  1, 'live hides ACT- spend, keeps act_ spend');
+  2, 'seed spend predicate keeps BOTH act_ rows incl. demo client act_9001');
 assert.strictEqual(
   tx.get(`SELECT COUNT(*) c FROM meta_ad a WHERE ${dm.metaNotDemo(dm.LIVE, 'a')}`).c,
-  1, 'live hides ACT- meta entities, keeps act_');
+  2, 'seed meta predicate keeps both act_ ads incl. demo client ad');
+// v11 client-level hiding: the demo client's rows vanish on top of the seed
+// predicates, via the client.demo=1 flag (never via id ranges or act_ look).
+assert.strictEqual(
+  tx.get(`SELECT COUNT(*) c FROM meta_ad_account ma WHERE ${dm.metaNotDemo(dm.LIVE, 'ma')} AND ${dm.clientNotDemo(dm.LIVE, 'ma')}`)
+    .c,
+  1, 'live switcher accounts: only client-1 act_ account (demo client act_9001 + ACT- gone)');
+assert.strictEqual(
+  tx.get(`SELECT COUNT(*) c FROM spend_daily s WHERE ${dm.spendNotDemo(dm.LIVE, 's')} AND ${dm.spendClientNotDemo(dm.LIVE, 's')}`).c,
+  1, 'live spend: demo-client act_9001 spend hidden by client.demo, act_7001 kept');
+assert.strictEqual(
+  tx.get(`SELECT COUNT(*) c FROM lead l WHERE ${dm.leadNotDemo(dm.LIVE, 'l')} AND ${dm.clientNotDemo(dm.LIVE, 'l')}`).c,
+  1, 'live leads: demo-client lead 301 hidden by client.demo, real lead 300 kept');
+assert.deepStrictEqual(
+  dm.realClientIds(tx, dm.LIVE, null),
+  [1], 'live realClientIds: demo client 2 filtered out');
+assert.deepStrictEqual(
+  dm.realClientIds(tx, dm.DEMO, null),
+  [1, 2], 'demo realClientIds: every in-scope client incl. demo');
+assert.deepStrictEqual(
+  dm.realClientIds(tx, dm.LIVE, [1, 2]),
+  [1], 'live realClientIds honours the caller baseScope');
 assert.strictEqual(
   tx.get(`SELECT COUNT(*) c FROM webhook_log w WHERE ${dm.webhookNotDemo(dm.LIVE, 'w')}`).c,
   1, 'live hides seed webhook rows (ref/raw/test), keeps real');

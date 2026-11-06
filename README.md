@@ -63,9 +63,10 @@ Sign in, Meta spend, Weekly summary.
 - **Real-data dashboard + DATA_MODE (v9)** — dashboard/reports centre on the real
   ad accounts (`act_…`, 7d/30d KPIs in INR + billing currency, top campaigns/ads,
   30-day trend, pull status + "Pull now"; ROAS shows "N/A — pilot live" until
-  revenue is real). `DATA_MODE` (`demo` default locally, `live` in prod) hides the
-  seed fixtures in live mode, with the yellow demo band on / off and clean empty
-  states; admin toggle is audit-logged. See `docs/dashboard-real-data.md`.
+  revenue is real). `DATA_MODE` (v11: `live` is the default everywhere, `demo`
+  is opt-in) hides the seed fixtures + any `client.demo=1` demo client in live
+  mode, with the yellow demo band on / off and clean empty states; admin toggle
+  is audit-logged. See `docs/dashboard-real-data.md`.
 - **CAPI push** — hashed phone/email, fbc/fbp, deterministic `event_id` for dedup;
   never sends twice, suppresses Purchase on refund, records Event Match Quality.
 - **Attribution** — last paid click (default, 30d), first click, linear, lead source;
@@ -87,7 +88,7 @@ Sign in, Meta spend, Weekly summary.
 - `docs/deploy.md` — Phase H: Vercel + managed Postgres (Mumbai), env vars, staging, monitoring, prod verify
 - `docs/frontend-tour.md` — Phase F: the /app SPA, dashboard→portal walk-through, screenshots + the demo-data label
 - `docs/meta-live-connect.md` — Meta live connect (pull only, CAPI dry-run): the 3-point "what to grab from Meta" list, `.env`→DB token bridge, live-pull test + ≤1% spend gate, `/alerts` token-expiry + friendly failure lines
-- `docs/dashboard-real-data.md` — v9+v10: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics, empty-state copy, the dev-DB hygiene model (v10: the sweep runs on a scratch DB + the `__sweep_test` marker guard, so test runs never dirty the dev DB), and the dashboard **custom date range** (`?from=&to=`, live-fetched from Meta via `/dashboard/refresh`, 92-day cap)
+- `docs/dashboard-real-data.md` — v9+v10+v11: where every dashboard number comes from, DATA_MODE resolution + live/demo semantics (v11: **live is the default**, demo is opt-in; a `client.demo=1` seed client hides its whole dataset in live), empty-state copy, the dev-DB hygiene model (v10: the sweep runs on a scratch DB + the `__sweep_test` marker guard, so test runs never dirty the dev DB), the dashboard **custom date range** (`?from=&to=`, live-fetched from Meta via `/dashboard/refresh`, 92-day cap), and the **v11 real-client mapping + accuracy spot-check** (`?client=` scoping + the app-vs-Ads-Manager drift table, `GET /meta/check`)
 
 ## Tests
 

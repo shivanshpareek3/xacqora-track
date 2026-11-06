@@ -58,9 +58,9 @@ tx.run(`INSERT INTO workspace (id, name) VALUES (1,'Foremost Leads') ON CONFLICT
 tx.run(`INSERT INTO client (id, workspace_id, name) VALUES (1,1,'Client One') ON CONFLICT(id) DO NOTHING`);
 tx.run(`INSERT INTO client (id, workspace_id, name) VALUES (2,1,'Client Two') ON CONFLICT(id) DO NOTHING`);
 tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, token, pixel_id, status)
-  VALUES (1,1,'One Ads','ACT-900001','MOCK','PIX-901','connected') ON CONFLICT(id) DO NOTHING`);
+  VALUES (1,1,'One Ads','act_900001','MOCK','PIX-901','connected') ON CONFLICT(id) DO NOTHING`);
 tx.run(`INSERT INTO meta_ad_account (id, client_id, name, ad_account_id, token, pixel_id, status)
-  VALUES (2,2,'Two Ads','ACT-900002','MOCK','PIX-902','connected') ON CONFLICT(id) DO NOTHING`);
+  VALUES (2,2,'Two Ads','act_900002','MOCK','PIX-902','connected') ON CONFLICT(id) DO NOTHING`);
 
 function putLead(id, client, phone, email, name) {
   const e = tx.get(`SELECT id FROM lead WHERE id=?`, id);
@@ -81,19 +81,19 @@ putDeal('ISO-2', 902, 2, 2002);
 function putAd(id, acc, adset, name) {
   tx.run(`INSERT INTO meta_ad (id, ad_account_id, adset_id, name, status) VALUES (?,?,?,?, 'ACTIVE') ON CONFLICT(id) DO NOTHING`, id, acc, adset, name);
 }
-putAd('ACT-900001-777', 'ACT-900001', 'A1', 'C1 Ad');
-putAd('ACT-900002-888', 'ACT-900002', 'A2', 'C2 Ad');
+putAd('act_900001-777', 'act_900001', 'A1', 'C1 Ad');
+putAd('act_900002-888', 'act_900002', 'A2', 'C2 Ad');
 if (!tx.get(`SELECT id FROM touchpoint WHERE lead_id=901`))
-  tx.run(`INSERT INTO touchpoint (lead_id, ad_id, adset_id, utm_medium, ts) VALUES (901,'ACT-900001-777','A1','paid',?)`, threeDaysAgo);
+  tx.run(`INSERT INTO touchpoint (lead_id, ad_id, adset_id, utm_medium, ts) VALUES (901,'act_900001-777','A1','paid',?)`, threeDaysAgo);
 if (!tx.get(`SELECT id FROM touchpoint WHERE lead_id=902`))
-  tx.run(`INSERT INTO touchpoint (lead_id, ad_id, adset_id, utm_medium, ts) VALUES (902,'ACT-900002-888','A2','paid',?)`, threeDaysAgo);
+  tx.run(`INSERT INTO touchpoint (lead_id, ad_id, adset_id, utm_medium, ts) VALUES (902,'act_900002-888','A2','paid',?)`, threeDaysAgo);
 
 // Postgres: fixtures used explicit ids (leads 901/902) — keep every SERIAL
 // sequence past its max so later auto-id inserts continue, not collide.
 alignSequences(db);
 
 const C1_PHONE = '9000000001';
-const C1_ACC = 'ACT-900001';
+const C1_ACC = 'act_900001';
 const client2User = { id: 99, role: 'client', client_ids: '2', email: 'c2@x.local', name: 'Client Two' };
 const teamUser = { id: 98, role: 'owner', client_ids: '', email: 'o@x.local', name: 'Owner' };
 
@@ -122,14 +122,14 @@ for (const [name, page] of Object.entries(html)) {
 }
 check('canary: client-2 cannot open client-1 lead 901', html.leadOther.includes('Not found'));
 check('canary: ?client=1 filter does NOT widen pipeline', !html.pipelineWiden.includes(C1_PHONE));
-check('canary: ?client=1 filter does NOT widen reports', !html.reportsWiden.includes(C1_ACC) && !html.reportsWiden.includes('ACT-900002') || !html.reportsWiden.includes(C1_ACC));
+check('canary: ?client=1 filter does NOT widen reports', !html.reportsWiden.includes(C1_ACC) && !html.reportsWiden.includes('act_900002') || !html.reportsWiden.includes(C1_ACC));
 
 // team user: sanity that scoping is not over-strict
 const teamDash = screens.dashboard(db, teamUser, {});
 const teamRep1 = screens.reports(db, teamUser, { client: '1' });
 check('team: unrestricted dashboard renders', teamDash.includes('Dashboard'));
 check('team: ?client=1 report shows client-1 ad account', teamRep1.includes(C1_ACC));
-check('team: ?client=1 report hides client-2 ad account', !teamRep1.includes('ACT-900002'));
+check('team: ?client=1 report hides client-2 ad account', !teamRep1.includes('act_900002'));
 
 // report functions direct, scoped to client 2
 const fp2 = S.funnelReport(tx, null, { attribution_model: 'last_paid_click' }, [2]);
@@ -138,7 +138,7 @@ check('funnelReport([2]) leads == 1', fp2.leads === 1, 'leads=' + fp2.leads);
 const fp1 = S.funnelReport(tx, null, { attribution_model: 'last_paid_click' }, [1]);
 check('funnelReport([1]) revenue == 1001 only', fp1.revenue === 1001, 'revenue=' + fp1.revenue);
 const ap2 = S.adPerformance(tx, {}, [2]);
-check('adPerformance([2]) lists only client-2 ad', ap2.rows.length === 1 && ap2.rows[0].ad_id === 'ACT-900002-888',
+check('adPerformance([2]) lists only client-2 ad', ap2.rows.length === 1 && ap2.rows[0].ad_id === 'act_900002-888',
   JSON.stringify(ap2.rows.map((r) => r.ad_id)));
 check('adPerformance([2]) revenue == 2002', ap2.total.revenue === 2002, 'total=' + JSON.stringify(ap2.total));
 const mix2 = S.sourceMix(tx, [2]);
@@ -221,8 +221,8 @@ check('query-dump: no top-level global aggregation over spend_daily/deal when sc
   globalAgg.length === 0, globalAgg.map((q) => q.sql.slice(0, 40)).join(' | '));
 
 // 2) FK child lookups must only touch client-2's own keys
-//    (client-2 canary lead=902 / ad=ACT-900002-888; client-1=901 / ACT-900001-777)
-const c1Keys = new Set([901, 'ACT-900001-777']);
+//    (client-2 canary lead=902 / ad=act_900002-888; client-1=901 / act_900001-777)
+const c1Keys = new Set([901, 'act_900001-777']);
 let leak = 0;
 for (const q of cap.seen) {
   const fk = fkChildLookup(q);
