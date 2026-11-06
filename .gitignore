@@ -22,5 +22,8 @@ node_modules/
 tmp/
 git/
 backups/
+# pilot cutover handover (v13): real secrets/credentials/CSVs land here, never committed
+pilot-intake/*
+!pilot-intake/README.md
 xacqora-isolation.sqlite3*
 .pgdata/
