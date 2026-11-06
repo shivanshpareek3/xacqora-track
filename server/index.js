@@ -578,13 +578,17 @@ async function handleRequest(req, res) {
             const metaLib = require('./lib/meta');
             const S2 = S;
             const tx2 = makeTx(db, user);
-            const since7 = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
-            const today = new Date().toISOString().slice(0, 10);
-            metaLib.fetchMetaSpendTotal(tx2, { ad_account_id: row.ad_account_id, from: since7, to: today })
+            // Spend-accuracy fix (v13): check over the COMPLETE 7 days
+            // (N-7..N-1, today excluded) — the same basis as the dashboard KPI
+            // and Ads Manager's "last 7 days". (Previously N-6..today, where
+            // Meta's T+1-mutable today figure made the drift look like a bug.)
+            const dayOff = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+            const since7 = dayOff(7), to7 = dayOff(1);
+            metaLib.fetchMetaSpendTotal(tx2, { ad_account_id: row.ad_account_id, from: since7, to: to7 })
               .then((res) => {
                 const dm = require('./lib/datamode');
                 const spendEx = dm.spendEx(dm.LIVE, 's');
-                const appSpend = Number(tx2.get(`SELECT COALESCE(SUM(s.spend),0) v FROM spend_daily s WHERE s.ad_account_id=? AND s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}`, row.ad_account_id, since7)?.v || 0);
+                const appSpend = Number(tx2.get(`SELECT COALESCE(SUM(s.spend),0) v FROM spend_daily s WHERE s.ad_account_id=? AND s.date >= ? AND s.date <= ? ${spendEx ? `AND ${spendEx}` : ''}`, row.ad_account_id, since7, to7)?.v || 0);
                 S2.recordAccuracyCheck(tx2, {
                   ad_account_id: row.ad_account_id, from: res.from, to: res.to,
                   app_spend: appSpend, meta_spend: res.metaSpend, currency: res.currency,

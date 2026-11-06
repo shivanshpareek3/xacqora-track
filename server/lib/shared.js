@@ -595,14 +595,22 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
   const adScope = adAccount
     ? `s.ad_account_id = '${clean(adAccount)}'`
     : `s.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE ${clientScope('client_id')} ${accEx ? `AND ${accEx}` : ''})`;
+  // Spend-accuracy fix (v13): KPI/aggregate windows use COMPLETE days
+  // (N-7..N-1, N-30..N-1) — the same basis as Ads Manager's "last 7/30 days"
+  // (today excluded; Meta's today figure is T+1-mutable and would make the KPI
+  // look "off by a day's spend" vs Ads Manager). The 30-day trend keeps today
+  // (the page labels it "through today, not final").
+  const dayOff = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
   const since = (days) => new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10);
-  const kpi = (from) => {
+  const complete = (days) => [dayOff(days), dayOff(1)]; // from, to (today OUT)
+  const windows = { d7: { from: dayOff(7), to: dayOff(1) }, d30: { from: dayOff(30), to: dayOff(1) } };
+  const kpi = (w) => {
     const o = tx.get(`
       SELECT COALESCE(SUM(s.spend),0) spend, COALESCE(SUM(s.spend_inr),0) spend_inr,
         COALESCE(SUM(s.impressions),0) impressions, COALESCE(SUM(s.reach),0) reach,
         COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.conversions),0) conversions
       FROM spend_daily s WHERE ${adScope}
-      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?`, from) || {};
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ? AND s.date <= ?`, w.from, w.to) || {};
     return {
       spend: o.spend || 0, spend_inr: o.spend_inr || 0,
       impressions: o.impressions || 0, reach: o.reach || 0,
@@ -611,7 +619,7 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
       cpc: o.clicks ? +(((o.spend_inr || 0) / o.clicks).toFixed(2)) : null,
     };
   };
-  const kpis = { d7: kpi(since(7)), d30: kpi(since(30)) };
+  const kpis = { d7: kpi(windows.d7), d30: kpi(windows.d30) };
   // 30-day daily trend (spend INR + clicks + impressions), zero-filled.
   const tRows = tx.all(`SELECT s.date, COALESCE(SUM(s.spend_inr),0) spend,
     COALESCE(SUM(s.clicks),0) clicks, COALESCE(SUM(s.impressions),0) impressions
@@ -647,8 +655,8 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
     LEFT JOIN meta_adset as_ ON as_.id=m.adset_id
     LEFT JOIN meta_campaign c ON c.id=as_.campaign_id
     WHERE ${adScope}
-      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?
-    GROUP BY c.id, c.name, c.status ORDER BY spend DESC LIMIT 5`, since(7));
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ? AND s.date <= ?
+    GROUP BY c.id, c.name, c.status ORDER BY spend DESC LIMIT 5`, windows.d7.from, windows.d7.to);
   const topAds = tx.all(`
     SELECT s.ad_id ad_id, COALESCE(m.name,'(unknown)') name, COALESCE(m.status,'') status, m.creative_img,
       COALESCE(SUM(s.spend_inr),0) spend, COALESCE(SUM(s.impressions),0) impressions,
@@ -656,14 +664,15 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
     FROM spend_daily s
     LEFT JOIN meta_ad m ON m.id=s.ad_id
     WHERE ${adScope}
-      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ?
-    GROUP BY s.ad_id, m.name, m.status, m.creative_img ORDER BY spend DESC LIMIT 5`, since(7));
-  // Per-account 7d spend (drives the "largest account is the default" rule).
+      ${spendEx ? "AND " + spendEx : ""} AND s.date >= ? AND s.date <= ?
+    GROUP BY s.ad_id, m.name, m.status, m.creative_img ORDER BY spend DESC LIMIT 5`, ...complete(7));
+  // Per-account 7d spend (drives the "largest account is the default" rule) —
+  // complete-days basis so the default selection matches the KPI/Ads-Manager basis.
   const accountSpends = tx.all(`
     SELECT s.ad_account_id, COALESCE(SUM(s.spend_inr),0) spend
     FROM spend_daily s
-    WHERE s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}
-    GROUP BY s.ad_account_id`, since(7));
+    WHERE s.date >= ? AND s.date <= ? ${spendEx ? `AND ${spendEx}` : ''}
+    GROUP BY s.ad_account_id`, ...complete(7));
   const spendByAcc = {}; for (const r of accountSpends) spendByAcc[r.ad_account_id] = r.spend;
   // "default = largest account" over the IN-SCOPE switcher accounts only
   let defaultAccount = '';
@@ -753,25 +762,32 @@ function metaAccountReport(tx, { adAccount = '', clientIds = null, dataMode = 'd
   };
 }
 
-// v11 accuracy spot-check — per in-scope REAL ad account: the 7-day spend the
-// APP has stored (what the dashboard KPI shows) vs a FRESH Meta fetch of the
-// same window, both in the account's NATIVE currency units, with the drift %.
-// Gate: drift <= 1% means the pipeline is honest. Live-mode demo-client / seed
-// accounts are excluded (metaAccEx / spendEx) so the table is real data only.
-// `meta7d`/`drift`/`checked_at` are null until a "Re-check vs Meta" has run.
+// v11 accuracy spot-check — per in-scope REAL ad account: the 7-COMPLETE-day
+// spend the APP has stored (what the dashboard KPI shows) vs a FRESH Meta fetch
+// of the SAME window, both in the account's NATIVE currency units, drift %.
+// Spend-accuracy fix (v13): the window is now N-7..N-1 (today excluded) —
+// identical basis to Ads Manager's "last 7 days" — so the "app vs Meta"
+// comparison is apples-to-apples and the ≤1% gate is honest. Previously it was
+// N-6..N-0 (today in), and Meta's T+1-mutable today figure made the app look
+// "off by a day's spend". Gate: drift <= 1% means the pipeline is honest.
+// Live-mode demo-client / seed accounts are excluded (metaAccEx / spendEx) so
+// the table is real data only. `meta7d`/`drift`/`checked_at` are null until a
+// "Re-check vs Meta" has run.
 function accuracyCheck(tx, dataMode, clientIds) {
   const dm = require('./datamode');
   const andCl = (parts) => parts.filter(Boolean).join(' AND ');
   const accEx = dm.metaAccEx(dataMode, 'a');
   const spendEx = dm.spendEx(dataMode, 's');
   const scope = clientIds && clientIds.length ? `AND a.client_id IN (${clientIds.map((n) => Number(n)).join(',')})` : '';
-  const since7 = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
-  // app-side stored 7-day total per account in NATIVE currency units
+  const dayOff = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const since7 = dayOff(7), to7 = dayOff(1); // complete 7 days, today OUT
+  const WINDOW_LABEL = `${since7} → ${to7} (7 complete days, today excluded)`;
+  // app-side stored 7-complete-day total per account in NATIVE currency units
   // (spend_daily.spend is the raw Meta figure, before the fx_rate INR multiply)
   const appByAcc = {};
   for (const r of tx.all(`SELECT s.ad_account_id, COALESCE(SUM(s.spend),0) v
-    FROM spend_daily s WHERE s.date >= ? ${spendEx ? `AND ${spendEx}` : ''}
-    GROUP BY s.ad_account_id`, since7)) appByAcc[r.ad_account_id] = +(r.v).toFixed(2);
+    FROM spend_daily s WHERE s.date >= ? AND s.date <= ? ${spendEx ? `AND ${spendEx}` : ''}
+    GROUP BY s.ad_account_id`, since7, to7)) appByAcc[r.ad_account_id] = +(r.v).toFixed(2);
   // last recorded fresh-Meta figure + drift (meta_accuracy_check, no client_id)
   const chk = {};
   for (const r of tx.all(`SELECT * FROM meta_accuracy_check`)) chk[r.ad_account_id] = r;
@@ -790,7 +806,9 @@ function accuracyCheck(tx, dataMode, clientIds) {
     return {
       ...a, app7d, meta7d, drift, currency: cur,
       checked_at: c ? c.checked_at : null,
-      window: c ? `${c.window_from} → ${c.window_to}` : null,
+      // un-checked rows show the CURRENT window basis (N-7..N-1) so the app
+      // number is self-explaining; checked rows show the window they used.
+      window: c ? `${c.window_from} → ${c.window_to}` : WINDOW_LABEL,
       gateOk: drift != null ? drift <= 1 : null,
     };
   });

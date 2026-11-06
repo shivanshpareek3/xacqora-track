@@ -75,11 +75,26 @@ function dashboard(db, user, p) {
   const kpis = rep.kpis;
   const win = p.win === '30' ? 'd30' : 'd7';
   const k = range ? range.kpi : kpis[win];
-  const winLabel = range ? 'custom range' : (win === 'd7' ? '7d' : '30d');
-  const money2 = (n) => (n == null ? '—' : '₹' + Math.round(n).toLocaleString('en-IN'));
+  const winLabel = range ? 'custom range' : (win === 'd7' ? 'last 7d' : 'last 30d');
+  // Spend-accuracy fix (v13): label KPI currency HONESTLY — the "inr" column is
+  // spend × fx_rate (AED accounts have no rate yet, so it is the raw AED
+  // number). ₹ is only right for INR accounts.
+  const kCur = rep.currency ? rep.currency.toUpperCase() : 'INR';
+  const money2 = (n) => (n == null ? '—' : (kCur === 'INR' ? '₹' : kCur + ' ') + Math.round(n).toLocaleString('en-IN'));
+  // truth label for the preset windows: KPIs now cover COMPLETE days
+  // (N-7..N-1 / N-30..N-1, today excluded — Ads Manager basis). The 30-day
+  // trend still includes today and says so.
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const d1 = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const pullAt = Array.isArray(rep.pull) ? rep.pull.map((x) => x.last_pull_at).filter(Boolean).sort().pop() : (rep.pull && rep.pull.last_pull_at);
+  const pullAgeH = pullAt ? Math.max(0, Math.round((Date.now() - new Date(pullAt).getTime()) / 3600000)) : null;
+  const dataThroughNote = range ? ''
+    : `<div class="small muted" style="margin-top:6px">
+      <b>Data through ${d1}</b> · ${win === 'd7' ? 'last 7 complete days' : 'last 30 complete days'} (today ${todayStr} excluded — Meta finalises today's spend at T+1, so it is not in this KPI)
+      ${pullAgeH != null ? ` · last Meta pull ${pullAgeH} h ago${pullAgeH > 24 ? ' · <a href="/meta/pull" class="small">Pull now</a>' : ''}` : ' · never pulled'}</div>`;
   const roasOk = rep.revenue > 0 && k.spend_inr > 0;
   const kpiCards = [
-    { l: `${winLabel} spend (INR)`, v: money2(k.spend_inr), sub: [range ? range.rangeLabel : '', rep.currency ? `+ ${k.spend.toLocaleString('en-IN')} ${rep.currency}` : ''].filter(Boolean).join(' · ') },
+    { l: `${winLabel} spend (${kCur})`, v: money2(k.spend_inr), sub: [range ? range.rangeLabel : (rep.currency && rep.currency.toUpperCase() !== kCur ? `billing ${rep.currency}` : '')].filter(Boolean).join(' · ') },
     { l: 'Impressions', v: S.fmtN(k.impressions) },
     { l: 'Reach', v: S.fmtN(k.reach) },
     { l: 'Clicks · CTR', v: `${S.fmtN(k.clicks)} · ${k.ctr != null ? k.ctr + '%' : '—'}` },
@@ -249,16 +264,16 @@ function dashboard(db, user, p) {
       <td>${cur(r.app7d, r.currency)}</td>
       <td>${r.meta7d == null ? `<span class="muted small">${r.checked_at ? 'check failed — see Meta hub' : 'not checked'}</span>` : cur(r.meta7d, r.currency)}</td>
       <td>${driftCell}</td>
-      <td class="small muted">${r.checked_at ? `${S.esc(r.window)} · ${S.fmtDT(r.checked_at)}` : ''}</td>
+      <td class="small muted">${S.esc(r.window || '')}${r.checked_at ? ` · ${S.fmtDT(r.checked_at)}` : ''}</td>
       ${canPull ? `<td>${r.id ? `<a class="btn sm sec" href="/meta/check?acc=${r.id}" title="Live-fetch last 7d from Meta + record the drift">Re-check</a>` : ''}</td>` : ''}
     </tr>`;
   }).join('') : `<tr><td colspan="${canPull ? 7 : 6}" class="muted">No real ad accounts yet — fill META_AD_ACCOUNT_IDS in .env and restart</td></tr>`;
   const accuracyCard = `
   <div class="card"><h2>Accuracy spot-check <span class="badge">app 7d spend vs Meta Ads Manager · gate ≤ 1% drift</span></h2>
     <div class="tabwrap"><table>
-      <thead><tr><th>Client</th><th>ACT_ account</th><th>7d spend (app)</th><th>7d spend (Ads Manager)</th><th>drift %</th><th>checked</th>${canPull ? '<th></th>' : ''}</tr></thead>
+      <thead><tr><th>Client</th><th>ACT_ account</th><th>7 complete days (app)</th><th>7 complete days (Meta live)</th><th>drift %</th><th>window · checked</th>${canPull ? '<th></th>' : ''}</tr></thead>
       <tbody>${accBody}</tbody></table></div>
-    <div class="small muted">Figures are in each account's billing currency (INR / AED …) — the same units Meta's Ads Manager shows. "Re-check" live-fetches the last 7 days from Meta for that account and records the drift (it does NOT re-pull the app's spend). A green pill means the app's number matches Ads Manager within 1%.</div>
+    <div class="small muted">Both columns now use the SAME window — the last 7 <b>complete</b> days (today excluded), the basis Ads Manager's "last 7 days" uses; Meta's today figure is T+1-mutable so it is intentionally left out. Figures are in each account's billing currency (INR / AED …) — the same units Meta's Ads Manager shows. "Re-check" live-fetches that exact window from Meta and records the drift (it does NOT re-pull the app's spend). A green pill means the app's number matches Meta within 1%.</div>
   </div>`;
   const body = `
   <div class="row pagehead" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
@@ -272,12 +287,13 @@ function dashboard(db, user, p) {
   </div>
   ${noDataCta}
   <div class="grid g6" style="margin-top:10px">${kpiCards}</div>
+  ${dataThroughNote}
   ${repullNote}
 
   ${accuracyCard}
 
   <div class="grid g2" style="margin-top:14px">
-    <div class="card"><h2>Spend trend <span class="badge">${range ? S.esc(range.rangeLabel) : (win === 'd7' ? 'last 7 days' : 'last 30 days')} · INR</span></h2>
+    <div class="card"><h2>Spend trend <span class="badge">${range ? S.esc(range.rangeLabel) : (win === 'd7' ? 'last 7 days' : 'last 30 days')} · through today (not final, T+1) · ${kCur}</span></h2>
       ${trendChart || '<div class="empty-state">No spend yet — run a Meta pull to start charting.</div>'}
       ${trendNote}${campSplit}</div>
     ${pullCard}

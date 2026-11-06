@@ -2,6 +2,63 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-06 (v13 spend-accuracy fix — dashboard KPIs now match Meta Ads Manager)
+
+User report: dashboard KPIs "don't match Ads Manager, Re-check still shows
+drift". Diagnosis-first (no speculative code), via the new read-only
+`scripts/spend-diagnose.js` (3 numbers per account: app DB / Meta
+account-level live / Meta ad-level live sum, both windows, drifts, fx_rate,
+AED + near-zero notes).
+
+Root-cause classification (from the numbers, not guesswork):
+- **Cause B (window mismatch)** — the visible mismatch. Dashboard "7d" was
+  N-6→N (**today in**); Ads Manager "last 7 days" = N-7→N-1 (**today out**).
+  Today's Meta spend is T+1-mutable, so the two always differ by ~a day's
+  spend. Proof: over the today-excluded window, **all 7 real accounts match
+  Meta live at 0.00%**, and Meta's own account-level aggregate equals its
+  ad-level sum at 0.00% on every account (no aggregation-level bug).
+- **Cause A (staleness)** — residual 0.22–0.42% on the same-window
+  (today-in) comparison; Meta's today was still accruing between the 06:37
+  UTC pull and the check. Not a bug; now labelled.
+- **Cause C (AED currency labeling)** — The Job Workshop bills in AED; the
+  app's INR column = spend × fx_rate('INR') (=1.0, no AED rate exists) and
+  `spend_daily.currency` was hardcoded 'INR'. KPIs labelled ₹ were actually
+  AED numbers.
+- **Re-check blocker (schema drift)** — the dev DB's `meta_accuracy_check`
+  was created on the older INR-basis shape (`app_spend_inr`/`meta_spend_inr`,
+  no `currency`); `CREATE TABLE IF NOT EXISTS` can't extend it, so every
+  `/meta/check` failed with `no column named app_spend` and recorded nothing.
+  This is why "Re-check" appeared to still show drift.
+
+Fix (all committed):
+- `server/lib/shared.js`: KPI/aggregate windows → **complete days**
+  (N-7..N-1 / N-30..N-1, today excluded) for kpis, top campaigns, top ads,
+  the default-account rule, and the accuracy check — the Ads Manager basis.
+  The 30-day trend keeps today (it's a trend, labelled "not final, T+1").
+- `server/screens.js`: truth labels — under the KPIs: "Data through N-1 ·
+  last 7 complete days (today N excluded …) · last Meta pull X h ago [Pull
+  now]"; KPI currency is honest (`LAST 7D SPEND (AED) AED 2,700`, ₹ only
+  for INR); trend badge "through today (not final, T+1)"; accuracy table
+  headers "7 complete days (app) / (Meta live)" + every row shows
+  `window · checked` (checked timestamp on recorded rows, current window
+  basis on unchecked ones).
+- `server/index.js` `/meta/check`: live-fetches the SAME N-7..N-1 window and
+  records `window_from/to` — apples-to-apples with the KPI and Ads Manager.
+- `server/db.js`: idempotent migration adding `app_spend`/`meta_spend`/
+  `currency` to `meta_accuracy_check` on BOTH engines (SQLite PRAGMA-driven
+  ALTER; PG `ADD COLUMN IF NOT EXISTS`) so Re-check works on pre-v11 DBs.
+- `scripts/spend-diagnose.js` (new): read-only 3-number diagnosis for any
+  engine; `docs/spend-verification.md` (new): exact KPI formulas, the 7-row
+  proof table (all 0.00% drift, gate passed 2026-11-06), the 5-minute Ads
+  Manager check steps, AED + Piyush-inactive notes, screenshot list.
+- 4 screenshots: `docs/screenshots/spend-v13-{dashboard,accuracy,aed,piyush}.png`.
+- NOTE for later: `fx_rate` still has no AED→INR rate (INR=1.0 seed only);
+  the app now labels AED honestly but does not convert it. Add a rate when
+  cross-currency KPIs matter.
+
+Both engines green (11 components each: reports/security/liveapi/xt-queue/
+isolation/metalive/gates/datamode/spa + replay + sweep, 0 failures).
+
 ## 2026-11-06 (v12 — final close-out: adapter re-verification, CAPI audit, staging/QA green)
 
 Master v12 Task 1: make the project technically **pilot go-live ready**. All

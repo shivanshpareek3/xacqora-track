@@ -49,6 +49,16 @@ function open() {
     sys.exec(`ALTER TABLE meta_ad_account ADD COLUMN IF NOT EXISTS currency TEXT`);
     // v11: mark a seed/demo client so its whole dataset hides in DATA_MODE=live.
     sys.exec(`ALTER TABLE client ADD COLUMN IF NOT EXISTS demo INTEGER DEFAULT 0`);
+    // v13 spend-accuracy: meta_accuracy_check shipped first on the INR-basis
+    // shape (app_spend_inr/meta_spend_inr, no currency); v11 re-shaped it to
+    // NATIVE currency units (app_spend/meta_spend/currency). CREATE TABLE IF
+    // NOT EXISTS cannot extend an existing table, so pre-v11 DBs are missing
+    // the new columns and every /meta/check upsert fails ("no column named
+    // app_spend"). Add them idempotently; the old _inr columns are left
+    // unused (the table holds only completed checks, which re-checks overwrite).
+    sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS app_spend DOUBLE PRECISION NOT NULL DEFAULT 0`);
+    sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS meta_spend DOUBLE PRECISION NOT NULL DEFAULT 0`);
+    sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS currency TEXT`);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -110,6 +120,18 @@ function open() {
   // v11: mark a seed/demo client so its whole dataset hides in DATA_MODE=live.
   const cl = cols('client');
   if (!cl.includes('demo')) db.exec(`ALTER TABLE client ADD COLUMN demo INTEGER DEFAULT 0`);
+  // v13 spend-accuracy: meta_accuracy_check shipped first on the INR-basis
+  // shape (app_spend_inr/meta_spend_inr, no currency) and was re-shaped to
+  // NATIVE currency units in v11 (app_spend/meta_spend/currency). CREATE
+  // TABLE IF NOT EXISTS cannot extend an existing table, so any DB created
+  // before the re-shape is missing the new columns and every /meta/check
+  // upsert fails ("no column named app_spend"). Add the missing columns
+  // idempotently; the table holds only completed checks (re-checks
+  // overwrite), so the old _inr columns are simply left unused.
+  const macc = cols('meta_accuracy_check');
+  if (!macc.includes('app_spend')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN app_spend REAL NOT NULL DEFAULT 0`);
+  if (!macc.includes('meta_spend')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN meta_spend REAL NOT NULL DEFAULT 0`);
+  if (!macc.includes('currency')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN currency TEXT`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,
