@@ -40,12 +40,37 @@ function verifyInboundSignature(platform, rawBody, headers, secret) {
       const expect = hmacSha256hex(raw, secret);
       return { ok: timingSafeEqual(provided, expect), reason: 'cashfree HMAC-SHA256 (verified)' };
     }
+    // Calendly (VERIFIED 2026-11-06): header Calendly-Webhook-Signature =
+    // `t=<ts>,v1=<HMAC-SHA256(secret, ts + "." + rawBody)>` (see calendlyVerifySignature).
+    case 'calendly':
+      return calendlyVerifySignature(raw, h['calendly-webhook-signature'], secret, Date.now() / 1000);
     // Everything else: a shared secret echoed in a header
     default: {
       const provided = h['x-xt-secret'] || h['x-signature'] || h['secret'];
       return { ok: !!provided && timingSafeEqual(provided, secret), reason: 'shared secret header' };
     }
   }
+}
+
+// Calendly (VERIFIED against developer.calendly.com/api-docs/overview/webhooks/webhook-signatures
+// on 2026-11-06). The signature header is `t=<unixTs>,v1=<hex>` where
+// v1 = HMAC-SHA256 with the shared webhook secret keying
+// `String(ts) + "." + rawBody`. The timestamp is part of the signed message
+// and must fall within `now - toleranceSec`; a tampered body or stale
+// timestamp both fail. Tolerance defaults to 3 minutes (the docs example).
+// nowSec is injectable for tests.
+function calendlyVerifySignature(rawBody, signatureHeader, secret, nowSec, toleranceSec = 180) {
+  if (!signatureHeader || !secret) return { ok: false, reason: 'missing Calendly-Webhook-Signature or secret' };
+  const parts = String(signatureHeader).split(',');
+  const t = parts.find((p) => p.startsWith('t='));
+  const v1 = parts.find((p) => p.startsWith('v1='));
+  if (!t || !v1) return { ok: false, reason: 'Calendly signature malformed' };
+  const ts = t.slice(2);
+  if (!/^\d+$/.test(ts)) return { ok: false, reason: 'Calendly timestamp malformed' };
+  const now = Number.isFinite(nowSec) ? nowSec : Date.now() / 1000;
+  if (Math.abs(now - Number(ts)) > toleranceSec) return { ok: false, reason: 'calendly timestamp outside tolerance' };
+  const expect = hmacSha256hex(ts + '.' + String(rawBody == null ? '' : rawBody), secret);
+  return { ok: timingSafeEqual(v1.slice(3), expect), reason: 'calendly HMAC-SHA256 (verified)' };
 }
 
 function lowerHeaders(headers) {
@@ -203,4 +228,4 @@ async function runLiveCapi({ pixelId, accessToken, payload, signal }) {
   return body; // { events_received, fbtrace_id, ... }
 }
 
-module.exports = { liveMode, verifyInboundSignature, runLiveMetaPull, runLiveCapi };
+module.exports = { liveMode, verifyInboundSignature, calendlyVerifySignature, runLiveMetaPull, runLiveCapi };

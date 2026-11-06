@@ -2,7 +2,69 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
-## 2026-11-05 (v11 — real-client ad-account mapping + live-mode demo-client hiding)
+## 2026-11-06 (v12 — final close-out: adapter re-verification, CAPI audit, staging/QA green)
+
+Master v12 Task 1: make the project technically **pilot go-live ready**. All
+work below; pilot cutover (Task 2) starts the moment Arpit's §2 checklist items
+arrive.
+
+1. **5-platform webhook spec retry** (`docs/adapter-verification.md`):
+   - **Calendly promoted UNVERIFIED → VERIFIED** (2026-11-06). The official
+     `developer.calendly.com` API docs are now public + fetchable (the
+     auth-gated path the 2026-11-02 pass hit 404s). Spec: header
+     `Calendly-Webhook-Signature` = `t=<ts>,v1=<HMAC-SHA256(secret, ts+"."+rawBody)>`
+     — the timestamp is part of the signed message (3-min replay tolerance,
+     matching the docs example).
+   - Native Calendly HMAC path added in `server/lib/liveapi.js`
+     (`calendlyVerifySignature`, exposed + a `case 'calendly'` branch), with a
+     real sample-signed-payload regression in `test/liveapi.js` (valid /
+     tampered / missing / malformed / stale-timestamp all asserted). The shared
+     secret fallback for Calendly is gone — live mode now verifies its native
+     signature.
+   - Zoom stayed UNVERIFIED but its reason was corrected: official docs still
+     404, and a consistent third-party reference shows the *current* spec is
+     `x-zm-signature` = `v0=HMAC-SHA256(secret, "v0:"+ts+":"+rawBody)` +
+     `x-zm-request-timestamp` (NOT the older token+secret / method+uri+date
+     form recorded in 2026-10/11). Retry dates bumped: Aevent/Zoom →
+     2026-11-20, Pabbly/FlexiFunnels → 2026-11-27. `pilot-live-checklist.md`
+     entry-condition + §4 retry lines updated to match.
+
+2. **CAPI dry-run audit** (new `docs/capi-audit.md` + read-only probe
+   `tmp/capi-audit.js`): 40 dry-run `capi_log` rows, **0 duplicate event_ids**
+   (dedup invariant holds), refund-suppression branch confirmed in code
+   (`meta.js:120`, `sent_to_meta=2`), queue fully drained, `settings.capi='dry'`
+   (nothing has hit Meta yet). The single "Purchase on a refunded lead" row
+   traced to demo seed data (client 1, dry-run, pre-rule) — not a live bug.
+   Cutover actions listed (flip to live only with real pixel + token; re-run
+   the probe post-cutover, gate CAPI MQ ≥ 7 on Purchase).
+
+3. **Pilot readiness**: `test/gates.js` G1–G4 green on the mock pilot dataset;
+   `docs/pilot-live-checklist.md` re-checked against the current repo
+   (staleness after `client.demo` + per-client dashboard fixes folded into item 1).
+
+4. **Staging re-run** (`scripts/staging.sh`, prod-mirror PG): 0 failures across
+   all 5 steps (suite, replay, sweep, backup+restore). One real bug found +
+   fixed: **with `.env` carrying `XACQORA_LIVE=1` + a valid `XACQORA_SECRET_KEY`**
+   (our dev .env now does), the seeded endpoint secrets become decryptable and
+   the replay/sweep spawned servers enter live signature-gate mode → bare
+   sample POSTs 401 "bad signature". Fix: `staging.sh` now runs replay + sweep
+   with `MOCK=1` (the gate's own HMAC regressions stay covered by `test/liveapi.js`
+   under the real key). Without this, any future staging run with a dev .env
+   that has `XACQORA_LIVE=1` would red for no code reason.
+
+5. **Final QA, both engines green**: reports, security, liveapi, xt-queue,
+   isolation, metalive, gates, datamode, spa + replay + sweep — all PASS on
+   SQLite and Postgres (consolidated runs logged; sweep 0 failures both).
+
+6. **Token hygiene**: `docs/deploy.md` §7 cutover now carries a one-line
+   reminder — the live Meta token was pasted in an AI chat session; rotate it
+   in Meta before wiring secrets (or confirm in writing if already rotated).
+
+Ready state: project is technically pilot-go-live ready. Cutover (v12 Task 2)
+is gated on Arpit's checklist: 7 decisions, gateway credentials via `.env`
+handover, Meta CAPI pixel/dataset IDs, Mumbai PG + Vercel + `track.`
+subdomain, pilot CSVs + ad destination URLs, token-rotation confirmation.
+
 
 Arpit's mapping-task ask: the dashboard kept centering **dummy data** — the 7
 real `act_` ad accounts were all pinned to the seed "Coach Ravi" client, so

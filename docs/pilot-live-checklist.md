@@ -21,8 +21,10 @@ gate is a pilot blocker, not a footnote.
 - [ ] `XACQORA_LIVE=1` is **off** until every secret below is in place (the app
       runs in mock/dry-run and is fully safe with fake data).
 - [ ] `docs/adapter-verification.md` has **zero pending markers** for Razorpay +
-      Cashfree (they were re-verified 2026-11-02; the 5 other adapters stay
-      UNVERIFIED with retry dates — do not treat them as live).
+      Cashfree + Calendly (Razorpay/Cashfree re-verified 2026-11-02, Calendly
+      first-verified 2026-11-06; the 4 other adapters — Aevent, Zoom, Pabbly,
+      FlexiFunnels — stay UNVERIFIED with bumped retry dates — do not treat
+      them as live).
 - [ ] Dev DB kabhi test-artifact se dirty nahi hota (v10): the test sweep runs on a
       **scratch DB** (its own throwaway database + server, dropped on exit) and
       the sweep/test-button ingest payloads carry a `__sweep_test` marker the
@@ -140,11 +142,14 @@ settlements or the Meta Ads Manager dashboard for you.
 
 ## 4. Open / handoff items (not pilot-blocking, but decide in week 1)
 
-- **Aevent / Zoom / Calendly** retry: 2026-11-09 (see
-  `docs/adapter-verification.md`).
-- **Pabbly / FlexiFunnels** retry: 2026-11-16.
+- **Aevent / Zoom** retry: 2026-11-20; **Pabbly / FlexiFunnels** retry:
+  2026-11-27 (see `docs/adapter-verification.md`). **Calendly is now VERIFIED**
+  (2026-11-06, native HMAC path in `server/lib/liveapi.js`) — no retry needed;
+  wire its `calendly_webhook_secret` into the endpoint row when live.
 - **CAPI live toggle:** only flip `settings.capi='live'` after pixel + ad
       account verified; dry-run until then so `match_quality` is the estimate.
+      (Pre-cutover state is audited in `docs/capi-audit.md`: all dry-run, 0
+      live deliveries, `event_id` dedup + refund rule confirmed.)
 
 ---
 

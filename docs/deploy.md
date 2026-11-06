@@ -190,6 +190,13 @@ cutover (the checklist's entry condition).
 4. Run `scripts/prod-verify.sh` + the pilot checklist; open the 4-week
    accuracy window (`docs/pilot-live-checklist.md` §3 cadence)
 
+> **⚠️ Token hygiene — read before cutover:** the live Meta access token used
+> during development was pasted into an AI chat session. Treat it as
+> compromised: before step 2, **rotate it in Meta's system-user token
+> dashboard** and confirm the new token is the only one in `.env` / the
+> endpoint rows (old copies deleted). If Arpit has already rotated it,
+> confirm once in writing and tick this line off.
+
 ---
 
 ## 8. Rollback

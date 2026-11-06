@@ -46,8 +46,19 @@ cd "$HERE"
 for t in reports security liveapi xt-queue isolation gates; do
   if node test/$t.js >/dev/null 2>&1; then echo "   PASS $t"; else echo "   FAIL $t"; node test/$t.js 2>&1 | tail -5; exit 1; fi
 done
-node test/replay.js 2>&1 | grep -E "ALL TESTS|FAIL|assertion" | tail -3
-PORT=4125 bash test/sweep.sh 2>&1 | grep -iE "SWEEP RESULT|FAIL" | tail -4
+# replay exercises ingest plumbing end-to-end; its sample POSTs carry no HMAC
+# signature headers. With XACQORA_SECRET_KEY set (step 3) the seeded endpoint
+# secrets decrypt AND .env's XACQORA_LIVE=1 puts the spawned server in live
+# mode, so the Phase-L signature gate (index.js:152) would 401 every sample.
+# The gate's own regressions are covered by test/liveapi.js above, so run
+# replay in mock mode: MOCK=1 forces liveMode()=false and the gate is skipped
+# (the test's original dev-default design).
+MOCK=1 node test/replay.js 2>&1 | grep -E "ALL TESTS|FAIL|assertion" | tail -3
+# sweep: same story — its S.6 rate-limit test POSTs ingest endpoints with the
+# shared endpoint secret but no live signature header; MOCK=1 keeps the
+# signature gate off so those requests reach the 429 check they were written
+# for. (The sweep's own server is spawned with this env, so MOCK=1 propagates.)
+MOCK=1 PORT=4125 bash test/sweep.sh 2>&1 | grep -iE "SWEEP RESULT|FAIL" | tail -4
 
 echo "==> [5/5] staging backup + restore drill (prod backup role)"
 node scripts/backup.js 2>&1 | tail -1

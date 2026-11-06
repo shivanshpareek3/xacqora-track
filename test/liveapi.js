@@ -45,6 +45,30 @@ const rzSigSha512 = crypto.createHmac('sha512', rzSecret).update(rzBody, 'utf8')
 assert.strictEqual(live.verifyInboundSignature('razorpay', rzBody, { 'X-Razorpay-Signature': rzSigSha512 }, rzSecret).ok, false, 'SHA512 must be rejected');
 console.log('PASS razorpay: SHA512 signature correctly rejected (spec is SHA256)');
 
+// ---- Calendly: a real sample-signed payload
+// Spec (developer.calendly.com/api-docs/overview/webhooks/webhook-signatures):
+//   header Calendly-Webhook-Signature = `t=<ts>,v1=<HMAC-SHA256(secret, ts+"."+rawBody)>`
+//   The timestamp is part of the signed message and must be within tolerance.
+const cdBody = JSON.stringify({ event: 'invite.created', invitee_email: 'prospect@client.com', uuid: 'inv_1' });
+const cdSecret = 'calendly_webhook_secret_demo';
+const cdTs = String(Math.floor(Date.now() / 1000));
+const cdSig = `t=${cdTs},v1=${hmac256(cdTs + '.' + cdBody, cdSecret)}`;
+r = live.verifyInboundSignature('calendly', cdBody, { 'calendly-webhook-signature': cdSig }, cdSecret);
+assert.strictEqual(r.ok, true, 'valid calendly sample-signed payload must pass');
+assert.ok(/calendly/i.test(r.reason), 'reason should state calendly HMAC-SHA256');
+console.log('PASS calendly: real sample-signed payload (Calendly-Webhook-Signature) accepted');
+
+// tampered body must fail
+assert.strictEqual(live.verifyInboundSignature('calendly', cdBody + ' ', { 'calendly-webhook-signature': cdSig }, cdSecret).ok, false, 'tampered calendly body must fail');
+// missing / malformed header must fail
+assert.strictEqual(live.verifyInboundSignature('calendly', cdBody, {}, cdSecret).ok, false, 'missing Calendly-Webhook-Signature must fail');
+assert.strictEqual(live.verifyInboundSignature('calendly', cdBody, { 'calendly-webhook-signature': 'garbage' }, cdSecret).ok, false, 'malformed calendly signature must fail');
+// a stale timestamp (outside tolerance) must fail even if the HMAC matches
+const cdStaleTs = String(Math.floor(Date.now() / 1000) - 3600);
+const cdStaleSig = `t=${cdStaleTs},v1=${hmac256(cdStaleTs + '.' + cdBody, cdSecret)}`;
+assert.strictEqual(live.verifyInboundSignature('calendly', cdBody, { 'calendly-webhook-signature': cdStaleSig }, cdSecret).ok, false, 'stale calendly timestamp must be rejected');
+console.log('PASS calendly: tampered / missing / malformed / stale all rejected');
+
 // ---- Cashfree: a real sample-signed payload
 const cfBody = JSON.stringify({ event: 'transaction_settled', payload: { transactionId: 'TXN-1', amount: 4999 } });
 const cfSecret = 'cfclient_secret_demo';
@@ -58,4 +82,4 @@ assert.strictEqual(live.verifyInboundSignature('cashfree', cfBody, {}, cfSecret)
 assert.strictEqual(live.verifyInboundSignature('cashfree', cfBody, { 'x-cashfree-signature': cfSig }, cfSecret).ok, false, 'legacy header must be ignored');
 console.log('PASS cashfree: missing header + legacy header name rejected');
 
-console.log('\nLIVE-API GATE PASSED (Razorpay + Cashfree signatures, verified spec)');
+console.log('\nLIVE-API GATE PASSED (Razorpay + Cashfree + Calendly signatures, verified spec)');
