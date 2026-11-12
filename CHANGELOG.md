@@ -2,6 +2,41 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-12 (v14.2: Classic UI — "Webhooks & API Keys" screen + sidebar entry)
+
+The v14/v14.1 screen shipped SPA-only (`/app/#/webhooks`). The user's daily
+driver is the **Classic UI** (`dashboard.html`, `localhost:4100`), whose
+sidebar comes from `S.navFor` — so the option simply didn't exist there
+("ab toh webhooks or api key ka option he nhi dikh rha").
+
+Fix:
+- `server/screens.js`: new `webhooks(db, user, p)` screen — the classic
+  twin of the SPA screen, server-rendered listing (endpoint table with
+  pause/resume/revoke/rotate + full-URL copy, API-key table, recent
+  inbound events) + the same generate cards (webhook URL + API key) that
+  POST to the SAME JSON API the SPA uses (`/api/app/webhooks/*`), so
+  audit/RLS/hashing are one code path. Live mode lists only REAL clients
+  (demo fixtures excluded, matching v14.1); FlexiFunnels 4-step
+  setup guide + dev public-URL notice included.
+- `server/lib/shared.js` `navFor`: "Webhooks & API Keys" sidebar item in
+  the Integrations group for owner/admin/media_buyer (classic + SPA /me
+  both read this function).
+- `server/index.js`: `GET /webhooks.html` route (team-only guard).
+- `test/sweep.sh`: owner sweep + client-403 list now include
+  `webhooks.html`.
+- Latent alias bug caught by the smoke render: the classic screen's
+  inbound-log query had to alias the table (`webhook_log w`) because the
+  live-mode `webhookEx` predicates emit `w.`-prefixed columns.
+
+**Rule of thumb:** any new screen ships in BOTH UIs — the SPA tab AND a
+classic `screens.js` page + `navFor` entry + route + sweep gates. The
+integrations screen cross-links `/app/#/webhooks`; the new classic screen
+cross-links back to integrations.
+
+Tests: all in-process suites green (SPA 42/42, security, webhook-keys
+39 checks) + classic-screen smoke render vs a scratch copy of the dev DB
+(live mode: real clients only, generate/guide/key sections present).
+
 ## 2026-11-12 (v14.1: real clients only in live mode + prominent webhook generation)
 
 User pushback on the v14 screen: it still listed the SEED demo clients

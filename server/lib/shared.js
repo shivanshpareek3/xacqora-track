@@ -1166,6 +1166,7 @@ function navFor(user) {
   );
   if (['owner', 'admin', 'media_buyer'].includes(user.role)) n.push(
     { group: 'Integrations', path: 'integrations.html', label: 'Integrations' },
+    { group: 'Integrations', path: 'webhooks.html', label: 'Webhooks & API Keys' },
     { group: 'Ops', path: 'pilot', label: 'Pilot' },
     { group: 'Ops', path: 'alerts.html', label: 'Alerts' },
   );

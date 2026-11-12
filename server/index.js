@@ -763,6 +763,10 @@ async function handleRequest(req, res) {
           return;
         case 'integrations.html':
           return guard(screens.integrations(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin', 'media_buyer']);
+        case 'webhooks.html':
+          // v14: token-in-URL webhooks + API keys (classic-UI twin of the SPA
+          // #/webhooks screen) — team-only, same as integrations.html.
+          return guard(screens.webhooks(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin', 'media_buyer']);
         case 'duplicates.html':
           return guard(screens.duplicates(db, user, Object.fromEntries(u.searchParams.entries())), ['owner', 'admin']);
         case 'admin.html':

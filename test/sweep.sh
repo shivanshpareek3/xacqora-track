@@ -87,14 +87,14 @@ curl -s -c "$C" -o /dev/null -X POST -d "email=client@xacqora.local&password=xac
 
 FAILS=0
 echo '--- owner sweep (14 screens + demo + xt.js) ---'
-for p in dashboard.html leads lead/101 pipeline.html "reports.html?model=last_paid_click" "reports.html?model=first_click" "reports.html?model=linear" "reports.html?model=lead_source" meta.html integrations.html duplicates.html admin.html import pilot alerts.html demo xt.js; do
+for p in dashboard.html leads lead/101 pipeline.html "reports.html?model=last_paid_click" "reports.html?model=first_click" "reports.html?model=linear" "reports.html?model=lead_source" meta.html integrations.html webhooks.html duplicates.html admin.html import pilot alerts.html demo xt.js; do
   code=$(curl -s -b "$O" -o /dev/null -w "%{http_code}" "$BASE/$p")
   [ "$code" != "200" ] && { echo "FAIL owner $p -> $code"; FAILS=$((FAILS+1)); }
 done
 [ "$FAILS" -eq 0 ] && echo "all owner pages -> 200"
 
 echo '--- client must be DENIED team-only screens ---'
-for p in admin.html integrations.html duplicates.html pilot alerts.html; do
+for p in admin.html integrations.html webhooks.html duplicates.html pilot alerts.html; do
   code=$(curl -s -b "$C" -o /dev/null -w "%{http_code}" "$BASE/$p")
   if [ "$code" = "200" ]; then echo "FAIL client $p is 200 (should be 403)"; FAILS=$((FAILS+1)); else echo "ok client $p -> $code (denied)"; fi
 done

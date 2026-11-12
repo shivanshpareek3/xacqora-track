@@ -790,6 +790,214 @@ function integrations(db, user, p) {
   return S.layout({ title: 'Integrations', nav: S.navFor(user), active: 'integrations.html', user, body, band: S.layoutDemoBand(dataMode) });
 }
 
+// ---------------------------------------------------------------- Webhooks & API Keys
+// Classic-UI twin of the SPA #/webhooks screen (v14). The listing is
+// server-rendered; generate/pause/revoke/rotate + API-key actions POST to the
+// JSON API (/api/app/webhooks/* — cookie-authenticated, same audit + RLS as
+// the SPA) and reload, matching this file's fetch-and-reload convention.
+function webhooks(db, user, p) {
+  const tx = makeTx(db, user);
+  const dm = require('./lib/datamode');
+  const dataMode = dm.mode(tx);
+  const W = require('./lib/webhooks');
+  const PLATFORMS = [
+    ['meta_leadgen', 'Meta Lead Forms'], ['tagmango', 'TagMango'], ['razorpay', 'Razorpay'],
+    ['cashfree', 'Cashfree'], ['cosmofeed', 'Cosmofeed'], ['aevent', 'Aevent'],
+    ['zoom', 'Zoom'], ['calendly', 'Calendly'], ['flexifunnels', 'FlexiFunnels'],
+    ['pabbly', 'Pabbly Connect'], ['whatsapp', 'WhatsApp'], ['google_sheets', 'Google Sheets / CSV'],
+  ];
+  // v14.1: live mode = REAL clients only (the demo-flagged seed clients stay
+  // out of generation AND the endpoint listing); demo mode keeps the fixtures.
+  const clients = user.role === 'client'
+    ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
+    : dm.clientOptions(tx, dataMode, null).map((c) => ({ id: c.id, name: c.name }));
+  const clientName = {}; for (const c of clients) clientName[String(c.id)] = c.name;
+  const epIds = (user.role !== 'client' && dataMode === dm.LIVE) ? dm.realClientIds(tx, dm.LIVE, null) : null;
+  const endpoints = epIds
+    ? tx.all(`SELECT * FROM webhook_endpoint WHERE client_id IN (${epIds.join(',') || '0'}) ORDER BY id DESC`)
+    : tx.all(`SELECT * FROM webhook_endpoint ORDER BY id DESC`);
+  const epStatus = (s) => `<span class="pill ${s === 'active' ? 'g' : s === 'paused' ? 'o' : 'r'}">${S.esc(s || 'active')}</span>`;
+  const epRows = endpoints.map((e) => `<tr>
+    <td><b>${S.esc(e.platform)}</b></td>
+    <td class="small muted">${S.esc(e.description || '—')}</td>
+    <td class="small muted">${S.esc(clientName[String(e.client_id)] || 'client ' + e.client_id)}</td>
+    <td class="small"><code data-copurl="${S.esc(e.url || '')}">${S.esc(e.url || '')}</code> <button class="btn sm sec" data-copy="${e.id}" title="Copy the full URL">Copy</button></td>
+    <td><span class="pill m">${S.esc(e.events || 'all')}</span></td>
+    <td>${epStatus(e.status)}</td>
+    <td class="small muted">${e.last_event_at ? S.fmtDT(e.last_event_at) : 'never'}</td>
+    <td class="small">${String(e.events_total || 0)}</td>
+    <td>
+      ${e.status !== 'revoked' ? `<button class="btn sm sec" data-ep="${e.id}" data-act="status" data-to="paused">Pause</button> ` : ''}
+      ${e.status === 'paused' ? `<button class="btn sm sec" data-ep="${e.id}" data-act="status" data-to="active">Resume</button> ` : ''}
+      ${e.status !== 'revoked' ? `<button class="btn sm sec" data-ep="${e.id}" data-act="status" data-to="revoked">Revoke</button> ` : ''}
+      ${e.status !== 'revoked' ? `<button class="btn sm sec" data-ep="${e.id}" data-act="rotate">Rotate</button>` : ''}
+    </td></tr>`).join('');
+  const apikeys = W.listApiKeys(tx, null);
+  const keyRows = apikeys.map((k) => `<tr>
+    <td><b>${S.esc(k.label || '—')}</b></td>
+    <td class="small muted">${S.esc(k.scope_client_id == null ? 'workspace (all clients)' : (clientName[String(k.scope_client_id)] || 'client ' + k.scope_client_id))}</td>
+    <td><span class="pill ${k.permission === 'read_write' ? 'o' : 'm'}">${S.esc(k.permission)}</span></td>
+    <td class="small muted">${S.fmtDT(k.created_at)}</td>
+    <td class="small muted">${k.last_used_at ? S.fmtDT(k.last_used_at) : 'never'}</td>
+    <td>${k.revoked_at ? '<span class="pill r">revoked</span>' : '<span class="pill g">active</span>'}</td>
+    <td>${k.revoked_at ? `<button class="btn sm sec" data-key="${k.id}" data-kact="delete">Delete</button>`
+      : `<button class="btn sm sec" data-key="${k.id}" data-kact="revoke">Revoke</button>`}</td></tr>`).join('');
+  // v14.1: the live-mode predicates reference the `w.` alias, so the query
+  // must carry it (no alias + a `w.` clause = "no such column: w.ref").
+  const logWhere = [dm.webhookEx(dataMode, 'w'), epIds ? `(w.client_id IS NULL OR w.client_id IN (${epIds.join(',') || '0'}))` : ''].filter(Boolean);
+  const log = tx.all(`SELECT w.* FROM webhook_log w ${logWhere.length ? `WHERE ${logWhere.join(' AND ')}` : ''} ORDER BY w.id DESC LIMIT 30`);
+  const logRows = log.map((r) => `<tr><td class="small muted">${S.fmtDT(r.ingested_at)}</td><td>${S.esc(r.platform)}</td>
+    <td class="small muted">${S.esc(r.ref || '—')}</td>
+    <td><span class="pill ${r.status === 'processed' ? 'g' : r.status === 'failed' ? 'r' : 'o'}">${S.esc(r.status)}</span></td>
+    <td class="small muted">${S.esc((r.error || '').slice(0, 40))}</td>
+    ${r.test ? '<td class="small"><span class="pill p">test</span></td>' : '<td class="small muted"></td>'}</tr>`).join('');
+  // public base for generated URLs (APP_URL / XACQORA_PUBLIC_URL = prod domain;
+  // unset = this host — FlexiFunnels can only reach a PUBLIC url).
+  const base = process.env.APP_URL || process.env.XACQORA_PUBLIC_URL;
+  const baseNote = base
+    ? `<div class="note">Generated URLs use your public domain <code>${S.esc(base)}</code> — platforms can reach them.</div>`
+    : `<div class="note" style="border-color:var(--warn)"><b>Dev notice:</b> generated URLs use this host. FlexiFunnels can only POST to a PUBLIC URL — either set <code>APP_URL</code> on your production host (docs/deploy.md) or run a tunnel in dev (<code>cloudflared tunnel --url http://localhost:4100</code> / <code>ngrok http 4100</code>) and use that address.</div>`;
+  const body = `
+  <div class="card"><h2>Generate a webhook URL <span class="badge">token-in-URL · copy once</span></h2>
+    <div class="row" style="gap:10px;flex-wrap:wrap">
+      <select id="wk-client">${clients.map((c) => `<option value="${c.id}">${S.esc(c.name)}</option>`).join('')}</select>
+      <select id="wk-platform">${PLATFORMS.map((x, i) => `<option value="${x[0]}" ${x[0] === 'flexifunnels' ? 'selected' : ''}>${S.esc(x[1])}</option>`).join('')}</select>
+      <select id="wk-events"><option value="leads" selected>leads (forms)</option><option value="purchases">purchases</option><option value="all">all events</option></select>
+      <input type="text" id="wk-desc" placeholder="e.g. Webinar form (FlexiFunnels)" style="flex:1;min-width:200px">
+      <button class="btn" id="wk-gen">Generate URL</button>
+    </div>
+    <div id="wk-newurl" style="display:none;margin-top:10px">
+      <div class="note" style="border-color:var(--ok)">
+        <div class="row" style="gap:8px"><span class="pill g">generated</span>
+          <code id="wk-newurl-val" style="word-break:break-all"></code>
+          <button class="btn sm" id="wk-newurl-copy">Copy URL</button></div>
+        <div class="small muted" style="margin-top:6px">This URL IS the endpoint's secret — paste it into the platform (FlexiFunnels: Forms → Webhook, and Products/Purchases → Webhook). Anyone with the URL can post events here.</div>
+      </div>
+    </div>
+    ${baseNote}
+  </div>
+  <div class="card"><h2>Webhook endpoints <span class="badge">${endpoints.length} endpoint(s)</span></h2>
+    <div class="tabwrap"><table><thead><tr><th>Platform</th><th>Description</th><th>Client</th><th>URL</th><th>Events</th><th>Status</th><th>Last event</th><th>Total</th><th></th></tr></thead>
+    <tbody>${epRows || '<tr><td colspan="9" class="muted">No endpoints for your clients yet — generate one above. For FlexiFunnels: one form webhook (events “leads”) + one product webhook (events “purchases”).</td></tr>'}</tbody></table></div>
+  </div>
+  <div class="card"><h2>FlexiFunnels setup guide <span class="badge">copy-paste ready</span></h2>
+    <div class="small">
+      <div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="pill b">1</span>
+        <div><b>Form webhook</b> — FlexiFunnels → Forms → Page Editor → select form → Form Settings → Webhooks → paste your “leads” URL → Save &amp; Publish.</div></div>
+      <div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="pill b">2</span>
+        <div><b>Product/purchase webhook</b> — FlexiFunnels → Products → select product → Set Product Rules → Webhook → paste your “purchases” URL → Save.</div></div>
+      <div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="pill b">3</span>
+        <div><b>Ad attribution</b> — FlexiFunnels pages don't run xt.js, so add <code>utm_source / utm_medium / utm_campaign</code> as hidden form fields (or page URL params). They flow into the webhook payload; the lead gets a UTM source card + attribution without the pixel.</div></div>
+      <div class="row" style="padding:8px 0"><span class="pill b">4</span>
+        <div><b>Public URL</b> — the URL must be reachable by FlexiFunnels: your production domain (set <code>APP_URL</code>), or a dev tunnel (<code>cloudflared tunnel --url http://localhost:4100</code>).</div></div>
+    </div>
+  </div>
+  <div class="card"><h2>Create an API key <span class="badge">xak_ · bearer auth on /api/app/*</span></h2>
+    <div class="row" style="gap:10px;flex-wrap:wrap">
+      <select id="ak-scope"><option value="">workspace (all clients)</option>${clients.map((c) => `<option value="${c.id}">${S.esc(c.name)}</option>`).join('')}</select>
+      <select id="ak-perm"><option value="read_only" selected>read-only</option><option value="read_write">read-write</option></select>
+      <input type="text" id="ak-label" placeholder="label (e.g. billing scraper)" style="flex:1;min-width:180px">
+      <button class="btn" id="ak-gen">Create key</button>
+    </div>
+    <div id="ak-newkey" style="display:none;margin-top:10px">
+      <div class="note" style="border-color:var(--ok)">
+        <div class="row" style="gap:8px"><span class="pill g">key created</span>
+          <code id="ak-newkey-val" style="word-break:break-all"></code>
+          <button class="btn sm" id="ak-newkey-copy">Copy key</button></div>
+        <div class="small muted" style="margin-top:6px">Shown once — use it as <code>Authorization: Bearer xak_…</code>; only the hash is stored.</div>
+      </div>
+    </div>
+    ${apikeys.length ? `<div class="tabwrap" style="margin-top:12px"><table><thead><tr><th>Label</th><th>Scope</th><th>Permission</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+      <tbody>${keyRows}</tbody></table></div>` : '<div class="muted small" style="margin-top:10px">No API keys yet.</div>'}
+  </div>
+  <div class="card"><h2>Recent inbound events <span class="badge">processed / failed / paused</span></h2>
+    <div class="tabwrap"><table><thead><tr><th>When</th><th>Platform</th><th>Ref</th><th>Status</th><th>Error</th><th></th></tr></thead>
+    <tbody>${logRows || '<tr><td colspan="6" class="muted">No inbound events yet — generate a URL + send a test from the endpoint table, or wait for the platform.</td></tr>'}</tbody></table></div>
+    <div class="small muted" style="margin-top:8px"><a href="/integrations.html">Platform adapters + full integrations →</a></div>
+  </div>
+  <script>
+    // v14: mutations go to the SAME JSON API the SPA uses (cookie-auth;
+    // audit + RLS + key hashing all server-side). Reload after writes.
+    const postJson = (path, body) => fetch('/api/app/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+    const clientByName = (name) => { const opt = [...document.getElementById('wk-client').options].find(o => o.text === name); return opt ? Number(opt.value) : 0; };
+    // pause / resume / revoke
+    document.querySelectorAll('[data-act="status"]').forEach(b => b.onclick = async () => {
+      const to = b.dataset.to;
+      if (to === 'revoked' && !confirm('Revoke? The URL stops accepting events (history stays).')) return;
+      await postJson('webhooks/status', { id: Number(b.dataset.ep), status: to });
+      location.reload();
+    });
+    // rotate = delete + regenerate with the same client/platform/desc/events
+    document.querySelectorAll('[data-act="rotate"]').forEach(b => b.onclick = async () => {
+      if (!confirm('Rotate token? A new URL is generated — the old one is revoked.')) return;
+      const cells = b.closest('tr').querySelectorAll('td');
+      const description = cells[1].innerText.trim();
+      const clientName = cells[2].innerText.trim();
+      const events = cells[4].innerText.trim() || 'all';
+      const platform = cells[0].innerText.trim();
+      await postJson('webhooks/delete', { id: Number(b.dataset.ep) });
+      const j = await postJson('webhooks/endpoint', { client_id: clientByName(clientName) || 1, platform, description: description === '—' ? '' : description, events });
+      if (j && j.created) {
+        document.getElementById('wk-newurl-val').textContent = j.created.url;
+        document.getElementById('wk-newurl').style.display = '';
+        // keep the page up for a moment so the new URL can be copied, then refresh the table
+        setTimeout(() => location.reload(), 2500);
+      }
+    });
+    // copy the FULL (unmasked) endpoint URL from the table
+    document.querySelectorAll('[data-copy]').forEach(b => b.onclick = async () => {
+      const code = b.closest('td').querySelector('code[data-copurl]');
+      try { await navigator.clipboard.writeText(code ? code.dataset.copurl : ''); alert('URL copied'); }
+      catch { alert('Copy failed — select the URL text manually'); }
+    });
+    // generate a fresh endpoint
+    document.getElementById('wk-gen').onclick = async () => {
+      const cid = Number(document.getElementById('wk-client').value);
+      if (!cid) { alert('Pick a client first.'); return; }
+      const j = await postJson('webhooks/endpoint', {
+        client_id: cid,
+        platform: document.getElementById('wk-platform').value,
+        events: document.getElementById('wk-events').value,
+        description: document.getElementById('wk-desc').value,
+      });
+      if (j && j.created) {
+        document.getElementById('wk-newurl-val').textContent = j.created.url;
+        document.getElementById('wk-newurl').style.display = '';
+        alert('Webhook URL generated — copy it from the box above (or from the endpoint table).');
+      } else { alert('Could not create endpoint: ' + (j && j.error || 'unknown error')); }
+    };
+    document.getElementById('wk-newurl-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(document.getElementById('wk-newurl-val').textContent); alert('URL copied — paste it into the platform'); }
+      catch { alert('Copy failed — select the URL manually'); }
+    };
+    // create API key
+    document.getElementById('ak-gen').onclick = async () => {
+      const j = await postJson('webhooks/key', {
+        scope_client_id: document.getElementById('ak-scope').value || null,
+        permission: document.getElementById('ak-perm').value,
+        label: document.getElementById('ak-label').value,
+      });
+      if (j && j.created) {
+        document.getElementById('ak-newkey-val').textContent = j.created.key;
+        document.getElementById('ak-newkey').style.display = '';
+        alert('API key created — copy it now (shown only once).');
+      } else { alert('Could not create key: ' + (j && j.error || 'unknown error')); }
+    };
+    document.getElementById('ak-newkey-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(document.getElementById('ak-newkey-val').textContent); alert('Key copied'); }
+      catch { alert('Copy failed — select the key manually'); }
+    };
+    // revoke / delete keys
+    document.querySelectorAll('[data-key]').forEach(b => b.onclick = async () => {
+      const act = b.dataset.kact;
+      if (act === 'revoke' && !confirm('Revoke this key? It stops working immediately.')) return;
+      await postJson('webhooks/' + (act === 'revoke' ? 'key_revoke' : 'key_delete'), { id: Number(b.dataset.key) });
+      location.reload();
+    });
+  </script>`;
+  return S.layout({ title: 'Webhooks & API Keys', nav: S.navFor(user), active: 'webhooks.html', user, body, band: S.layoutDemoBand(dataMode) });
+}
+
 // ---------------------------------------------------------------- Duplicates
 function duplicates(db, user, p) {
   const tx = makeTx(db, user); // Phase P: pins this user's RLS scope on Postgres
@@ -1117,6 +1325,6 @@ function notFound(user) {
 }
 
 module.exports = {
-  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, duplicates, admin, portal, pilot, alerts,
+  dashboard, leads, leadTimeline, pipeline, reports, meta, integrations, webhooks, duplicates, admin, portal, pilot, alerts,
   stagePillClass, notFound,
 };
