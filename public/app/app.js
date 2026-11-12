@@ -931,31 +931,71 @@
   // v14: team-only. Section A = inbound token-URL endpoints (generate / copy /
   // pause / revoke, FlexiFunnels setup guide + field mapping). Section B = the
   // app's bearer API keys (xak_... read-only / read-write, revoke).
+  // last created endpoint/key, shown in a big copy-URL box under the create
+  // form (the URL is the thing the user pastes into FlexiFunnels).
+  let WK_LAST_ENDPOINT = null;
+  let WK_LAST_KEY = null;
+
   async function renderWebhooksKeys(main, query) {
+    // WK_LAST_ENDPOINT / WK_LAST_KEY persist across re-renders of THIS screen
+    // (the create handler sets one, then navigate() re-renders and the box
+    // shows it). They start null on first load; rotating a token updates it.
     const d = await get('/webhooks');
     clear(main);
     main.append(
       banner('Generate a webhook URL per client + platform and paste it into the platform (FlexiFunnels: Forms → Webhook and Products/Purchases → Webhook). The URL token is the endpoint\'s auth; every event is logged. API keys (xak_…) give scripts read access to the app.', null),
       baseNotice(d),
+      // ---------- CREATE WEBHOOK (prominent, on top) ----------
       h('div', { class: 'card' },
-        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'Webhook endpoints' }), h('div', { class: 'sub' }, 'token-in-URL · status · last event · total events')),
+        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'Generate a webhook URL' }), h('div', { class: 'sub' }, 'Pick client + platform + event scope → Generate → copy the URL into the platform')),
           h('span', { class: 'sp' }),
-          createEndpointForm(d)),
-      d.endpoints.length ? endpointsTable(d) : h('div', { class: 'empty', style: { marginTop: 10 } }, 'No endpoints yet — create one. For FlexiFunnels: one form webhook (events “leads”) + one product webhook (events “purchases”).')),
+          h('span', { class: 'tag' }, 'token-in-URL · copy once')),
+        h('div', { style: { marginTop: 12 } }, createEndpointForm(d)),
+        WK_LAST_ENDPOINT ? generatedUrlBox(WK_LAST_ENDPOINT) : null),
+      // ---------- existing endpoints ----------
+      d.endpoints.length ? h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'Webhook endpoints' }), h('div', { class: 'sub' }, 'status · last event · total events · pause / revoke / rotate')),
+          h('span', { class: 'sp' }), h('span', { class: 'tag' }, d.endpoints.length + ' endpoint(s)')),
+        endpointsTable(d)) : h('div', { class: 'empty', style: { marginTop: 10 } }, 'No endpoints yet for your clients — generate one above. For FlexiFunnels: one form webhook (events “leads”) + one product webhook (events “purchases”).'),
       d.endpoints.length ? flexiGuide(d) : null,
       h('div', { class: 'card' },
         h('div', { class: 'row' }, h('h2', { text: 'FlexiFunnels field mapping' }), h('span', { class: 'sp' }),
           h('span', { class: 'tag' }, 'per client · optional override')),
         flexiFieldMapForm(d)),
+      // ---------- CREATE API KEY ----------
       h('div', { class: 'card' },
-        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'API keys' }), h('div', { class: 'sub' }, 'Bearer auth for /api/app/* — plaintext shown once, then only the hash is kept')),
+        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'Create an API key' }), h('div', { class: 'sub' }, 'Bearer auth for /api/app/* — plaintext shown once, then only the hash is kept')),
           h('span', { class: 'sp' }),
-          createKeyForm(d)),
-      d.apikeys.length ? apiKeysTable(d) : h('div', { class: 'empty', style: { marginTop: 10 } }, 'No API keys yet.')),
+          h('span', { class: 'tag' }, 'xak_…')),
+        h('div', { style: { marginTop: 12 } }, createKeyForm(d)),
+        WK_LAST_KEY ? generatedKeyBox(WK_LAST_KEY) : null),
+      d.apikeys.length ? h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('h2', { text: 'API keys' }), h('span', { class: 'sp' }), h('span', { class: 'tag' }, d.apikeys.length + ' key(s)')),
+        apiKeysTable(d)) : null,
       h('div', { class: 'card' },
         h('div', { class: 'row' }, h('h2', { text: 'Recent inbound events' }), h('span', { class: 'sp' }),
           h('a', { class: 'btn sm sec', href: '#/integrations' }, 'Full log in Integrations')),
         webhookTable(d.log || [])));
+  }
+
+  // the one-time generated URL, big + copyable, under the create form
+  function generatedUrlBox(ep) {
+    return h('div', { class: 'note', style: { marginTop: 12, borderColor: 'var(--ok, #34d399)', background: 'rgba(52,211,153,.08)' } },
+      h('div', { class: 'row' }, h('span', { class: 'pill g' }, 'generated'),
+        h('span', { class: 'small' }, ep.platform + ' · ' + (ep.description || 'endpoint'))),
+      h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 8, wordBreak: 'break-all', fontSize: 13 }, text: ep.url }),
+      h('div', { class: 'row', style: { marginTop: 8, gap: 8 } },
+        h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(ep.url); toast('URL copied — paste it into ' + ep.platform, 'ok'); } catch { toast('Copy failed', 'err'); } } }, 'Copy URL'),
+        h('span', { class: 'td-muted small' }, 'This URL IS the secret — anyone who has it can post events to this endpoint.')));
+  }
+  function generatedKeyBox(k) {
+    return h('div', { class: 'note', style: { marginTop: 12, borderColor: 'var(--ok, #34d399)', background: 'rgba(52,211,153,.08)' } },
+      h('div', { class: 'row' }, h('span', { class: 'pill g' }, 'key created'),
+        h('span', { class: 'small' }, k.permission + ' · ' + (k.scope_name || 'workspace'))),
+      h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 8, wordBreak: 'break-all', fontSize: 13 }, text: k.key }),
+      h('div', { class: 'row', style: { marginTop: 8, gap: 8 } },
+        h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(k.key); toast('Key copied', 'ok'); } catch { toast('Copy failed', 'err'); } } }, 'Copy key'),
+        h('span', { class: 'td-muted small' }, 'use as ', h('code', {}, 'Authorization: Bearer ' + k.key.slice(0, 12) + '…'), ' — shown once, only the hash is stored')));
   }
 
   function baseNotice(d) {
@@ -1031,8 +1071,9 @@
     // delete the old endpoint + create a fresh one with the same client/platform/desc
     await post('/webhooks/delete', { id: ep.id });
     const r = await post('/webhooks/endpoint', { client_id: ep.client_id, platform: ep.platform, description: ep.description, events: ep.events });
-    showOneTimeUrl(r && r.created, ep.platform);
+    if (r && r.created) WK_LAST_ENDPOINT = { ...r.created, client: 'client ' + ep.client_id };
     navigate();
+    toast('New URL generated (old URL revoked) — copy the new one', 'ok');
   }
   function copyBtn(label, value) {
     const b = h('button', { class: 'btn sm sec', onclick: async () => {
@@ -1041,69 +1082,59 @@
     } }, 'Copy');
     return b;
   }
-  function showOneTimeUrl(created, platform) {
-    if (!created) return;
-    modal(h('div', {},
-      h('h2', { text: (platform || 'Webhook') + ' endpoint created' }),
-      h('div', { class: 'note', style: { marginTop: 10 } }, 'Copy this URL now — it contains the endpoint token (your only secret). In live mode the URL must be public (prod domain or tunnel).'),
-      h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 10, wordBreak: 'break-all' }, text: created.url }),
-      h('div', { class: 'row', style: { marginTop: 12, gap: 8 } },
-        h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(created.url); toast('URL copied', 'ok'); } catch {} } }, 'Copy URL'),
-        created.secret ? h('button', { class: 'btn sm sec', onclick: async () => { try { await navigator.clipboard.writeText(created.secret); toast('Secret copied', 'ok'); } catch {} } }, 'Copy legacy secret') : null)),
-      () => {});
-  }
-
   function createEndpointForm(d) {
-    const clSel = h('select', { id: 'wk-cl' }, d.clients.map((c) => h('option', { value: c.id, text: c.name })));
-    const plSel = h('select', { id: 'wk-pl' }, d.platforms.map((p) => h('option', { value: p[0], text: p[1] + ' — ' + p[2] })));
-    const evSel = h('select', { id: 'wk-ev' }, [h('option', { value: 'all', text: 'all events' }), h('option', { value: 'leads', text: 'leads (forms)' }), h('option', { value: 'purchases', text: 'purchases' })]);
+    // default to FlexiFunnels (the live-lead pipeline) + first real client +
+    // "leads" scope, so the common path is: pick a real client → Generate.
+    const clSel = h('select', { id: 'wk-cl' }, d.clients.map((c) => h('option', { value: c.id, text: c.name, selected: String(c.id) === String((d.endpoints[0] || {}).client_id) || (d.clients[0] && String(c.id) === String(d.clients[0].id)) })));
+    const plSel = h('select', { id: 'wk-pl' }, d.platforms.map((p) => h('option', { value: p[0], text: p[1] + (p[0] === 'flexifunnels' ? ' — Opt-ins & orders' : ' — ' + p[2]), selected: p[0] === 'flexifunnels' })));
+    const evSel = h('select', { id: 'wk-ev' }, [
+      h('option', { value: 'leads', text: 'leads (forms)' }),
+      h('option', { value: 'purchases', text: 'purchases' }),
+      h('option', { value: 'all', text: 'all events' })]);
     const dIn = h('input', { type: 'text', placeholder: 'e.g. Webinar form (FlexiFunnels)', id: 'wk-desc' });
-    const out = h('div', { style: { marginTop: 10 } });
+    const genBtn = h('button', { class: 'btn', style: { minHeight: 40 }, onclick: mk }, h('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } }, icon('key', 15), 'Generate URL'));
     const mk = async () => {
+      const cid = Number(clSel.value);
+      if (!cid) return toast('Pick a real client first', 'err');
       const r = await post('/webhooks/endpoint', {
-        client_id: Number(clSel.value), platform: plSel.value, events: evSel.value, description: dIn.value,
+        client_id: cid, platform: plSel.value, events: evSel.value, description: dIn.value,
       });
-      clear(out);
-      if (r && r.created) { showOneTimeUrl(r.created, r.created.platform); out.append(h('div', { class: 'note' }, 'Endpoint generated (copy the URL from the box).')); }
-      else { toast('Could not create endpoint', 'err'); navigate(); }
+      if (r && r.created) {
+        WK_LAST_ENDPOINT = { ...r.created, client: (d.clients.find((c) => String(c.id) === String(cid)) || {}).name || 'client ' + cid };
+        // re-render so the copy box + endpoint table both show the new URL
+        navigate();
+        toast('Webhook URL generated — copy it from the box', 'ok');
+      }
+      else toast('Could not create endpoint' + (r && r.error ? ': ' + r.error : ''), 'err');
     };
     return h('div', { style: { minWidth: 260 } },
-      h('div', { class: 'formrow' },
-        h('div', { class: 'fld' }, h('label', { text: 'Client' }), clSel),
-        h('div', { class: 'fld' }, h('label', { text: 'Platform' }), plSel),
-        h('div', { class: 'fld' }, h('label', { text: 'Events' }), evSel),
+      h('div', { class: 'formrow', style: { gap: 10 } },
+        h('div', { class: 'fld grow', style: { minWidth: 150 } }, h('label', { text: 'Client' }), clSel),
+        h('div', { class: 'fld grow', style: { minWidth: 190 } }, h('label', { text: 'Platform' }), plSel),
+        h('div', { class: 'fld', style: { minWidth: 130 } }, h('label', { text: 'Events' }), evSel),
         h('div', { class: 'fld grow' }, h('label', { text: 'Description' }), dIn),
-        h('button', { class: 'btn', onclick: mk }, 'Generate URL')),
-      out);
+        genBtn));
   }
 
   function createKeyForm(d) {
     const clSel = h('select', { id: 'ak-cl' },
-      [h('option', { value: '', text: 'workspace (all clients)' })].concat(d.clients.map((c) => h('option', { value: c.id, text: c.name }))));
-    const pmSel = h('select', { id: 'ak-pm' }, [h('option', { value: 'read_only', text: 'read-only' }), h('option', { value: 'read_write', text: 'read-write' })]);
+      [h('option', { value: '', text: 'workspace (all clients)', selected: true })].concat(d.clients.map((c) => h('option', { value: c.id, text: c.name }))));
+    const pmSel = h('select', { id: 'ak-pm' }, [h('option', { value: 'read_only', text: 'read-only', selected: true }), h('option', { value: 'read_write', text: 'read-write' })]);
     const lIn = h('input', { type: 'text', placeholder: 'label (e.g. billing scraper)', id: 'ak-lb' });
-    const out = h('div', { style: { marginTop: 10 } });
     const mk = async () => {
       const r = await post('/webhooks/key', { scope_client_id: clSel.value || null, permission: pmSel.value, label: lIn.value });
-      clear(out);
       if (r && r.created) {
-        const k = r.created;
-        const hint = h('span', { class: 'td-muted small' }, 'use it as ', h('code', {}, 'Authorization: Bearer ' + k.key.slice(0, 10) + '…'));
-        out.append(h('div', {},
-          h('div', { class: 'note' }, h('b', { text: 'Copy the key now — it is shown only once (stored as a hash):' })),
-          h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 8, wordBreak: 'break-all' }, text: k.key }),
-          h('div', { class: 'row', style: { marginTop: 8, gap: 10 } },
-            h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(k.key); toast('Key copied', 'ok'); } catch {} } }, 'Copy key'),
-            hint)));
-      } else toast('Could not create key', 'err');
+        WK_LAST_KEY = { ...r.created, scope_name: clSel.value ? (d.clients.find((c) => String(c.id) === String(clSel.value)) || {}).name || 'client ' + clSel.value : 'workspace (all clients)' };
+        navigate();
+        toast('API key created — copy it now (shown only once)', 'ok');
+      } else toast('Could not create key' + (r && r.error ? ': ' + r.error : ''), 'err');
     };
     return h('div', { style: { minWidth: 260 } },
-      h('div', { class: 'formrow' },
-        h('div', { class: 'fld' }, h('label', { text: 'Scope' }), clSel),
-        h('div', { class: 'fld' }, h('label', { text: 'Permission' }), pmSel),
+      h('div', { class: 'formrow', style: { gap: 10 } },
+        h('div', { class: 'fld grow', style: { minWidth: 170 } }, h('label', { text: 'Scope' }), clSel),
+        h('div', { class: 'fld', style: { minWidth: 130 } }, h('label', { text: 'Permission' }), pmSel),
         h('div', { class: 'fld grow' }, h('label', { text: 'Label' }), lIn),
-        h('button', { class: 'btn', onclick: mk }, 'Create key')),
-      out);
+        h('button', { class: 'btn', style: { minHeight: 40 }, onclick: mk }, h('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } }, icon('key', 15), 'Create key'))));
   }
 
   function apiKeysTable(d) {

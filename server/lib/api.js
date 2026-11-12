@@ -30,12 +30,36 @@ function readSettings(tx) {
 }
 // client scoping mirrors the HTML routes: a client login is locked to its own
 // client_ids; team roles may filter with ?client=N (null = all internal).
-function scopeOf(user, p) {
+function scopeOf(user, p, tx) {
   const ids = (user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n));
   if (user.role === 'client') return { ids, filter: user.role === 'client' };
+  // v14.1: in LIVE data mode a team role's data is scoped to REAL clients
+  // (client.demo<>1) — the seed fixtures (Coach Ravi / Kaya Coach + their
+  // leads) stay hidden, matching every other live screen. A ?client= filter
+  // must name a real client or it is ignored. In demo mode the team sees all
+  // clients (the demo fixtures need them).
+  if (tx && DM.mode(tx) === DM.LIVE) {
+    const real = DM.realClientIds(tx, DM.LIVE, null);
+    const pick = p.client && real.includes(Number(p.client)) ? [Number(p.client)] : real;
+    return { ids: pick.length ? pick : null, filter: pick.length ? pick : null };
+  }
   return { ids: null, filter: p.client ? [String(p.client)] : null };
 }
 const CLIENTS_Q = (tx) => tx.all(`SELECT id, name FROM client ORDER BY id`);
+// v14.1: client pickers must list REAL clients only in live data mode.
+// The seed demo clients ("Coach Ravi — Webinar Funnel", "Kaya Coach — Workshop")
+// are marked client.demo=1 (scripts/map-real-clients.js) and their whole
+// dataset is hidden in live mode — so their names must not appear in dropdowns
+// or webhook generation. In demo mode the list is intentionally all clients
+// (the fixtures need them). Client roles get their own (real-data) clients.
+const DM = require('./datamode');
+function realClients(tx, user) {
+  if (user.role === 'client') {
+    const ids = (user.client_ids || '').split(',').map((s) => s.trim()).filter(Boolean).map((n) => Number(n));
+    return tx.all(`SELECT id, name FROM client WHERE id IN (${ids.join(',') || '0'})`);
+  }
+  return DM.clientOptions(tx, DM.mode(tx), null).map((c) => ({ id: c.id, name: c.name }));
+}
 // v14: the platform catalogue shared by the Integrations + Webhooks screens.
 const PLATFORMS = [
   ['meta_leadgen', 'Meta Lead Forms', 'Instant Form leads with ad IDs'],
@@ -92,7 +116,7 @@ const api = {
           });
 
         case 'dashboard': {
-          const { ids } = scopeOf(user, p);
+          const { ids } = scopeOf(user, p, tx);
           const set = readSettings(tx);
           const settings = { attribution_model: set.model, attribution_window_days: set.window, wasted_spend_threshold: set.threshold };
           const fp = S.funnelReport(tx, null, settings, ids);
@@ -148,9 +172,7 @@ const api = {
             sourceMix: mix,
             adPerf: ap, // full ad-performance so the dashboard's top-ads card can render
             recent,
-            clients: user.role === 'client'
-              ? CLIENTS_Q(tx).filter((c) => ids.map(String).includes(String(c.id)))
-              : CLIENTS_Q(tx),
+            clients: realClients(tx, user),
             spendTrend: spendTrendDays(tx, ids, 14),
           });
         }
@@ -166,6 +188,11 @@ const api = {
           if (q) { where += ` AND (l.phone LIKE ? OR l.email LIKE ? OR l.name LIKE ?)`; args.push('%' + q + '%', '%' + q + '%', '%' + q + '%'); }
           if (stage) { where += ` AND l.stage = ?`; args.push(stage); }
           if (client) { where += ` AND l.client_id = ?`; args.push(client); }
+          // v14.1: team views in live mode never list demo-client leads
+          if (user.role !== 'client' && DM.mode(tx) === DM.LIVE) {
+            const realIds = DM.realClientIds(tx, DM.LIVE, null);
+            where += ` AND l.client_id IN (${realIds.join(',') || '0'})`;
+          }
           const ids = String(p.ids || '').split(',').map((s) => s.trim()).filter((s) => /^\d+$/.test(s));
           if (ids.length) where += ` AND l.id IN (${ids.join(',')})`;
           const rows = tx.all(`SELECT l.*, c.name client_name,
@@ -179,7 +206,7 @@ const api = {
             stages: S.DEFAULT_STAGES,
             clients: user.role === 'client'
               ? tx.all(`SELECT id, name FROM client WHERE id IN (${scopeIds.map((n) => Number(n)).join(',') || '0'})`)
-              : CLIENTS_Q(tx),
+              : realClients(tx, user),
           });
         }
 
@@ -189,6 +216,9 @@ const api = {
           const lead = tx.get(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.id=?`, id);
           if (!lead) return err(res, 404, 'lead not found');
           if (!sec.canAccessClient(user, lead.client_id)) return err(res, 404, 'lead not found');
+          // v14.1: team roles in live mode cannot open a demo-client lead
+          if (user.role !== 'client' && DM.mode(tx) === DM.LIVE && tx.get(`SELECT demo FROM client WHERE id=?`, lead.client_id)?.demo === 1)
+            return err(res, 404, 'lead not found');
           const tps = tx.all(`SELECT * FROM touchpoint WHERE lead_id=? ORDER BY ts`, id);
           const events = tx.all(`SELECT * FROM event WHERE lead_id=? ORDER BY ts DESC`, id);
           const deals = tx.all(`SELECT * FROM deal WHERE lead_id=?`, id);
@@ -222,8 +252,13 @@ const api = {
           const mask = maskContacts(user);
           let client = p.client || '';
           if (user.role === 'client') client = String((user.client_ids || '').split(',')[0] || '');
-          const where = client ? `AND l.client_id=?` : '';
-          const args = client ? [client] : [];
+          let where = client ? `AND l.client_id=?` : '';
+          let args = client ? [client] : [];
+          // v14.1: team views in live mode never board demo-client leads
+          if (user.role !== 'client' && DM.mode(tx) === DM.LIVE) {
+            const realIds = DM.realClientIds(tx, DM.LIVE, null);
+            where += ` AND l.client_id IN (${realIds.join(',') || '0'})`;
+          }
           const stages = S.DEFAULT_STAGES;
           const columns = stages.map((s) => {
             const rows = tx.all(`SELECT l.*, c.name client_name FROM lead l LEFT JOIN client c ON c.id=l.client_id WHERE l.stage=? ${where} ORDER BY l.id DESC LIMIT 40`, s, ...args);
@@ -233,7 +268,7 @@ const api = {
             columns, client,
             clients: user.role === 'client'
               ? tx.all(`SELECT id, name FROM client WHERE id IN (${(user.client_ids || '').split(',').filter(Boolean).map((n) => Number(n)).join(',') || '0'})`)
-              : CLIENTS_Q(tx),
+              : realClients(tx, user),
             readOnly: user.role === 'client',
           });
         }
@@ -246,10 +281,21 @@ const api = {
             wasted_spend_threshold: set.threshold,
             report_from: p.from || null, report_to: p.to || null,
           };
+          // v14.1: a ?client= filter must name a REAL client in live mode,
+          // otherwise the report would mix demo data in behind a "real" filter.
           const clientFilter = String(p.client || '');
-          const scopeIds = user.role === 'client'
-            ? (user.client_ids || '').split(',').filter(Boolean)
-            : (clientFilter ? [clientFilter] : null);
+          // v14.1: in LIVE mode a team report with no filter scopes to the REAL
+          // clients (demo clients' spend stays out of the report); a ?client=
+          // filter must name a real client or it is ignored. Demo mode is
+          // unchanged (null = every client).
+          const isLive = user.role !== 'client' && DM.mode(tx) === DM.LIVE;
+          const realIds = isLive ? DM.realClientIds(tx, DM.LIVE, null) : null;
+          const filterOk = user.role === 'client' || !clientFilter || (realIds && realIds.length && realIds.includes(Number(clientFilter)));
+          let scopeIds;
+          if (user.role === 'client') scopeIds = (user.client_ids || '').split(',').filter(Boolean);
+          else if (filterOk && clientFilter) scopeIds = [clientFilter];
+          else if (isLive && realIds) scopeIds = realIds.length ? realIds : null;
+          else scopeIds = null;
           const ap = S.adPerformance(tx, settings, scopeIds);
           const fp = S.funnelReport(tx, null, settings, scopeIds);
           const waste = S.wastedSpend(ap);
@@ -259,29 +305,34 @@ const api = {
             settings, modelNames: { last_paid_click: 'Last paid click (default)', first_click: 'First click', linear: 'Linear', lead_source: 'Lead source' },
             models: ['last_paid_click', 'first_click', 'linear', 'lead_source'],
             funnel: fp, adPerf: ap, wasted: waste, sourceMix: mix, metaVsTrack: mvt,
-            clients: user.role === 'client' ? [] : CLIENTS_Q(tx),
-            clientFilter: user.role === 'client' ? null : clientFilter,
+            clients: user.role === 'client' ? [] : realClients(tx, user),
+            clientFilter: user.role === 'client' ? null : (filterOk ? clientFilter : ''),
             scopeLabel: user.role === 'client' ? 'your client' : (clientFilter ? 'selected client' : 'all clients'),
           });
         }
 
         case 'meta': {
           if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
-          const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id`)
+          // v14.1: live mode hides demo-client ad accounts (same rule as the
+          // classic Meta screen; demo mode shows the fixtures).
+          const dm = require('./datamode');
+          const live = dm.mode(tx) === dm.LIVE;
+          const demoAcct = live ? `NOT EXISTS (SELECT 1 FROM client c WHERE c.id=a.client_id AND c.demo=1)` : '1=1';
+          const accounts = tx.all(`SELECT a.*, c.name client_name FROM meta_ad_account a LEFT JOIN client c ON c.id=a.client_id WHERE ${demoAcct}`)
             .map((a) => ({ ...a, token: undefined })); // never send the token out
-          const spend = tx.all(`SELECT s.ad_id, ad.name, s.date, s.spend, s.spend_inr, s.impressions, s.clicks FROM spend_daily s LEFT JOIN meta_ad ad ON ad.id=s.ad_id ORDER BY s.date DESC LIMIT 40`);
-          const capi = tx.all(`SELECT cl.*, l.name lead_name FROM capi_log cl LEFT JOIN event e ON e.id=cl.event_row_id LEFT JOIN lead l ON l.id=e.lead_id ORDER BY cl.id DESC LIMIT 20`);
+          const spend = tx.all(`SELECT s.ad_id, ad.name, s.date, s.spend, s.spend_inr, s.impressions, s.clicks FROM spend_daily s LEFT JOIN meta_ad ad ON ad.id=s.ad_id ${live ? "WHERE NOT EXISTS (SELECT 1 FROM meta_ad_account ma WHERE ma.ad_account_id=s.ad_account_id AND EXISTS (SELECT 1 FROM client c WHERE c.id=ma.client_id AND c.demo=1))" : ''} ORDER BY s.date DESC LIMIT 40`);
+          const capi = tx.all(`SELECT cl.*, l.name lead_name FROM capi_log cl LEFT JOIN event e ON e.id=cl.event_row_id LEFT JOIN lead l ON l.id=e.lead_id ${live ? 'WHERE (l.client_id IS NULL OR l.client_id IN (SELECT id FROM client WHERE (demo IS NULL OR demo=0)))' : ''} ORDER BY cl.id DESC LIMIT 20`);
           return ok(res, { accounts, spend, capi });
         }
 
         case 'integrations': {
           if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
-          const clients = CLIENTS_Q(tx);
+          // v14.1: real clients only in live mode; demo-mode shows the fixtures.
+          const clients = realClients(tx, user);
           const cid = p.client || (clients[0] ? clients[0].id : '');
           const endpoints = tx.all(`SELECT * FROM webhook_endpoint WHERE client_id=?`, String(cid))
             .map((e) => ({ ...e, secret: String(e.secret || '').slice(0, 4) + '•••' }));
-          const log = tx.all(`SELECT * FROM webhook_log ORDER BY id DESC LIMIT 30`)
-            .map((r) => ({ ...r, raw: r.raw ? String(r.raw).slice(0, 200) : '' }));
+          const log = webhookLogRecent(tx, 30).map((r) => ({ ...r, raw: r.raw ? String(r.raw).slice(0, 200) : '' }));
           return ok(res, { platforms: PLATFORMS, clients, cid: String(cid), endpoints, log });
         }
 
@@ -290,14 +341,17 @@ const api = {
           // inbound token-URL endpoints + the app's bearer API keys.
           if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
           const W = require('./webhooks');
-          const { ids } = scopeOf(user, p); // team roles: ids null = all clients
+          // v14.1: live mode scopes endpoints to REAL clients (the demo
+          // "Coach Ravi / Kaya Coach" endpoint rows stay hidden); demo mode
+          // still shows everything (the fixtures need them).
+          const { ids } = scopeOf(user, p, tx);
           const endpoints = W.listEndpoints(tx, ids);
           const apikeys = W.listApiKeys(tx, null).map((k) => ({
             ...k,
-            scope_name: k.scope_client_id ? (CLIENTS_Q(tx).find((c) => String(c.id) === String(k.scope_client_id)) || {}).name || ('client ' + k.scope_client_id) : 'workspace (all clients)',
+            scope_name: k.scope_client_id ? (tx.get(`SELECT name FROM client WHERE id=?`, Number(k.scope_client_id))?.name || 'client ' + k.scope_client_id) : 'workspace (all clients)',
           }));
-          // recent inbound log (last 30) so the screen shows activity per endpoint
-          const log = tx.all(`SELECT * FROM webhook_log ORDER BY id DESC LIMIT 30`)
+          // recent inbound log (last 30, demo-client rows hidden in live mode)
+          const log = webhookLogRecent(tx, 30)
             .map((r) => ({ ...r, raw: r.raw ? String(r.raw).slice(0, 200) : '' }));
           // public base for generated URLs: APP_URL / XACQORA_PUBLIC_URL when set
           // (production Vercel domain); otherwise the host the request came from
@@ -310,7 +364,7 @@ const api = {
           for (const r of fmRows) { try { fieldMaps[r.client_id] = JSON.parse(r.mapping || '{}'); } catch {} }
           return ok(res, {
             endpoints, apikeys, log,
-            clients: CLIENTS_Q(tx),
+            clients: realClients(tx, user),
             base,
             baseIsProd: !!(process.env.APP_URL || process.env.XACQORA_PUBLIC_URL),
             platforms: PLATFORMS,
@@ -357,7 +411,7 @@ const api = {
             weekly = S.weeklySummary(tx, { attribution_model: set.model, attribution_window_days: set.window }, [cid]);
             hasPdf = !!tx.get(`SELECT 1 FROM settings WHERE key=?`, 'weekly_pdf_client_' + cid)?.value;
           }
-          return ok(res, { cid: String(cid), clients: CLIENTS_Q(tx), leads, weekly, hasPdf, readOnly: user.role === 'client' });
+          return ok(res, { cid: String(cid), clients: realClients(tx, user), leads, weekly, hasPdf, readOnly: user.role === 'client' });
         }
 
         case 'pilot': {
@@ -370,7 +424,7 @@ const api = {
           return ok(res, {
             gates: g, allPass: g.pass, timing,
             lastAccuracy: lastAcc ? lastAcc.detail : null,
-            clients: CLIENTS_Q(tx), urlCheck,
+            clients: realClients(tx, user), urlCheck,
           });
         }
 
@@ -651,8 +705,10 @@ function spendTrendDays(tx, ids, days) {
     ? `WHERE s.ad_id IN (SELECT a.id FROM meta_ad a JOIN meta_adset as_ ON as_.id=a.adset_id WHERE as_.ad_account_id IN (SELECT ad_account_id FROM meta_ad_account WHERE client_id IN (${ids.map((n) => Number(n)).join(',')})))`
     : '';
   const since = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10);
+  // v14.1: the table needed the `s` alias the moment `ids` is non-empty (live
+  // team scope) — before, team ids were always null so `s.ad_id` never ran.
   const rows = tx.all(`SELECT date, COALESCE(SUM(spend_inr),0) spend, COALESCE(SUM(clicks),0) clicks,
-      COALESCE(SUM(impressions),0) impressions FROM spend_daily ${where}
+      COALESCE(SUM(impressions),0) impressions FROM spend_daily s ${where}
       ${where ? 'AND' : 'WHERE'} date >= ?
     GROUP BY date ORDER BY date`, since);
   // fill missing days so the chart x-axis is continuous
@@ -669,6 +725,16 @@ function adCard(meta, tp) {
   if (!meta) return null;
   return { name: meta.name, status: meta.status, creative: meta.creative_img || '', campaign: tp ? (tp.utm_campaign || '') : '' };
 }
+// v14.1: recent webhook_log rows, hiding demo-client rows in live mode
+// (the seed test events for "Coach Ravi / Kaya Coach" stay out of the log).
+function webhookLogRecent(tx, limit) {
+  const live = DM.mode(tx) === DM.LIVE;
+  const where = live
+    ? `WHERE (client_id IS NULL OR client_id IN (SELECT id FROM client WHERE demo IS NULL OR demo=0))`
+    : '';
+  return tx.all(`SELECT * FROM webhook_log ${where} ORDER BY id DESC LIMIT ?`, limit);
+}
+
 // v14: build the lead's "source card" — where the lead came from.
 //   1. ad-driven (xt.js touchpoint with an ad_id) -> the Meta ad creative
 //   2. UTM-driven (FlexiFunnels form captured utm_* / page_url) -> the ad

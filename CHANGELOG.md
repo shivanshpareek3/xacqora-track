@@ -2,6 +2,46 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-12 (v14.1: real clients only in live mode + prominent webhook generation)
+
+User pushback on the v14 screen: it still listed the SEED demo clients
+("Coach Ravi — Webinar Funnel", "Kaya Coach — Workshop") and their old
+`/api/ingest/...` endpoint rows, and the "generate a webhook" flow was
+buried (form inside the endpoint table header, URL only in a modal). The
+dev DB now has 6 real clients (Abhishek pal … Piyush ahuja) and the app
+runs in live mode (`DATA_MODE=live`), so the seed clients were just
+never filtered out of the SPA's client lists.
+
+Fix:
+- `server/lib/api.js`: new `realClients(tx, user)` — team roles get
+  `datamode.clientOptions` (demo-flag-aware: live mode drops
+  `client.demo=1` rows, demo mode keeps the fixtures); used by every SPA
+  client picker (`dashboard`, `leads`, `pipeline`, `reports`,
+  `integrations`, `webhooks`, `duplicates`, `portal`, `pilot`).
+- `scopeOf(user, p, tx)` is live-aware: a team role's team-scope ids are
+  the REAL client ids in live mode (invalid `?client=` ignored), so the
+  dashboard KPIs/funnel/recent-leads + the webhooks endpoint list + the
+  inbound log all exclude demo-client data in live mode; demo mode is
+  byte-identical to before.
+- `leads` / `lead` / `pipeline` / `meta` (accounts, spend, CAPI log) /
+  `webhook_log` (both screens) hide demo-client rows for team roles in
+  live mode. A team role can no longer open a demo-client lead (404).
+- Latent SQL bug surfaced + fixed: `spendTrendDays` referenced `s.ad_id`
+  while `FROM spend_daily` had no alias — it only "worked" because team
+  `ids` used to be null; now that live scoping passes ids, the alias is
+  required. (`api.js` `spendTrendDays`.)
+- Screen rework (`public/app/app.js`): a prominent top-of-page
+  "Generate a webhook URL" card (real-client picker + platform defaulting
+  to FlexiFunnels + event scope + a big Generate button). The generated
+  URL lands in a green copy-box directly under the form (also used for
+  Rotate + API-key creation), not just a modal. Endpoint table +
+  FlexiFunnels guide + field mapping + API keys below.
+
+Tests: `test/webhook-keys.js` + all in-process suites green (SPA 42/42,
+security, isolation, gates, metalive, reports). Live/demo sanity vs a
+scratch copy of the dev DB: live = real-only everywhere, demo =
+fixtures intact. Socket suites (replay/sweep) still need the sweep host.
+
 ## 2026-11-06 (v14: Webhooks & API Keys screen + FlexiFunnels live-lead pipeline)
 
 The user's ask: a team-only "Webhooks & API Keys" tab where they can generate
