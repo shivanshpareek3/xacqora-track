@@ -21,6 +21,10 @@ xacqora.sqlite3.bak
 node_modules/
 tmp/
 git/
+# Claude app scratch (local dev launch config + write cache — never commit)
+.claude/
+# 0-byte leftover from an early run; the real dev DB is xacqora.sqlite3 (ignored above)
+xacqora.sqlite
 backups/
 # pilot cutover handover (v13): real secrets/credentials/CSVs land here, never committed
 pilot-intake/*
