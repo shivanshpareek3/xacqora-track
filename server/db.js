@@ -59,6 +59,18 @@ function open() {
     sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS app_spend DOUBLE PRECISION NOT NULL DEFAULT 0`);
     sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS meta_spend DOUBLE PRECISION NOT NULL DEFAULT 0`);
     sys.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN IF NOT EXISTS currency TEXT`);
+    // v14 (Webhooks & API Keys): token-in-URL inbound endpoint columns +
+    // lifecycle fields. Pre-v14 DBs only have client_id/platform/url/secret.
+    for (const c of [
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS slug TEXT`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS token_hash TEXT`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS description TEXT`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS events TEXT DEFAULT 'all'`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS events_total INTEGER DEFAULT 0`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS last_event_at TEXT`,
+      `ALTER TABLE webhook_endpoint ADD COLUMN IF NOT EXISTS created_at TEXT`,
+    ]) sys.exec(c);
     setScope(sys, null); // system default: see every row
 
     const scopedCache = new Map();
@@ -132,6 +144,28 @@ function open() {
   if (!macc.includes('app_spend')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN app_spend REAL NOT NULL DEFAULT 0`);
   if (!macc.includes('meta_spend')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN meta_spend REAL NOT NULL DEFAULT 0`);
   if (!macc.includes('currency')) db.exec(`ALTER TABLE meta_accuracy_check ADD COLUMN currency TEXT`);
+  // v14 (Webhooks & API Keys): token-in-URL inbound endpoint columns +
+  // lifecycle fields, and the api_keys credential store (hash-only).
+  const we = cols('webhook_endpoint');
+  const weCols = [
+    [`slug`, `ALTER TABLE webhook_endpoint ADD COLUMN slug TEXT`],
+    [`token_hash`, `ALTER TABLE webhook_endpoint ADD COLUMN token_hash TEXT`],
+    [`description`, `ALTER TABLE webhook_endpoint ADD COLUMN description TEXT`],
+    [`events`, `ALTER TABLE webhook_endpoint ADD COLUMN events TEXT DEFAULT 'all'`],
+    [`status`, `ALTER TABLE webhook_endpoint ADD COLUMN status TEXT DEFAULT 'active'`],
+    [`events_total`, `ALTER TABLE webhook_endpoint ADD COLUMN events_total INTEGER DEFAULT 0`],
+    [`last_event_at`, `ALTER TABLE webhook_endpoint ADD COLUMN last_event_at TEXT`],
+    [`created_at`, `ALTER TABLE webhook_endpoint ADD COLUMN created_at TEXT`],
+  ];
+  for (const [name, ddl] of weCols) if (!we.includes(name)) db.exec(ddl);
+  db.exec(`CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY, scope_client_id INTEGER, label TEXT,
+    permission TEXT DEFAULT 'read_only',
+    key_hash TEXT NOT NULL,
+    created_by TEXT, created_at TEXT DEFAULT (datetime('now')),
+    last_used_at TEXT, revoked_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_apikey_hash ON api_keys(key_hash)`);
   db.exec(`CREATE TABLE IF NOT EXISTS tfa_pending (
     user_id INTEGER PRIMARY KEY REFERENCES user(id),
     totp_secret TEXT NOT NULL,

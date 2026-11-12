@@ -1,0 +1,15 @@
+{
+  "data": {
+    "form_title": "Webinar opt-in",
+    "form_id": "ff-form-7788",
+    "name": "Flexi Form Lead",
+    "phone": "+91 98100 55667",
+    "email": "flexi.lead@example.com",
+    "city": "Jaipur",
+    "page_url": "https://funnels.example.com/webinar?utm_source=facebook&utm_medium=paid&utm_campaign=webinar-spring",
+    "utm_source": "facebook",
+    "utm_medium": "paid",
+    "utm_campaign": "webinar-spring",
+    "created_at": "2026-11-05T09:12:00.000Z"
+  }
+}

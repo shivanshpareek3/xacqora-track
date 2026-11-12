@@ -311,7 +311,8 @@ function dashboard(db, user, p) {
     <div class="card"><h2>Funnel <span class="badge">${win === 'd7' ? '7' : '30'}d</span></h2>${funnelBars}
       <div class="small muted">Attribution: <b>${S.esc(settings.attribution_model)}</b> · window ${settings.attribution_window_days}d · revenue net of refunds.</div></div>
     <div class="card"><h2>Recent leads</h2>
-      <div class="tabwrap"><table>${recentRows || `<tr><td class="muted">${dataMode === 'live' ? 'No leads yet (pilot live)' : 'No leads'}</td></tr>`}</table></div></div>
+      <div class="tabwrap"><table>${recentRows || `<tr><td class="muted">${dataMode === 'live' ? 'No leads yet — connect a webhook (Webhooks & API Keys) and your first FlexiFunnels form lands here' : 'No leads'}</td></tr>`}</table></div>
+      <div class="row" style="margin-top:8px"><a class="small" href="/app/#/webhooks">Generate webhook URLs / API keys →</a></div></div>
   </div>`;
   return S.layout({
     title: 'Dashboard', nav: S.navFor(user), active: 'dashboard.html', user, body,
@@ -765,6 +766,8 @@ function integrations(db, user, p) {
   <div class="card"><h2>Platform adapters <span class="badge">each lands events on the right lead within 1 minute</span></h2>
     <div class="grid g3">${PLATFORMS.map((x) => `<div class="kpi"><div class="l">${S.esc(x[1])}</div><div class="small muted">${S.esc(x[2])}</div></div>`).join('')}</div>
     <div class="note">Where a platform has no direct webhook it is routed through Pabbly first. Every platform has a test button that sends a fake event and shows where it landed.</div>
+    <div class="row" style="margin-top:10px;gap:8px"><a class="btn sm sec" href="/app/#/webhooks">Webhooks &amp; API Keys →</a>
+      <span class="small muted">generate token-in-URL endpoints (FlexiFunnels form + purchase) and xak_ API keys in the app UI</span></div>
   </div>
   <div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Webhooks for client</h2>
     <form method="get" class="inline" action="/integrations.html">

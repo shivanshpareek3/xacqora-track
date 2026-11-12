@@ -124,8 +124,28 @@ CREATE TABLE IF NOT EXISTS call_log (
 CREATE TABLE IF NOT EXISTS webhook_endpoint (
   id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES client(id),
   platform TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+  -- v14 (Webhooks & API Keys): token-in-URL inbound endpoints + lifecycle
+  slug TEXT,                    -- readable segment: /webhooks/<platform>/<slug>/<token>
+  token_hash TEXT,              -- sha256 of the generated URL token (auth + lookup)
+  description TEXT,             -- e.g. "FlexiFunnels form: Webinar opt-in"
+  events TEXT DEFAULT 'all',    -- event scope: 'all' | 'leads' | 'purchases'
+  status TEXT DEFAULT 'active', -- 'active' | 'paused' | 'revoked'
+  events_total INTEGER DEFAULT 0,
+  last_event_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
   UNIQUE(client_id, platform, url)
 );
+-- v14: outbound-agnostic app API keys (bearer auth on /api/app/*).
+-- Plain text is shown ONCE at creation; only the hash is stored.
+-- scope_client_id NULL = workspace-level (read-only access to all internal clients).
+CREATE TABLE IF NOT EXISTS api_keys (
+  id INTEGER PRIMARY KEY, scope_client_id INTEGER, label TEXT,
+  permission TEXT DEFAULT 'read_only',   -- 'read_only' | 'read_write'
+  key_hash TEXT NOT NULL,               -- sha256 of the xak_... key (unique)
+  created_by TEXT, created_at TEXT DEFAULT (datetime('now')),
+  last_used_at TEXT, revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apikey_hash ON api_keys(key_hash);
 CREATE TABLE IF NOT EXISTS webhook_log (
   id INTEGER PRIMARY KEY, client_id INTEGER, platform TEXT NOT NULL,
   ref TEXT, dedup_key TEXT, status TEXT DEFAULT 'received',

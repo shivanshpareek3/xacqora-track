@@ -221,6 +221,94 @@ function logIngest(tx, platform, clientId, status, error, raw, ref, test) {
   return info;
 }
 
+// v14: the public token-URL path (POST /webhooks/<platform>/<slug>/<token>).
+// The token authenticates the endpoint row (resolveByToken), then the same
+// enqueue + log + rate-limit flow as /api/ingest. The `events` scope on the
+// endpoint ('all' | 'leads' | 'purchases') filters which event families this
+// URL carries — so a form-webhook and a purchase-webhook can coexist on one
+// client+platform without cross-posting.
+async function handleTokenWebhook(platform, token, res, bodyJson, raw, req) {
+  const tx = makeTx(db, null);
+  const W = require('./lib/webhooks');
+  const found = token ? W.resolveByToken(tx, platform, token) : null;
+  if (!found) {
+    logIngest(tx, platform, 0, 'failed', 'unknown webhook token', raw, null, false);
+    json(res, { ok: false, error: 'unknown webhook endpoint' }, 404);
+    return;
+  }
+  const ep = found.row;
+  if (ep.status === 'revoked') {
+    logIngest(tx, platform, ep.client_id, 'failed', 'endpoint revoked', raw, null, false);
+    json(res, { ok: false, error: 'endpoint revoked' }, 410);
+    return;
+  }
+  if (ep.status === 'paused') {
+    // paused = accept-and-ignore (FlexiFunnels keeps retrying); count it so the
+    // screen shows the pause is actually holding traffic.
+    W.recordEvent(tx, ep.id);
+    logIngest(tx, platform, ep.client_id, 'paused', 'endpoint paused: event not processed', raw, null, false);
+    json(res, { ok: true, paused: true });
+    return;
+  }
+  // per-IP + per-endpoint rate limit (same limits as /api/ingest)
+  const ip = req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim()
+    : (req.socket && req.socket.remoteAddress) || 'unknown';
+  const perIp = sec.rateLimit('ip:' + ip, Number(process.env.XT_RATE_PER_MIN_IP) || 600, Date.now());
+  if (perIp.limited) {
+    json429(res, 'rate limited (per-IP)');
+    logIngest(tx, platform, ep.client_id, 'rate_limited', 'per-IP flood guard', raw, null, false);
+    return;
+  }
+  const perEnd = sec.rateLimit('wep:' + ep.id, Number(process.env.XT_RATE_PER_MIN_ENDPOINT) || 300, Date.now());
+  if (perEnd.limited) {
+    json429(res, 'rate limited (per-endpoint)');
+    logIngest(tx, platform, ep.client_id, 'rate_limited', 'per-endpoint window', raw, null, false);
+    return;
+  }
+  const map = epMap(tx, ep.client_id, platform);
+  const test = bodyJson?.__test === true;
+  if (bodyJson?.__sweep_test === true) {
+    logIngest(tx, platform, ep.client_id, 'test', '__sweep_test marker: logged only, no lead', raw, null, true);
+    json(res, { ok: true, client_id: ep.client_id, queued: false, sweep_test: true });
+    return;
+  }
+  // events scope filter: 'leads' -> form_submit / registered / webinar types;
+  // 'purchases' -> payment / checkout / refund types. 'all' -> pass through.
+  const family = eventFamilyFor(platform, bodyJson);
+  const scope = ep.events || 'all';
+  if (scope !== 'all' && family && family !== scope) {
+    // out-of-scope event: log it (so the operator sees it arrived) but do not
+    // enqueue it for this URL.
+    logIngest(tx, platform, ep.client_id, 'skipped_scope', 'event ' + family + ' not in scope ' + scope, raw, null, false);
+    W.recordEvent(tx, ep.id);
+    json(res, { ok: true, skipped: true, reason: 'out-of-scope event' });
+    return;
+  }
+  try {
+    const jobPayload = {
+      platform, client_id: ep.client_id, payload: bodyJson ?? parseLoose(raw), map,
+      dedup_key: dedupKey(platform, bodyJson), test,
+      endpoint_id: ep.id,
+    };
+    enqueue(db, 'webhook', jobPayload);
+    W.recordEvent(tx, ep.id);
+    logIngest(tx, platform, ep.client_id, test ? 'test' : 'queued', null, raw, dedupKey(platform, bodyJson), test);
+    json(res, { ok: true, client_id: ep.client_id, queued: !test, endpoint_id: ep.id });
+  } catch (e) {
+    logIngest(tx, platform, ep.client_id, 'failed', String(e.message || e).slice(0, 300), raw, null, test);
+    json(res, { ok: false, error: String(e.message || e) }, 500);
+  }
+}
+// Coarse event-family hint from the raw body (best-effort, platform-agnostic).
+// A purchase-like payload carries amount/order/payment keys; everything else
+// is treated as a lead-family event. 'none' when the shape is ambiguous.
+function eventFamilyFor(platform, b) {
+  if (!b || typeof b !== 'object') return 'none';
+  const p = b.data || b.payload || b.event || b;
+  const purchase = p.order_id || p.transaction_id || p.payment_status != null || (p.amount != null && !p.phone && !p.email);
+  return purchase ? 'purchases' : 'leads';
+}
+
 // tracker path (xt.js): touchpoint + optional form_submit that reveals identity
 function processTrackerEvent(tx, kind, b, client_id) {
   if (!b) return;
@@ -298,14 +386,62 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // ---------- Phase F: JSON API for the SPA. Cookie-authenticated,
-    // role-aware + RLS-scoped (lib/api.js). The HTML routes above stay the
-    // fallback and render the same data.
+    // ---------- Phase F: JSON API for the SPA. Cookie-authenticated (session
+    // role-aware + RLS-scoped, lib/api.js) OR v14: Bearer API key. The HTML
+    // routes above stay the fallback and render the same data.
     if (u.pathname.startsWith('/api/app/')) {
       const app = require('./lib/api');
       const { json: body } = method === 'POST' ? await parseBody(req) : { json: null };
-      if (method === 'GET') app.api.get(u, db, user, res);
-      else if (method === 'POST') app.api.post(u, body, db, user, res, req);
+      // v14 API-key auth: Authorization: Bearer xak_... or X-API-Key: xak_...
+      // A verified key resolves to a scoped synthetic user (team role + the
+      // key's client scope); read_only keys are GET-only. Session-cookie auth
+      // still works first when a cookie is present (the app UI path).
+      let keyUser = null, keyObj = null;
+      if (!user) {
+        const auth = req.headers['authorization'] || '';
+        let provided = '';
+        if (auth.toLowerCase().startsWith('bearer ')) provided = auth.slice(7).trim();
+        if (!provided) provided = String(req.headers['x-api-key'] || '').trim();
+        if (provided) {
+          const W = require('./lib/webhooks');
+          const check = W.verifyApiKey(makeTx(db, null), provided);
+          if (check.ok) {
+            keyObj = check.key;
+            // Scope -> synthetic role: a workspace-level key (scope NULL) maps
+            // to an owner-scoped user (RLS unrestricted); a client-scoped key
+            // maps to a CLIENT login locked to that client (pg RLS + api.js
+            // scoping both honor client_ids), so a key can never read another
+            // client's data even with read_write permission.
+            const scoped = keyObj.scope_client_id != null;
+            keyUser = {
+              id: 0, email: 'api-key-' + keyObj.id + '@xacqora.local', name: 'API Key: ' + (keyObj.label || ('#' + keyObj.id)),
+              role: scoped ? 'client' : 'owner',
+              client_ids: scoped ? String(keyObj.scope_client_id) : '',
+              clientNames: scoped ? [] : 'all',
+              _apiKey: keyObj,
+            };
+            audit(db, keyUser, 'apikey.use', 'api_keys', String(keyObj.id), method + ' ' + u.pathname);
+          }
+        }
+      }
+      const actor = user || keyUser;
+      if (!actor) {
+        // unauthenticated: the same public endpoints as before (health/me) else 401
+        const appm = u.pathname.split('/').filter(Boolean);
+        if (method === 'GET' && (appm[2] === 'health' || appm[2] === 'me')) {
+          if (method === 'GET') app.api.get(u, db, null, res);
+          return;
+        }
+        json(res, { ok: false, error: 'sign in first (cookie or a valid xak_ API key)' }, 401);
+        return;
+      }
+      // a read_only API key may only GET (no mutations)
+      if (!user && actor._apiKey && actor._apiKey.permission !== 'read_write' && method !== 'GET') {
+        json(res, { ok: false, error: 'read-only API key: write not allowed' }, 403);
+        return;
+      }
+      if (method === 'GET') app.api.get(u, db, actor, res);
+      else if (method === 'POST') app.api.post(u, body, db, actor, res, req);
       else { res.writeHead(405, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'method not allowed' })); }
       return;
     }
@@ -351,6 +487,25 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // ---------- v14: token-in-URL inbound webhooks (FlexiFunnels etc.) ----------
+    // POST /webhooks/<platform>/<slug>/<token> — the URL generated on the
+    // "Webhooks & API Keys" screen. The URL token is the endpoint's primary
+    // auth (FlexiFunnels sends no signature; PRD rule: "signature OR secret").
+    // Paused endpoints accept-but-ignore; revoked ones 410. Same queue +
+    // webhook_log + per-IP / per-endpoint rate limit as /api/ingest.
+    if (u.pathname.startsWith('/webhooks/') && method === 'POST') {
+      const platform = parts[1];
+      const token = parts[3] || '';
+      const { json: body, raw } = await parseBody(req);
+      await handleTokenWebhook(platform, token, res, body, raw, req);
+      return;
+    }
+    if (u.pathname.startsWith('/webhooks/') && method === 'GET') {
+      // FlexiFunnels / Pabbly sometimes GET-probe the URL ("verify endpoint"):
+      // answer 200 JSON so they mark the webhook live without enqueuing.
+      json(res, { ok: true, service: 'Xacqora Track', method: 'POST only' });
+      return;
+    }
     // ---------- public ingest ----------
     if (u.pathname.startsWith('/api/ingest/') && method === 'POST') {
       const platform = parts[2];

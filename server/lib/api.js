@@ -36,6 +36,17 @@ function scopeOf(user, p) {
   return { ids: null, filter: p.client ? [String(p.client)] : null };
 }
 const CLIENTS_Q = (tx) => tx.all(`SELECT id, name FROM client ORDER BY id`);
+// v14: the platform catalogue shared by the Integrations + Webhooks screens.
+const PLATFORMS = [
+  ['meta_leadgen', 'Meta Lead Forms', 'Instant Form leads with ad IDs'],
+  ['tagmango', 'TagMango', 'Course / workshop purchases'],
+  ['razorpay', 'Razorpay', 'Payments'], ['cashfree', 'Cashfree', 'Payments'],
+  ['cosmofeed', 'Cosmofeed', 'Purchases'], ['aevent', 'Aevent', 'Webinar registration & attendance'],
+  ['zoom', 'Zoom', 'Webinar registration & attendance'], ['calendly', 'Calendly', 'Booked / cancelled calls'],
+  ['flexifunnels', 'FlexiFunnels', 'Opt-ins & orders'], ['pabbly', 'Pabbly Connect', 'Anything + WhatsApp flows'],
+  ['whatsapp', 'WhatsApp (WATI/Interakt/AiSensy)', 'Messages sent & replies'],
+  ['google_sheets', 'Google Sheets / CSV', 'Old leads & sales backfill'],
+];
 
 function err(res, code, msg) {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -90,17 +101,48 @@ const api = {
           const totalLeads = ids
             ? tx.get(`SELECT COUNT(*) c FROM lead WHERE client_id IN (${ids.map((n) => Number(n)).join(',')})`)?.c || 0
             : tx.get(`SELECT COUNT(*) c FROM lead`)?.c || 0;
+          // v14: new-leads KPI (today / last 7d) — the dashboard previously had
+          // no lead-rate number, only the lifetime total. The threshold uses a
+          // SPACE-form midnight string: it is a strict lower bound on BOTH the
+          // SQLite default (datetime('now') -> "YYYY-MM-DD HH:MM:SS") and the PG
+          // default ("YYYY-MM-DDTHH:MM:SSZ"), so the count is engine-identical.
+          const midnight = (ms) => new Date(ms).toISOString().slice(0, 10) + ' 00:00:00';
+          const leadCount = (sinceMs) => {
+            let w = `WHERE created_at >= ?`; const args = [midnight(sinceMs)];
+            if (ids && ids.length) { w += ` AND client_id IN (${ids.map((n) => Number(n)).join(',')})`; }
+            return tx.get(`SELECT COUNT(*) c FROM lead ${w}`, ...args)?.c || 0;
+          };
+          const leadsToday = leadCount(Date.now());
+          const leads7d = leadCount(Date.now() - 6 * 86400000);
           const mask = maskContacts(user);
           const recentWhere = ids ? `WHERE l.client_id IN (${ids.map((n) => Number(n)).join(',')})` : '';
-          const recent = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
-            FROM lead l LEFT JOIN client c ON c.id=l.client_id ${recentWhere} ORDER BY l.id DESC LIMIT 8`)
-            .map((r) => ({ ...r, phone: mask.phone(r.phone), email: mask.email(r.email) }));
+          const recentRows = tx.all(`SELECT l.id, l.name, l.phone, l.email, l.stage, l.client_id, l.created_at, c.name client_name
+            FROM lead l LEFT JOIN client c ON c.id=l.client_id ${recentWhere} ORDER BY l.id DESC LIMIT 8`);
+          // source + form-title for the mini-table: the newest event on each
+          // lead carries the webhook's platform + (for FlexiFunnels) the form
+          // title / page URL / UTM. A lead with zero events = manual / organic.
+          const recent = recentRows.map((r) => {
+            const out = { ...r, phone: mask.phone(r.phone), email: mask.email(r.email), source: null, form_title: null, page_url: null, utm_source: null };
+            const ev = tx.get(`SELECT type, source_platform, raw_payload FROM event WHERE lead_id=? ORDER BY id DESC LIMIT 1`, r.id);
+            if (ev) {
+              out.source = ev.source_platform || null;
+              try {
+                const pp = JSON.parse(ev.raw_payload || '{}');
+                const d = pp.data || pp;
+                out.form_title = d.form_title || d.form_name || null;
+                out.page_url = d.page_url || d.landing_url || null;
+                out.utm_source = d.utm_source || null;
+              } catch { /* payload not JSON (rare) */ }
+            }
+            return out;
+          });
           return ok(res, {
             settings,
             kpis: {
               totalLeads, showUp: fp.show_up_rate, close: fp.close_rate,
               cpl: fp.cpl, revenue: fp.revenue, spend: fp.spend,
               roas: ap.total.roas, profit: ap.total.profit,
+              leadsToday, leads7d,
             },
             funnel: { steps: fp, attributed: fp.attribution.attributed, organic: fp.attribution.organic },
             sourceMix: mix,
@@ -157,6 +199,10 @@ const api = {
           const adMeta = (a) => a ? tx.get(`SELECT * FROM meta_ad WHERE id=?`, a.ad_id) || null : null;
           const firstMeta = adMeta(adTps[0]), lastMeta = adMeta(adTps[adTps.length - 1]);
           const totalPaid = deals.filter((d) => d.status === 'success' && !d.refunded_at).reduce((a, b) => a + b.amount, 0);
+          // v14: source card for the lead timeline — the ad/form that brought
+          // this lead in. FlexiFunnels pages don't run xt.js, so the ad
+          // attribution is UTM captured on the form (page_url + utm_* fields).
+          const sourceCard = buildSourceCard(tx, id, tps, adTps, adMeta);
           return ok(res, {
             lead: { ...lead, phone: mask.phone(lead.phone), email: mask.email(lead.email) },
             stages: S.DEFAULT_STAGES,
@@ -166,6 +212,7 @@ const api = {
               last: adCard(lastMeta, adTps[adTps.length - 1]),
               clicks: adTps.length,
             },
+            sourceCard,
             events, deals, notes, tasks, calls, totalPaid,
             readOnly: user.role === 'client',
           });
@@ -229,16 +276,6 @@ const api = {
 
         case 'integrations': {
           if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
-          const PLATFORMS = [
-            ['meta_leadgen', 'Meta Lead Forms', 'Instant Form leads with ad IDs'],
-            ['tagmango', 'TagMango', 'Course / workshop purchases'],
-            ['razorpay', 'Razorpay', 'Payments'], ['cashfree', 'Cashfree', 'Payments'],
-            ['cosmofeed', 'Cosmofeed', 'Purchases'], ['aevent', 'Aevent', 'Webinar registration & attendance'],
-            ['zoom', 'Zoom', 'Webinar registration & attendance'], ['calendly', 'Calendly', 'Booked / cancelled calls'],
-            ['flexifunnels', 'FlexiFunnels', 'Opt-ins & orders'], ['pabbly', 'Pabbly Connect', 'Anything + WhatsApp flows'],
-            ['whatsapp', 'WhatsApp (WATI/Interakt/AiSensy)', 'Messages sent & replies'],
-            ['google_sheets', 'Google Sheets / CSV', 'Old leads & sales backfill'],
-          ];
           const clients = CLIENTS_Q(tx);
           const cid = p.client || (clients[0] ? clients[0].id : '');
           const endpoints = tx.all(`SELECT * FROM webhook_endpoint WHERE client_id=?`, String(cid))
@@ -246,6 +283,39 @@ const api = {
           const log = tx.all(`SELECT * FROM webhook_log ORDER BY id DESC LIMIT 30`)
             .map((r) => ({ ...r, raw: r.raw ? String(r.raw).slice(0, 200) : '' }));
           return ok(res, { platforms: PLATFORMS, clients, cid: String(cid), endpoints, log });
+        }
+
+        case 'webhooks': {
+          // v14: Webhooks & API Keys screen (team-only). Two sections:
+          // inbound token-URL endpoints + the app's bearer API keys.
+          if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
+          const W = require('./webhooks');
+          const { ids } = scopeOf(user, p); // team roles: ids null = all clients
+          const endpoints = W.listEndpoints(tx, ids);
+          const apikeys = W.listApiKeys(tx, null).map((k) => ({
+            ...k,
+            scope_name: k.scope_client_id ? (CLIENTS_Q(tx).find((c) => String(c.id) === String(k.scope_client_id)) || {}).name || ('client ' + k.scope_client_id) : 'workspace (all clients)',
+          }));
+          // recent inbound log (last 30) so the screen shows activity per endpoint
+          const log = tx.all(`SELECT * FROM webhook_log ORDER BY id DESC LIMIT 30`)
+            .map((r) => ({ ...r, raw: r.raw ? String(r.raw).slice(0, 200) : '' }));
+          // public base for generated URLs: APP_URL / XACQORA_PUBLIC_URL when set
+          // (production Vercel domain); otherwise the host the request came from
+          // (localhost in dev — the screen shows a notice that localhost URLs
+          // are not reachable by FlexiFunnels and a prod domain is required).
+          const base = process.env.APP_URL || process.env.XACQORA_PUBLIC_URL || u.origin;
+          // saved FlexiFunnels field-mappings per client (for the editor's reload)
+          const fmRows = tx.all(`SELECT client_id, platform, mapping FROM field_map WHERE platform IN ('flexifunnels','razorpay','cashfree')`);
+          const fieldMaps = {};
+          for (const r of fmRows) { try { fieldMaps[r.client_id] = JSON.parse(r.mapping || '{}'); } catch {} }
+          return ok(res, {
+            endpoints, apikeys, log,
+            clients: CLIENTS_Q(tx),
+            base,
+            baseIsProd: !!(process.env.APP_URL || process.env.XACQORA_PUBLIC_URL),
+            platforms: PLATFORMS,
+            fieldMaps,
+          });
         }
 
         case 'duplicates': {
@@ -461,6 +531,89 @@ const api = {
           return err(res, 404, 'unknown endpoint');
         }
 
+        case 'webhooks': {
+          // v14: create / pause / revoke / delete inbound endpoints + API keys.
+          if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
+          const W = require('./webhooks');
+          const tx2 = require('../db').makeTx(db, user); // RLS-scoped (team = all clients)
+          const base = process.env.APP_URL || process.env.XACQORA_PUBLIC_URL || u.origin;
+          if (seg[1] === 'endpoint') {
+            const cid = Number(body.client_id);
+            const platform = String(body.platform || '');
+            if (!cid || !platform) return err(res, 400, 'client_id + platform required');
+            const row = W.createEndpoint(tx2, { client_id: cid, platform, description: body.description, events: body.events, base });
+            audit(db, user, 'webhook.create_endpoint', 'webhook_endpoint', String(row.id), `${platform} · ${row.description || ''}`);
+            // return the ONE-TIME url + token (the UI shows it with a copy box,
+            // then the user pastes it into FlexiFunnels / the gateway).
+            return ok(res, { ok: true, created: { ...row, url: row.url, token: row.token, secret: row.secretPlain } });
+          }
+          if (seg[1] === 'status') {
+            const id = Number(body.id); const status = String(body.status || 'active');
+            const r = W.setStatus(tx2, id, status, user);
+            if (!r) return err(res, 404, 'endpoint not found');
+            audit(db, user, 'webhook.endpoint_status', 'webhook_endpoint', String(id), status);
+            return ok(res, { ok: true, id, status: r.status });
+          }
+          if (seg[1] === 'delete') {
+            W.deleteEndpoint(tx2, Number(body.id));
+            audit(db, user, 'webhook.delete_endpoint', 'webhook_endpoint', String(body.id));
+            return ok(res, { ok: true });
+          }
+          if (seg[1] === 'key') {
+            const perm = body.permission === 'read_write' ? 'read_write' : 'read_only';
+            const k = W.createApiKey(tx2, { scope_client_id: body.scope_client_id || null, label: body.label, permission: perm, createdBy: user.email });
+            audit(db, user, 'apikey.create', 'api_keys', String(k.id), `${k.permission} · ${k.label}`);
+            // key = ONE-TIME plaintext (the UI shows it in a copy-once box)
+            return ok(res, { ok: true, created: { ...W.keyView(k), key: k.key } });
+          }
+          if (seg[1] === 'key_revoke') {
+            W.revokeApiKey(tx2, Number(body.id), user);
+            audit(db, user, 'apikey.revoke', 'api_keys', String(body.id));
+            return ok(res, { ok: true });
+          }
+          if (seg[1] === 'key_delete') {
+            W.deleteApiKey(tx2, Number(body.id));
+            audit(db, user, 'apikey.delete', 'api_keys', String(body.id));
+            return ok(res, { ok: true });
+          }
+          if (seg[1] === 'fieldmap') {
+            // save per-client, per-platform FlexiFunnels field mapping (JSON)
+            const cid = Number(body.client_id); const platform = String(body.platform || 'flexifunnels');
+            const mapping = body.mapping || {};
+            const existing = tx2.get(`SELECT mapping FROM field_map WHERE client_id=? AND platform=?`, cid, platform);
+            const mapJson = JSON.stringify(mapping);
+            if (existing) tx2.run(`UPDATE field_map SET mapping=? WHERE client_id=? AND platform=?`, mapJson, cid, platform);
+            else tx2.run(`INSERT INTO field_map (client_id, platform, mapping) VALUES (?,?,?)`, cid, platform, mapJson);
+            audit(db, user, 'fieldmap.save', 'field_map', cid + ':' + platform, Object.keys(mapping).length + ' fields');
+            return ok(res, { ok: true });
+          }
+          if (seg[1] === 'flexi_test') {
+            // POST a sample FlexiFunnels form payload through the public ingest
+            // path so the screen can prove a lead lands (the "test event" row).
+            const cid = Number(body.client_id || 1);
+            const sample = {
+              data: {
+                form_title: 'Webinar opt-in', phone: '+919999' + String(100 + cid).slice(-4),
+                email: 'flexitest' + cid + '@xacqora.local', name: 'Flexi Test Lead',
+                page_url: 'https://funnels.example.com/webinar?utm_source=facebook&utm_medium=paid&utm_campaign=webinar',
+                utm_source: 'facebook', utm_medium: 'paid', utm_campaign: 'webinar',
+              },
+            };
+            const mapRow = tx2.get(`SELECT mapping FROM field_map WHERE client_id=? AND platform='flexifunnels'`, cid);
+            const { enqueue } = require('./queue');
+            enqueue(db, 'webhook', {
+              platform: 'flexifunnels', client_id: cid, payload: sample,
+              map: mapRow ? JSON.parse(mapRow.mapping || '{}') : {}, test: true,
+              dedup_key: 'test|flexifunnels|' + cid,
+            });
+            tx2.run(`INSERT INTO webhook_log (client_id, platform, ref, status, raw, test, ingested_at) VALUES (?,?,?,?,1,?,?)`,
+              cid, 'flexifunnels', 'flexi-test-' + Date.now(), 'test', JSON.stringify(sample), new Date().toISOString());
+            audit(db, user, 'flexifunnels.test', 'webhook_log', String(cid));
+            return ok(res, { ok: true, queued: true });
+          }
+          return err(res, 404, 'unknown endpoint');
+        }
+
         case 'alerts': {
           if (!['owner', 'admin', 'media_buyer'].includes(user.role)) return forbid(res, user);
           if (seg[1] === 'meta-verify') {
@@ -515,6 +668,27 @@ function spendTrendDays(tx, ids, days) {
 function adCard(meta, tp) {
   if (!meta) return null;
   return { name: meta.name, status: meta.status, creative: meta.creative_img || '', campaign: tp ? (tp.utm_campaign || '') : '' };
+}
+// v14: build the lead's "source card" — where the lead came from.
+//   1. ad-driven (xt.js touchpoint with an ad_id) -> the Meta ad creative
+//   2. UTM-driven (FlexiFunnels form captured utm_* / page_url) -> the ad
+//      link that the form carried (ad attribution without xt.js)
+//   3. nothing -> organic / unknown
+function buildSourceCard(tx, leadId, tps, adTps, adMeta) {
+  // (1) real ad-click touchpoint
+  if (adTps && adTps.length) {
+    const meta = adMeta(adTps[0]);
+    if (meta) {
+      return { kind: 'ad', ad: meta, utm_source: adTps[0].utm_source, utm_medium: adTps[0].utm_medium, utm_campaign: adTps[0].utm_campaign, ts: adTps[0].ts };
+    }
+  }
+  // (2) UTM from a webhook-captured touchpoint (FlexiFunnels / Pabbly forms
+  //     carry utm_* hidden fields even without the pixel)
+  const utmTp = (tps || []).filter((t) => t.utm_campaign || t.utm_source || t.landing_url).slice(-1)[0];
+  if (utmTp) {
+    return { kind: 'utm', utm_source: utmTp.utm_source, utm_medium: utmTp.utm_medium, utm_campaign: utmTp.utm_campaign, landing_url: utmTp.landing_url, ts: utmTp.ts };
+  }
+  return { kind: 'organic' };
 }
 
 module.exports = { api, maskContacts, spendTrendDays, adCard };

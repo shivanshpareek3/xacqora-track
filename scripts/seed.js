@@ -90,6 +90,7 @@ function seedAll() {
   // webhook endpoints (secret stored ENCRYPTED; index.js decrypts on read)
   const epList = [
     [1, 'meta_leadgen'], [1, 'razorpay'], [1, 'aevent'], [1, 'calendly'], [1, 'whatsapp'],
+    [1, 'flexifunnels'], // v14: the live-lead pipeline's demo endpoint
     [2, 'meta_leadgen'], [2, 'cashfree'], [2, 'zoom'],
   ];
   for (const [cid, p] of epList) {

@@ -99,6 +99,18 @@ for p in admin.html integrations.html duplicates.html pilot alerts.html; do
   if [ "$code" = "200" ]; then echo "FAIL client $p is 200 (should be 403)"; FAILS=$((FAILS+1)); else echo "ok client $p -> $code (denied)"; fi
 done
 
+echo '--- v14: Webhooks & API Keys screen (team-only) + public token route ---'
+WOK=$(curl -s -b "$O" -o /tmp/xt-wh.json -w "%{http_code}" "$BASE/api/app/webhooks")
+[ "$WOK" = "200" ] && grep -q '"apikeys"' /tmp/xt-wh.json && echo "ok owner /api/app/webhooks -> 200 (carries endpoints + apikeys)" || { echo "FAIL owner /api/app/webhooks not 200/apikeys ($WOK)"; FAILS=$((FAILS+1)); }
+W403=$(curl -s -b "$C" -o /dev/null -w "%{http_code}" "$BASE/api/app/webhooks")
+[ "$W403" = "403" ] && echo "ok client /api/app/webhooks -> 403 (team-only)" || { echo "FAIL client /api/app/webhooks -> $W403 (expect 403)"; FAILS=$((FAILS+1)); }
+# public token-in-URL route: a made-up FlexiFunnels token must 404 (FlexiFunnels
+# can only reach this URL via a public domain / tunnel — never the sweep host).
+T404=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d '{"data":{"phone":"+919999000011"}}' "$BASE/webhooks/flexifunnels/demo/$(printf '0%.0s' $(seq 40))")
+[ "$T404" = "404" ] && echo "ok unknown webhook token -> 404" || { echo "FAIL unknown webhook token -> $T404 (expect 404)"; FAILS=$((FAILS+1)); }
+TGET=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/webhooks/flexifunnels/demo/$(printf '0%.0s' $(seq 40))")
+[ "$TGET" = "200" ] && echo "ok GET webhook URL -> 200 (verify probe, no enqueue)" || { echo "FAIL GET webhook URL -> $TGET (expect 200)"; FAILS=$((FAILS+1)); }
+
 echo '--- Phase H: /health JSON + alerts screen ---'
 HCODE=$(curl -s -b "$O" -o /tmp/xt-health.json -w "%{http_code}" "$BASE/health")
 echo "/health -> $HCODE"; [ "$HCODE" = "200" ] || { echo "FAIL /health not 200"; FAILS=$((FAILS+1)); }

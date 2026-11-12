@@ -45,6 +45,7 @@
     reports: { title: 'Reports', icon: 'chart', group: 'Insight', roles: null },
     meta: { title: 'Meta Hub', icon: 'bolt', group: 'Integrations', roles: 'teamOps' },
     integrations: { title: 'Integrations', icon: 'plug', group: 'Integrations', roles: 'teamOps' },
+    webhooks: { title: 'Webhooks & API Keys', icon: 'key', group: 'Integrations', roles: 'teamOps' },
     duplicates: { title: 'Duplicates', icon: 'copy', group: 'Admin', roles: 'canAdmin' },
     admin: { title: 'Admin', icon: 'shield', group: 'Admin', roles: 'canAdmin' },
     pilot: { title: 'Pilot Gates', icon: 'gate', group: 'Ops', roles: 'teamOps' },
@@ -167,6 +168,7 @@
     reports: (m, b, q) => renderReports(m, q),
     meta: (m) => renderMeta(m),
     integrations: (m, b, q) => renderIntegrations(m, q),
+    webhooks: (m, b, q) => renderWebhooksKeys(m, q),
     duplicates: (m, b, q) => renderDuplicates(m, q),
     admin: (m) => renderAdmin(m),
     pilot: (m) => renderPilot(m),
@@ -237,8 +239,11 @@
     const spendPts = (d.spendTrend || []).map((p) => ({ label: p.date.slice(5), y: p.spend }));
     const clickPts = (d.spendTrend || []).map((p) => ({ label: p.date.slice(5), y: p.clicks }));
     const k = d.kpis;
-    // section 1: KPI strip
+    // section 1: KPI strip — v14: new-leads rate (today / 7d) so live
+    // FlexiFunnels / gateway webhooks make the dashboard move in real time.
     const kpis = h('div', { class: 'grid g4' },
+      kpiCard('Leads today', fmtN(k.leadsToday != null ? k.leadsToday : 0), { icon: 'leads', hint: 'created in the last 24h' }),
+      kpiCard('Leads (7d)', fmtN(k.leads7d != null ? k.leads7d : 0), { icon: 'chart', hint: 'created in the last 7 days' }),
       kpiCard('Total leads', fmtN(k.totalLeads), { icon: 'leads', spark: spark(spendPts.map((p) => p.y), '#6d7cff'), hint: 'all clients' }),
       kpiCard('Net revenue', fmtINRk(k.revenue), { icon: 'dollar', hint: fmtINR(k.revenue) }),
       kpiCard('Ad spend', fmtINRk(k.spend), { icon: 'bolt', hint: fmtINR(k.spend) }),
@@ -283,9 +288,11 @@
         h('a', { class: 'btn sm sec', href: '#/reports' }, 'Full report')),
       adMini((d.adPerf || {}).rows || []));
     const recentCard = h('div', { class: 'card' },
-      h('div', { class: 'row' }, h('h2', { text: 'Recent leads' }), h('span', { class: 'sp' }),
+      h('div', { class: 'row' },
+        h('div', {}, h('h2', { text: 'New leads' }), h('div', { class: 'sub' }, 'Latest webhook / form events with their source')),
+        h('span', { class: 'sp' }),
         h('a', { class: 'btn sm sec', href: '#/leads' }, 'All leads')),
-      recentTable(d.recent));
+      newLeadsTable(d.recent));
     const bottom = h('div', { class: 'grid g2' }, topAdsCard, recentCard);
 
     clear(main);
@@ -310,6 +317,28 @@
     const segs = (mix || []).map((m) => ({ label: m.src, value: m.c, color: SRC_COLOR[m.src] || '#98a2c0' }));
     const total = segs.reduce((a, s) => a + s.value, 0);
     return segs.length ? donut(segs, { centerLabel: 'leads', centerValue: fmtN(total) }) : h('div', { class: 'empty' }, 'No leads yet');
+  }
+
+  // v14: dashboard "New leads" card — real webhook events (FlexiFunnels etc.)
+  // fill this the moment they land: source platform, the form title the lead
+  // came from, masked phone, and when it happened. Empty state is gone.
+  function newLeadsTable(rows) {
+    const t = h('div', { class: 'tblwrap', style: { marginTop: 10 } });
+    if (!rows || !rows.length) { t.append(h('div', { class: 'empty' }, 'No leads yet — connect a webhook (Webhooks & API Keys) or wait for your first FlexiFunnels form.')); return t; }
+    const th = h('thead', {}, h('tr', {}, h('th', {}, 'Lead'), h('th', {}, 'Source'), h('th', {}, 'Form / page'), h('th', {}, 'Phone'), h('th', {}, 'When')));
+    const tb = h('tbody', {}, rows.map((r) => {
+      // source: the event's platform; form title / page / UTM from the payload
+      const src = r.source ? platIcon(r.source) : (r.utm_source ? h('span', { class: 'pill b' }, r.utm_source) : h('span', { class: 'td-muted' }, r.form_title ? 'form' : '—'));
+      const formBit = r.page_url ? h('div', { class: 'td-muted small' }, r.page_url) : (r.form_title ? h('div', { class: 'td-muted small' }, 'form: ' + r.form_title) : null);
+      return h('tr', {},
+        h('td', {}, h('a', { class: 'leadlink', href: '#/lead/' + r.id, text: r.name || '—' })),
+        h('td', {}, src),
+        h('td', { class: 'td-muted small' }, formBit || '—'),
+        h('td', { class: 'td-muted' }, r.phone || '—'),
+        h('td', { class: 'td-muted', text: relTime(r.created_at) || fmtDT(r.created_at) }));
+    }));
+    t.append(th, tb);
+    return t;
   }
 
   // ---------------------------------------------------------------- leads table
@@ -416,6 +445,10 @@
             h('div', { class: 'td-muted small', style: { marginTop: 6 } }, 'Owner: ' + (l.owner || 'unassigned') + ' · Total paid ' + fmtINR(L.totalPaid))),
           editLeadForm(L))),
 
+      // v14: source card — where this lead came from. Ad-driven leads show the
+      // ad creative; FlexiFunnels / UTM-driven leads (pages without xt.js) show
+      // the form's ad link (utm_* / page_url captured on the webhook payload).
+      L.sourceCard && L.sourceCard.kind !== 'organic' ? sourceCardBlock(L.sourceCard, L) : null,
       // ad source cards
       h('div', { class: 'grid g2' },
         adCardBlock('First ad clicked', L.adCards.first, L.adCards),
@@ -461,6 +494,29 @@
     navigate();
   }
 
+  // v14: the ad attribution for leads that arrived WITHOUT xt.js (FlexiFunnels
+  // pages) — the form's UTM hidden fields / page URL that the webhook captured.
+  function sourceCardBlock(sc, L) {
+    const isAd = sc.kind === 'ad';
+    const title = isAd ? 'Ad source' : 'Ad source (from form UTM)';
+    const sub = isAd ? 'Meta ad click via pixel / CAPI' : 'Captured on the FlexiFunnels form — pages without xt.js';
+    const utmLine = [sc.utm_source, sc.utm_medium, sc.utm_campaign].filter(Boolean).join(' · ');
+    const bigLine = isAd ? ((sc.ad && sc.ad.name) || 'Ad') : (sc.landing_url || 'Landing page');
+    const detail = isAd
+      ? ((sc.ad && sc.ad.status || '') + (sc.utm_campaign ? ' · campaign ' + sc.utm_campaign : ''))
+      : utmLine;
+    return h('div', { class: 'card' },
+      h('div', { class: 'row', style: { justifyContent: 'space-between' } },
+        h('div', {},
+          h('h2', { text: title, style: { fontSize: 15 } }),
+          h('div', { class: 'sub' }, sub)),
+        h('span', { class: 'tag' }, isAd ? 'ad click' : 'UTM attribution')),
+      h('div', { class: 'src', style: { marginTop: 10 } },
+        isAd && sc.ad ? adThumb(sc.ad.name, sc.ad.name) : platIcon(isAd ? 'meta_leadgen' : 'flexifunnels'),
+        h('div', { style: { marginLeft: 10 } },
+          h('div', { style: { fontWeight: 700 } }, bigLine),
+          detail ? h('div', { class: 'small muted' }, detail) : null)));
+  }
   function adCardBlock(label, card, adCards) {
     if (!card) return h('div', { class: 'card' },
       h('h2', { text: label }),
@@ -869,6 +925,257 @@
   function webStatus(s) {
     const c = s === 'processed' ? 'g' : s === 'failed' ? 'r' : 'o';
     return h('span', { class: 'pill ' + c }, h('span', { class: 'dot' }), s);
+  }
+
+  // ================================================================ WEBHOOKS & API KEYS
+  // v14: team-only. Section A = inbound token-URL endpoints (generate / copy /
+  // pause / revoke, FlexiFunnels setup guide + field mapping). Section B = the
+  // app's bearer API keys (xak_... read-only / read-write, revoke).
+  async function renderWebhooksKeys(main, query) {
+    const d = await get('/webhooks');
+    clear(main);
+    main.append(
+      banner('Generate a webhook URL per client + platform and paste it into the platform (FlexiFunnels: Forms → Webhook and Products/Purchases → Webhook). The URL token is the endpoint\'s auth; every event is logged. API keys (xak_…) give scripts read access to the app.', null),
+      baseNotice(d),
+      h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'Webhook endpoints' }), h('div', { class: 'sub' }, 'token-in-URL · status · last event · total events')),
+          h('span', { class: 'sp' }),
+          createEndpointForm(d)),
+      d.endpoints.length ? endpointsTable(d) : h('div', { class: 'empty', style: { marginTop: 10 } }, 'No endpoints yet — create one. For FlexiFunnels: one form webhook (events “leads”) + one product webhook (events “purchases”).')),
+      d.endpoints.length ? flexiGuide(d) : null,
+      h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('h2', { text: 'FlexiFunnels field mapping' }), h('span', { class: 'sp' }),
+          h('span', { class: 'tag' }, 'per client · optional override')),
+        flexiFieldMapForm(d)),
+      h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('div', {}, h('h2', { text: 'API keys' }), h('div', { class: 'sub' }, 'Bearer auth for /api/app/* — plaintext shown once, then only the hash is kept')),
+          h('span', { class: 'sp' }),
+          createKeyForm(d)),
+      d.apikeys.length ? apiKeysTable(d) : h('div', { class: 'empty', style: { marginTop: 10 } }, 'No API keys yet.')),
+      h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('h2', { text: 'Recent inbound events' }), h('span', { class: 'sp' }),
+          h('a', { class: 'btn sm sec', href: '#/integrations' }, 'Full log in Integrations')),
+        webhookTable(d.log || [])));
+  }
+
+  function baseNotice(d) {
+    if (d.baseIsProd) return null;
+    return h('div', { class: 'banner', style: { borderColor: 'var(--warn, #fbbf24)', background: 'rgba(251,191,36,.08)' } },
+      icon('bell', 18),
+      h('span', {}, 'Dev notice — generated URLs use this host (', h('span', { class: 'mono' }, d.base), '). FlexiFunnels can only POST to a PUBLIC URL: either deploy (docs/deploy.md, Arpit) or run a tunnel in dev: ',
+        h('code', { style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 6, padding: '1px 6px' }, text: 'ngrok http ' + String(d.base || 'http://localhost:4100').replace(/^https?:\/\//, '') }),
+        h('span', {}, ' — then copy that public ngrok URL as the base.')));
+  }
+
+  function epActionCell(e, clients) {
+    const b = h('div', { class: 'row', style: { gap: 6, justifyContent: 'flex-end' } });
+    b.append(copyBtn(e.url, e.url));
+    if (e.status === 'active') b.append(h('button', { class: 'btn sm sec', onclick: () => epStatus(e.id, 'paused') }, 'Pause'));
+    else if (e.status === 'paused') b.append(h('button', { class: 'btn sm', onclick: () => epStatus(e.id, 'active') }, 'Resume'));
+    else b.append(h('button', { class: 'btn sm danger', onclick: () => epStatus(e.id, 'revoked') }, 'Revoke'));
+    if (e.status !== 'revoked') b.append(h('button', { class: 'btn sm sec', onclick: () => epTest(e) }, 'Test'));
+    if (e.status !== 'revoked') b.append(h('button', { class: 'btn sm sec', title: 'New token; old URL stops working', onclick: () => epRotate(e) }, 'Rotate'));
+    return b;
+  }
+  function epTest(e) {
+    return e.platform === 'flexifunnels' ? epFlexiTest(e) : epGenericTest(e);
+  }
+  async function epGenericTest(e) {
+    toast('Queueing test ' + e.platform + ' event…');
+    const r = await post('/integrations/test', { platform: e.platform, client_id: e.client_id });
+    toast(r && r.ok ? 'Test queued — watch the recent events below' : 'Could not queue test', 'ok');
+    setTimeout(navigate, 800);
+  }
+  async function epFlexiTest(e) {
+    toast('Queueing sample FlexiFunnels form event…');
+    const r = await post('/webhooks/flexi_test', { client_id: e.client_id });
+    toast(r && r.ok ? 'Test queued — watch the recent events below' : 'Could not queue test', 'ok');
+    setTimeout(navigate, 800);
+  }
+  function endpointsTable(d) {
+    const t = h('div', { class: 'tblwrap', style: { marginTop: 12 } });
+    const head = h('thead', {}, h('tr', {},
+      h('th', {}, 'Platform'), h('th', {}, 'Description'), h('th', {}, 'Client'), h('th', {}, 'URL'),
+      h('th', {}, 'Events'), h('th', {}, 'Status'), h('th', {}, 'Last event'), h('th', { class: 'num' }, 'Total'), h('th', {}, '')));
+    const body = h('tbody', {}, d.endpoints.map((e) => {
+      const tr = h('tr', {});
+      const cName = d.clients.find((c) => String(c.id) === String(e.client_id));
+      tr.append(
+        h('td', {}, platIcon(e.platform), h('span', { style: { marginLeft: 6, fontWeight: 600 } }, e.platform)),
+        h('td', { class: 'td-muted small' }, e.description || '—'),
+        h('td', { class: 'td-muted' }, cName ? cName.name : 'client ' + e.client_id),
+        h('td', { class: 'td-muted mono small' }, e.url_masked || e.url || ''),
+        h('td', {}, h('span', { class: 'pill m' }, e.events || 'all')),
+        h('td', {}, epStatusPill(e.status)),
+        h('td', { class: 'td-muted small' }, e.last_event_at ? relTime(e.last_event_at) : 'never'),
+        h('td', { class: 'num td-muted' }, String(e.events_total || 0)),
+        h('td', {}, epActionCell(e, d.clients)));
+      return tr;
+    }));
+    t.append(head, body);
+    return t;
+  }
+  function epStatusPill(s) {
+    const c = s === 'active' ? 'g' : s === 'paused' ? 'o' : 'r';
+    return h('span', { class: 'pill ' + c }, h('span', { class: 'dot' }), s);
+  }
+  async function epStatus(id, status) {
+    const msg = status === 'revoked' ? 'Revoke? The URL stops accepting events (history stays).' : 'Set status ' + status + '?';
+    if (!confirm(msg)) return;
+    const r = await post('/webhooks/status', { id, status });
+    toast(r && r.ok ? 'Endpoint ' + status : 'Could not change status', r && r.ok ? 'ok' : 'err');
+    navigate();
+  }
+  async function epRotate(ep) {
+    if (!confirm('Rotate token for ' + ep.platform + '? A new URL is generated — the old one is revoked.')) return;
+    // delete the old endpoint + create a fresh one with the same client/platform/desc
+    await post('/webhooks/delete', { id: ep.id });
+    const r = await post('/webhooks/endpoint', { client_id: ep.client_id, platform: ep.platform, description: ep.description, events: ep.events });
+    showOneTimeUrl(r && r.created, ep.platform);
+    navigate();
+  }
+  function copyBtn(label, value) {
+    const b = h('button', { class: 'btn sm sec', onclick: async () => {
+      try { await navigator.clipboard.writeText(value || label); toast('Copied', 'ok'); }
+      catch { toast('Copy failed — select the URL manually', 'err'); }
+    } }, 'Copy');
+    return b;
+  }
+  function showOneTimeUrl(created, platform) {
+    if (!created) return;
+    modal(h('div', {},
+      h('h2', { text: (platform || 'Webhook') + ' endpoint created' }),
+      h('div', { class: 'note', style: { marginTop: 10 } }, 'Copy this URL now — it contains the endpoint token (your only secret). In live mode the URL must be public (prod domain or tunnel).'),
+      h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 10, wordBreak: 'break-all' }, text: created.url }),
+      h('div', { class: 'row', style: { marginTop: 12, gap: 8 } },
+        h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(created.url); toast('URL copied', 'ok'); } catch {} } }, 'Copy URL'),
+        created.secret ? h('button', { class: 'btn sm sec', onclick: async () => { try { await navigator.clipboard.writeText(created.secret); toast('Secret copied', 'ok'); } catch {} } }, 'Copy legacy secret') : null)),
+      () => {});
+  }
+
+  function createEndpointForm(d) {
+    const clSel = h('select', { id: 'wk-cl' }, d.clients.map((c) => h('option', { value: c.id, text: c.name })));
+    const plSel = h('select', { id: 'wk-pl' }, d.platforms.map((p) => h('option', { value: p[0], text: p[1] + ' — ' + p[2] })));
+    const evSel = h('select', { id: 'wk-ev' }, [h('option', { value: 'all', text: 'all events' }), h('option', { value: 'leads', text: 'leads (forms)' }), h('option', { value: 'purchases', text: 'purchases' })]);
+    const dIn = h('input', { type: 'text', placeholder: 'e.g. Webinar form (FlexiFunnels)', id: 'wk-desc' });
+    const out = h('div', { style: { marginTop: 10 } });
+    const mk = async () => {
+      const r = await post('/webhooks/endpoint', {
+        client_id: Number(clSel.value), platform: plSel.value, events: evSel.value, description: dIn.value,
+      });
+      clear(out);
+      if (r && r.created) { showOneTimeUrl(r.created, r.created.platform); out.append(h('div', { class: 'note' }, 'Endpoint generated (copy the URL from the box).')); }
+      else { toast('Could not create endpoint', 'err'); navigate(); }
+    };
+    return h('div', { style: { minWidth: 260 } },
+      h('div', { class: 'formrow' },
+        h('div', { class: 'fld' }, h('label', { text: 'Client' }), clSel),
+        h('div', { class: 'fld' }, h('label', { text: 'Platform' }), plSel),
+        h('div', { class: 'fld' }, h('label', { text: 'Events' }), evSel),
+        h('div', { class: 'fld grow' }, h('label', { text: 'Description' }), dIn),
+        h('button', { class: 'btn', onclick: mk }, 'Generate URL')),
+      out);
+  }
+
+  function createKeyForm(d) {
+    const clSel = h('select', { id: 'ak-cl' },
+      [h('option', { value: '', text: 'workspace (all clients)' })].concat(d.clients.map((c) => h('option', { value: c.id, text: c.name }))));
+    const pmSel = h('select', { id: 'ak-pm' }, [h('option', { value: 'read_only', text: 'read-only' }), h('option', { value: 'read_write', text: 'read-write' })]);
+    const lIn = h('input', { type: 'text', placeholder: 'label (e.g. billing scraper)', id: 'ak-lb' });
+    const out = h('div', { style: { marginTop: 10 } });
+    const mk = async () => {
+      const r = await post('/webhooks/key', { scope_client_id: clSel.value || null, permission: pmSel.value, label: lIn.value });
+      clear(out);
+      if (r && r.created) {
+        const k = r.created;
+        const hint = h('span', { class: 'td-muted small' }, 'use it as ', h('code', {}, 'Authorization: Bearer ' + k.key.slice(0, 10) + '…'));
+        out.append(h('div', {},
+          h('div', { class: 'note' }, h('b', { text: 'Copy the key now — it is shown only once (stored as a hash):' })),
+          h('div', { class: 'mono', style: { background: '#0b0d13', border: '1px solid var(--line)', borderRadius: 8, padding: 12, marginTop: 8, wordBreak: 'break-all' }, text: k.key }),
+          h('div', { class: 'row', style: { marginTop: 8, gap: 10 } },
+            h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(k.key); toast('Key copied', 'ok'); } catch {} } }, 'Copy key'),
+            hint)));
+      } else toast('Could not create key', 'err');
+    };
+    return h('div', { style: { minWidth: 260 } },
+      h('div', { class: 'formrow' },
+        h('div', { class: 'fld' }, h('label', { text: 'Scope' }), clSel),
+        h('div', { class: 'fld' }, h('label', { text: 'Permission' }), pmSel),
+        h('div', { class: 'fld grow' }, h('label', { text: 'Label' }), lIn),
+        h('button', { class: 'btn', onclick: mk }, 'Create key')),
+      out);
+  }
+
+  function apiKeysTable(d) {
+    const t = h('div', { class: 'tblwrap', style: { marginTop: 12 } });
+    t.append(
+      h('thead', {}, h('tr', {}, h('th', {}, 'Label'), h('th', {}, 'Scope'), h('th', {}, 'Permission'), h('th', {}, 'Created'), h('th', {}, 'Last used'), h('th', {}, 'Status'), h('th', {}, ''))),
+      h('tbody', {}, d.apikeys.map((k) => h('tr', {},
+        h('td', { style: { fontWeight: 600 } }, k.label || '—'),
+        h('td', { class: 'td-muted' }, k.scope_name || 'workspace'),
+        h('td', {}, h('span', { class: 'pill ' + (k.permission === 'read_write' ? 'o' : 'm') }, k.permission)),
+        h('td', { class: 'td-muted small' }, fmtDT(k.created_at)),
+        h('td', { class: 'td-muted small' }, k.last_used_at ? relTime(k.last_used_at) : 'never'),
+        h('td', {}, k.status === 'revoked' ? h('span', { class: 'pill r' }, 'revoked') : h('span', { class: 'pill g' }, 'active')),
+        h('td', {},
+          h('div', { class: 'row', style: { gap: 6, justifyContent: 'flex-end' } },
+            k.status !== 'revoked' ? h('button', { class: 'btn sm danger', onclick: async () => { if (!confirm('Revoke this key?')) return; const r = await post('/webhooks/key_revoke', { id: k.id }); toast(r && r.ok ? 'Key revoked' : 'Could not revoke', 'ok'); navigate(); } }, 'Revoke') :
+            h('button', { class: 'btn sm sec', onclick: async () => { if (!confirm('Delete this key row?')) return; await post('/webhooks/key_delete', { id: k.id }); navigate(); } }, 'Delete')))))));
+    return t;
+  }
+
+  // per-client FlexiFunnels field-mapping editor (PRD §5.2 style): map the
+  // payload field names FlexiFunnels sends to phone / email / name / city +
+  // an optional event_type override (form_submit vs registered).
+  function flexiFieldMapForm(d) {
+    const clSel = h('select', { id: 'fm-cl' }, d.clients.map((c) => h('option', { value: c.id, text: c.name })));
+    const F = ['phone', 'email', 'name', 'city', 'form_title', 'page_url', 'event_type'];
+    const inputs = F.map((f) => h('input', { type: 'text', placeholder: f, id: 'fm-' + f, class: f === 'event_type' ? 'td-muted' : '', style: f === 'event_type' ? { fontSize: 12 } : {} }));
+    const note = h('div', { class: 'td-muted small', style: { marginTop: 6 } },
+      'Default keys already cover FlexiFunnels form fields (phone, email, name, city, form_title, page_url). Override here only if your forms use custom names, or set event_type=registered to move form leads to the Registered stage.');
+    const sv = async () => {
+      const m = {};
+      F.forEach((f) => { const v = document.getElementById('fm-' + f).value.trim(); if (v) m[f] = v; });
+      const r = await post('/webhooks/fieldmap', { client_id: Number(clSel.value), platform: 'flexifunnels', mapping: m });
+      toast(r && r.ok ? 'Field mapping saved' : 'Could not save', 'ok');
+    };
+    const load = async () => {
+      // re-GET to pull the current mapping for the chosen client (best-effort)
+      const cur = d.fieldMaps && d.fieldMaps[clSel.value];
+      if (cur) F.forEach((f) => { const el = document.getElementById('fm-' + f); if (el) el.value = cur[f] || ''; });
+    };
+    return h('div', { style: { marginTop: 12 } },
+      h('div', { class: 'formrow' },
+        h('div', { class: 'fld' }, h('label', { text: 'Client' }), clSel),
+        h('div', { class: 'formrow', style: { flex: 1, gap: 6 } },
+          inputs.map((i) => h('div', { class: 'fld grow' }, i))),
+        h('button', { class: 'btn', onclick: sv }, 'Save mapping'),
+        h('button', { class: 'btn sm sec', onclick: load }, 'Reload')));
+  }
+
+  // copy-paste ready FlexiFunnels setup (the two paste points FlexiFunnels
+  // support confirmed: Forms → Webhook + Products/Purchases → Webhook).
+  function flexiGuide(d) {
+    const formEp = d.endpoints.find((e) => e.platform === 'flexifunnels' && (e.events || 'all') !== 'purchases');
+    const purchEp = d.endpoints.find((e) => e.platform === 'flexifunnels' && e.events === 'purchases');
+    const step = (n, title, body) => h('div', { class: 'row', style: { padding: '10px 0', borderBottom: '1px solid var(--line)', gap: 10, alignItems: 'flex-start' } },
+      h('span', { class: 'pill b', style: { minWidth: 22, textAlign: 'center' } }, String(n)),
+      h('div', { style: { flex: 1 } },
+        h('div', { style: { fontWeight: 600 } }, title),
+        h('div', { class: 'td-muted small', style: { marginTop: 2 } }, body)));
+    const flexis = d.endpoints.filter((e) => e.platform === 'flexifunnels');
+    const body = h('div', { style: { marginTop: 12 } });
+    if (!flexis.length) {
+      body.append(h('div', { class: 'empty' }, 'Create a FlexiFunnels endpoint above (client + platform FlexiFunnels + events “leads” for the form, and one with “purchases” for orders), then follow these steps in FlexiFunnels:'));
+    }
+    body.append(
+      step(1, 'Form webhook', 'FlexiFunnels → Forms → Page Editor → select form → Form Settings → Webhooks → paste your “leads” URL ' + (formEp ? '(generated: ' + (formEp.url_masked || '') + ')' : '') + ' → Save & Publish.'),
+      step(2, 'Product/purchase webhook', 'FlexiFunnels → Products → select product → Set Product Rules → Webhook → paste your “purchases” URL ' + (purchEp ? '(generated: ' + (purchEp.url_masked || '') + ')' : '') + ' → Save.'),
+      step(3, 'Ad attribution (recommended)', 'FlexiFunnels pages don\'t run xt.js, so ad clicks aren\'t tracked there. Add utm_source / utm_medium / utm_campaign / utm_content / utm_term as HIDDEN fields on each form (or set them in the page URL) — they flow into the webhook payload and the lead gets an ad source card + attribution.'),
+      step(4, 'Public URL requirement', 'The URL must be reachable by FlexiFunnels — a localhost URL only works behind a tunnel (ngrok / cloudflared) or on your production domain (docs/deploy.md). Dev: ', h('code', {}, 'cloudflared tunnel --url http://localhost:4100') + ' and swap the URL\'s host for the tunnel address.'));
+    return h('div', { class: 'card' },
+      h('div', { class: 'row' }, h('h2', { text: 'FlexiFunnels setup guide' }), h('span', { class: 'sp' }), h('span', { class: 'tag' }, 'copy-paste ready')),
+      body);
   }
 
   // ================================================================ DUPLICATES

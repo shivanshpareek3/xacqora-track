@@ -2,6 +2,79 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-06 (v14: Webhooks & API Keys screen + FlexiFunnels live-lead pipeline)
+
+The user's ask: a team-only "Webhooks & API Keys" tab where they can generate
+/manage multiple webhooks AND multiple API keys, and have real FlexiFunnels
+leads show up on the dashboard the moment they arrive. FlexiFunnels support
+confirmed the flow: generate a webhook URL on our side, paste it into
+FlexiFunnels (Forms → Webhook + Products/Purchases → Webhook).
+
+**Data model (both engines + idempotent migration in server/db.js):**
+- `webhook_endpoint` gained `slug, token_hash, description, events, status,
+  events_total, last_event_at, created_at`. Multi-webhook per client+platform
+  was already structurally true (UNIQUE on url); now each endpoint is a
+  token-in-URL endpoint with its own lifecycle. `status` = active/paused/revoked.
+- New `api_keys` table: `scope_client_id` (NULL = workspace-level), `label`,
+  `permission` (read_only|read_write), `key_hash` (sha256 of `xak_…`; the
+  plaintext is returned ONCE at creation), `created_by/created_at`,
+  `last_used_at`, `revoked_at`. Postgres RLS: the table is hidden from
+  scoped client sessions (team-managed credential store).
+
+**Inbound token-URL path (server/index.js `handleTokenWebhook`):**
+`POST /webhooks/<platform>/<slug>/<token>` — the URL's token authenticates the
+endpoint row (`lib/webhooks.resolveByToken`), then the same enqueue + log +
+per-IP/per-endpoint rate-limit flow as `/api/ingest`. Paused endpoint =
+accept-and-ignore (200), revoked = 410, unknown token = 404. GET on a webhook
+URL returns 200 JSON (FlexiFunnels "verify endpoint" probe) without enqueuing.
+`events` scope filter: a `purchases`-scoped URL logs + skips lead-family events
+(and vice-versa) so a form URL and a purchase URL can coexist without
+cross-posting.
+
+**FlexiFunnels adapter (server/lib/adapters.js):** maps form-submit payloads to
+`form_submit` (or `registered` when the client's `field_map.event_type` says so)
+and order payloads to `checkout_started` (pending) / `payment_success` (paid).
+Phone → E.164; purchase with no matching lead = `source_unknown` lead that still
+counts revenue; duplicate orders blocked on `gateway_txn_id`. Because FlexiFunnels
+pages don't run `xt.js`, `utm_*` + `page_url` are captured onto a touchpoint so
+ad attribution still works, and the lead shows a "UTM attribution" source card.
+
+**API-key bearer auth (server/index.js on `/api/app/*`):** `Authorization:
+Bearer xak_…` or `X-API-Key: xak_…`. A verified key resolves to a synthetic user
+— workspace-level key → owner (unrestricted); client-scoped key → a client login
+locked to that client (RLS + api.js both honor the scope). read-only keys are
+GET-only. `lib/webhooks.js` = the endpoint + key lifecycle, token/key
+generation, and `verifyApiKey`.
+
+**Screen (public/app `#/webhooks`, team-only):** Section A = endpoints
+(generate/copy/pause/resume/revoke/rotate, events-scope, last-event + total,
+FlexiFunnels 2-step setup guide + a public-URL dev notice with a tunnel command,
+per-client FlexiFunnels field-mapping editor). Section B = API keys
+(create with one-time copy, scope × permission, revoke). The integrations screen
+cross-links to it.
+
+**Dashboard (public/app):** new-leads KPIs (`leadsToday` / `leads7d`, computed
+engine-identically with a space-form midnight threshold) + a "New leads" card
+(real webhook events: source platform, form title / page, masked phone, when) +
+the lead timeline's UTM source card. The classic dashboard's empty state now
+points at the webhook generator.
+
+**Tests:** `test/webhook-keys.js` (in-process, engine-agnostic like spa.js — 39
+checks: screen access, multi-endpoint + token auth, FlexiFunnels form→lead + UTM
++ KPI + source card, purchase→deal idempotency + checkout_started, scope filter,
+pause/revoke lifecycle, API-key create/verify/scope/revocation, field-map
+override). `test/replay.js` + `test/sweep.sh` gained the flexifunnels sample +
+the public token-route / team-screen gates. `test-samples/flexifunnels.json`.
+All in-process suites green on SQLite; replay/sweep (socket-based) run in the
+sweep host. `test/datamode.js` "demo topAds includes ACT- ad" is a PRE-EXISTING
+failure (fails on the clean tree too — confirmed via `git stash`).
+
+**For the user:** the tab is live; to get real FlexiFunnels leads flowing, a
+generated URL must be PUBLIC — either deploy (`APP_URL`, docs/deploy.md, Arpit's
+hosting decision) or run a tunnel in dev (`cloudflared tunnel --url
+http://localhost:<PORT>` / `ngrok`) and paste that public URL. Docs:
+`docs/webhooks-adapters.md` §v14 + `.env.example` APP_URL block.
+
 ## 2026-11-06 (v13 spend-accuracy fix 2: the 30-day KPI was under-counting)
 
 The user pushed back on the first spend fix: 7d was fine, but Abhishek

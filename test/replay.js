@@ -89,6 +89,10 @@ function get(pathname) {
     ['aevent', 'aevent.json', { client_id: 1 }],
     ['calendly', 'calendly.json', { client_id: 2 }],
     ['whatsapp', 'whatsapp.json', { client_id: 1 }],
+    // v14: FlexiFunnels form submit -> form_submit lead event (no secret row
+    // seeded for this platform, so no ?secret= needed — same as the razorpay
+    // dupe below; token-URL auth is covered by test/webhook-keys.js + sweep)
+    ['flexifunnels', 'flexifunnels.json', { client_id: 1 }],
   ];
   let failed = 0;
   for (const [platform, file, extra] of samples) {
@@ -124,7 +128,9 @@ function get(pathname) {
     ['whatsapp_replied', `SELECT COUNT(*) c FROM event WHERE type='whatsapp_replied'`, 1],
     ['stages auto-moved (Paid exists)', `SELECT COUNT(*) c FROM lead WHERE stage='Paid'`, 1],
     ['CAPI log rows (dry-run)', `SELECT COUNT(*) c FROM capi_log`, 1],
-    ['webhook logs processed', `SELECT COUNT(*) c FROM webhook_log WHERE status IN ('processed','queued','test')`, 5],
+    ['flexifunnels form_submit event (v14)', `SELECT COUNT(*) c FROM event WHERE source_platform='flexifunnels' AND type='form_submit'`, 1],
+    ['flexifunnels lead + UTM touchpoint', `SELECT COUNT(*) c FROM lead l WHERE l.email='flexi.lead@example.com'`, 1],
+    ['webhook logs processed', `SELECT COUNT(*) c FROM webhook_log WHERE status IN ('processed','queued','test')`, 6],
   ];
   let bad = 0;
   for (const [label, sql, min] of checks) {

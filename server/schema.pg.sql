@@ -164,8 +164,27 @@ CREATE TABLE IF NOT EXISTS meta_ad_account (
 CREATE TABLE IF NOT EXISTS webhook_endpoint (
   id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES client(id),
   platform TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+  -- v14 (Webhooks & API Keys): token-in-URL inbound endpoints + lifecycle
+  slug TEXT,                    -- /webhooks/<platform>/<slug>/<token>
+  token_hash TEXT,              -- sha256 of the generated URL token (auth + lookup)
+  description TEXT,
+  events TEXT DEFAULT 'all',    -- 'all' | 'leads' | 'purchases'
+  status TEXT DEFAULT 'active',  -- 'active' | 'paused' | 'revoked'
+  events_total INTEGER DEFAULT 0,
+  last_event_at TEXT,
+  created_at TEXT,
   UNIQUE(client_id, platform, url)
 );
+-- v14: app API keys (bearer auth on /api/app/*; plain text shown once,
+-- hash stored). scope_client_id NULL = workspace-level (team-only use).
+CREATE TABLE IF NOT EXISTS api_keys (
+  id SERIAL PRIMARY KEY, scope_client_id INTEGER, label TEXT,
+  permission TEXT DEFAULT 'read_only',
+  key_hash TEXT NOT NULL,
+  created_by TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  last_used_at TEXT, revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apikey_hash ON api_keys(key_hash);
 CREATE TABLE IF NOT EXISTS webhook_log (
   id SERIAL PRIMARY KEY, client_id INTEGER, platform TEXT NOT NULL,
   ref TEXT, dedup_key TEXT, status TEXT DEFAULT 'received',
@@ -314,6 +333,21 @@ BEGIN
   EXECUTE 'CREATE POLICY client_scope ON webhook_log
     USING (app_webhook_ok(client_id))
     WITH CHECK (app_webhook_ok(client_id))';
+END $$;
+
+-- api_keys: a team-managed credential store (scope_client_id is an optional
+-- scoping hint, not an owning client_id). Visible only to unscoped /
+-- unrestricted (team + system) sessions; a scoped client session sees NOTHING.
+-- ENABLE + FORCE must run before CREATE POLICY (api_keys is not in the
+-- generic table loop above, which keys off client_id).
+DO $$
+BEGIN
+  EXECUTE 'ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY';
+  EXECUTE 'ALTER TABLE api_keys FORCE  ROW LEVEL SECURITY';
+  EXECUTE 'DROP POLICY IF EXISTS client_scope ON api_keys';
+  EXECUTE 'CREATE POLICY client_scope ON api_keys
+    USING (app_in_session())
+    WITH CHECK (app_in_session())';
 END $$;
 
 -- tables that only REFERENCE a client (no client_id of their own): visible

@@ -187,25 +187,65 @@ const ADAPTERS = {
     };
   },
 
-  // ----- FlexiFunnels: opt-ins and orders -----
+  // ----- FlexiFunnels: form opt-ins + product/purchase orders (v14) -----
+  // FlexiFunnels has no published HMAC signature for its webhooks: the
+  // generated URL token is the endpoint's primary auth (PRD rule "signature OR
+  // secret"). Two webhook types are wired in FlexiFunnels:
+  //   Forms → Webhook: a form-submission payload (lead-creating)
+  //   Products/Purchases → Webhook: an order payload (deal-creating)
+  // Event type follows the client rule (map.event_type); default:
+  //   form -> 'form_submit' (no auto stage move; set map.event_type='registered'
+  //   to move the lead to the Registered stage per funnel),
+  //   order -> 'payment_success' when paid, 'checkout_started' when pending.
+  // FlexiFunnels pages don't run xt.js, so UTM/hidden form fields are the only
+  // ad-attribution source — capture utm_* + page/form URL onto a touchpoint.
   flexifunnels(tx, { client_id, payload, map }) {
     const p = payload.data || payload;
-    const isOrder = p.order_id || p.amount || p.payment_status;
-    return {
+    const custom = p.custom_fields || p.fields || p.attributes || {};
+    const src = Object.assign({}, p, custom);
+    const phone = pick(src, map, ['phone', 'mobile', 'phone_number', 'contact_number', 'whatsapp_number']);
+    const email = pick(src, map, ['email', 'mail']);
+    const name = pick(src, map, ['name', 'full_name', 'first_name', 'contact_name']);
+    const city = pick(src, map, ['city', 'location']);
+    const formTitle = pick(src, map, ['form_title', 'form_name', 'title', 'form']);
+    const pageUrl = pick(src, map, ['page_url', 'url', 'page', 'landing_url', 'source_url']);
+    const utm = {};
+    for (const k of ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term']) {
+      const v = src[k];
+      if (v) utm[k] = String(v);
+    }
+    const paymentStatus = String(p.payment_status || p.status || '').toLowerCase();
+    const txnId = pick(src, map, ['order_id', 'transaction_id', 'payment_id', 'txn_id', 'order_number']);
+    const isOrder = !!(txnId || p.amount != null || p.order_amount != null || paymentStatus || p.product_id || p.product_name);
+    const amount = pick(src, map, ['amount', 'total', 'order_amount', 'price']);
+    // client rule override (field_map.event_type), else the platform default
+    const rule = map && map.event_type ? String(map.event_type) : '';
+    let event_type;
+    if (rule) event_type = rule;
+    else if (isOrder) event_type = (['success', 'paid', 'captured', 'completed'].includes(paymentStatus)) ? 'payment_success' : 'checkout_started';
+    else event_type = 'form_submit';
+    // phone missing -> source-unknown lead (existing rule: it still counts revenue)
+    const out = {
       client_id,
-      event_type: isOrder ? 'payment_success' : 'registered',
-      phone: pick(p, map, ['phone', 'mobile', 'phone_number', 'contact_number']),
-      email: pick(p, map, ['email', 'mail']),
-      name: pick(p, map, ['name', 'full_name', 'first_name']),
-      amount: isOrder ? (pick(p, map, ['amount', 'total', 'order_amount']) ? Number(pick(p, map, ['amount', 'total', 'order_amount'])) : null) : null,
-      currency: 'INR',
-      product: pick(p, map, ['product', 'funnel_name']) || 'FlexiFunnels',
-      gateway: 'flexifunnels',
-      gateway_txn_id: p.order_id || null,
-      ts: new Date().toISOString(),
-      source_ref: p.order_id || p.id || null,
+      event_type,
+      phone, email, name, city,
+      amount: isOrder && amount != null ? Number(amount) : null,
+      currency: isOrder ? (pick(src, map, ['currency']) || 'INR') : null,
+      product: isOrder ? (pick(src, map, ['product_name', 'product', 'item_name', 'order_product', 'funnel_name']) || 'FlexiFunnels') : null,
+      gateway: isOrder ? 'flexifunnels' : null,
+      gateway_txn_id: isOrder ? txnId : null,
+      status: isOrder ? (event_type === 'payment_success' ? 'success' : 'pending') : null,
+      ts: p.created_at || p.created || new Date().toISOString(),
+      // dedup: order id for purchases; submission id for forms (FlexiFunnels
+      // retries its webhooks, so a resubmission of the same form row is skipped)
+      source_ref: isOrder ? (txnId || p.id || null) : (pick(src, map, ['submission_id', 'id', 'uid']) || (formTitle ? 'form:' + formTitle + ':' + (phone || email || '') : null)),
+      // UTM/URL touchpoint so ad attribution + source mix work without xt.js
+      touchpoint: (Object.keys(utm).length || pageUrl) ? Object.assign(utm, { utm_medium: utm.utm_medium || null, landing_url: pageUrl || null }) : null,
+      // the dashboard "recent leads" card shows the form title + page URL
+      extra: { form_title: formTitle || null, page_url: pageUrl || null, utm: Object.keys(utm).length ? utm : null },
       raw_payload: JSON.stringify(payload).slice(0, 20000),
     };
+    return out;
   },
 
   // ----- Pabbly: anything, plus WhatsApp flows -----
