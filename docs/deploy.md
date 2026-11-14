@@ -36,9 +36,17 @@ Key properties:
 - **Serverless-safe app** — `server/index.js` no longer auto-listens when
   imported: the request handler is exported (`module.exports = { handleRequest,
   server }`) and `api/index.js` is the Vercel entry. The 5s in-process ticker
-  is replaced by **Vercel Cron → `POST /admin/tick`** (`vercel.json`), gated
-  by the `XACQORA_TICK_SECRET` header. Self-hosted runs (`npm start`) keep the
-  interval and never call the endpoint.
+  is replaced by **Vercel Cron → `POST /admin/tick`** (`vercel.json`).
+  Security (v15.1): Vercel's `crons[]` schema allows **only `path` +
+  `schedule`** — it cannot attach headers (and `{{ process.env.VAR }}`
+  substitution does not exist in crons). So the Vercel-native cron fires
+  headerless and is **self-gated to one tick per 20h** in the app
+  (`settings.last_admin_tick_ts` + rate-limit): at most one bounded,
+  idempotent drain per day from an anonymous call, more via the secret.
+  The **secret header** (`x-xacqora-tick-secret` = `XACQORA_TICK_SECRET`)
+  still works for the external-cron option B timer and for self-hosted /
+  manual use. Self-hosted runs (`npm start`) keep the interval and never
+  call the endpoint.
 - **Hobby cron limit (v15)** — Vercel **Hobby** plans allow **at most one cron
   firing per day**. The original `*/5 * * * *` (every 5 min) is rejected on
   Hobby ("would run more than once per day") — it is a *warning*, not a build
@@ -88,7 +96,7 @@ never go into AI chat.**
 | `XACQORA_SECRET_KEY` | Vercel | 32-byte AES-256-GCM master key for secrets-at-rest (gateway secrets, Meta tokens) | `openssl rand -hex 32` |
 | `XACQORA_LIVE` | Vercel | `1` = real Meta pull/CAPI + gateway HMAC verification | `1` |
 | `MOCK` | Vercel | `1` forces mock even with creds (dev default) | unset / `0` |
-| `XACQORA_TICK_SECRET` | Vercel | Cron secret for `POST /admin/tick` (header `x-xacqora-tick-secret`) | random 32+ chars |
+| `XACQORA_TICK_SECRET` | Vercel | secret for `POST /admin/tick` (header `x-xacqora-tick-secret`). Vercel's own cron can't send it (cron schema = path+schedule only), so on Hobby the Vercel cron tick is self-gated 1-per-20h instead; set this for the external-cron option B + self-hosted | random 32+ chars |
 | `XACQORA_XT_SUBDOMAIN` | Vercel | canonical host for `xt.js` (third-party CSP pages) | `track.<domain>` |
 | `XT_RATE_PER_MIN_IP` | Vercel | per-IP flood guard (Phase S.6) | `600` |
 | `XT_RATE_PER_MIN_ENDPOINT` | Vercel | per-endpoint cap | `300` |
@@ -162,8 +170,13 @@ vercel deploy --prod
 `vercel.json` (committed) does the rest: catchall rewrite → `api/index.js`
 (handles `/webhooks/*`, `/health`, `/admin/tick`, the SPA `/app` fallback, and
 every other route through the single function), and a **Hobby-legal daily
-cron `0 0 * * *` → `/admin/tick`** with the tick-secret header (Hobby allows at
-most one cron firing per day — the former `*/5 * * * *` was rejected; see §9).
+cron `0 0 * * *` → `/admin/tick`** (Hobby allows at most one cron firing per
+day — the former `*/5 * * * *` was rejected; see §9). **Note (v15.1):** the
+cron entry is exactly `{ path, schedule }` — Vercel's schema allows no
+`headers` and no `{{ process.env.VAR }}` substitution in `crons[]`, so the
+Vercel cron fires `/admin/tick` headerless and the app self-gates it to one
+tick per 20h. The `XACQORA_TICK_SECRET` header is for the external-cron
+(option B) and self-hosted paths.
 Because the drain is now daily, **inbound webhooks process INLINE on the
 serverless target** (a FlexiFunnels POST lands in Postgres in the same
 invocation, not at the next cron), and `/admin/tick` runs the capped-drain
@@ -268,6 +281,25 @@ drain never runs. Concretely: the 3-hour Meta auto-pull fires at most once
 a day, and a webhook that only *enqueued* would sit in the queue until the
 next daily cron.
 
+**The v15.1 build break (and fix).** v15 attempted to keep the tick-secret
+on the cron via a `headers` property (`x-xacqora-tick-secret` with a
+`{{ process.env.XACQORA_TICK_SECRET }}` substitution). That is **not a real
+Vercel feature** — the `crons[]` schema only permits `path` + `schedule`, so
+the build failed hard:
+
+> "Invalid vercel.json · `crons[0]` should NOT have additional property
+> 'headers'. Please remove it."
+
+Fix (v15.1, committed): the cron entry is exactly
+`{ "path": "/admin/tick", "schedule": "0 0 * * *" }`. Because a Vercel
+cron cannot present a secret, the Vercel-native tick is **self-gated in the
+app to one tick per 20h** (`settings.last_admin_tick_ts` + rate-limit) —
+safe against an attacker who finds the public path, and never blocks the
+once-a-day cron. The **secret header** (`x-xacqora-tick-secret` =
+`XACQORA_TICK_SECRET`) remains for option B (an external cron timer that
+*can* send a header) and for self-hosted / manual use; a correct secret
+bypasses the 20h gate.
+
 **Chosen — option A: daily cron (committed).** `vercel.json` now schedules
 `/admin/tick` at **`0 0 * * *`** (UTC, one firing/day — Hobby-legal). What
 that buys / gives up:
@@ -306,9 +338,13 @@ a Cloudflare Worker cron trigger, GitHub Actions `schedule` (free; min cadence
 sub-daily Meta-pull freshness on Hobby.
 
 **Option C — Vercel Pro (Arpit's budget call).** On Pro the Hobby "once a
-day" cap lifts, so restore **`*/5 * * * *`** (5-min drain, 3-hour pulls)
-exactly as originally designed and optionally raise `maxDuration` past 60 s
-for heavier ticks. No code change — just put the schedule back in `vercel.json`
+day" cap lifts, so set the schedule back to **`*/5 * * * *`** (5-min drain,
+3-hour pulls) and optionally raise `maxDuration` past 60 s for heavier
+ticks. No code change — just the schedule in `vercel.json` (keep it
+`{ path, schedule }` only — `headers` is invalid on the cron schema on every
+plan; a sub-daily tick stays self-gated 20h-less because it presents no
+secret, so on Pro you'd pair it with option B's secret timer or accept the
+headerless self-gate).
 and redeploy.
 
 **Stable public URL for FlexiFunnels (v15).** A Vercel deploy gives the app a

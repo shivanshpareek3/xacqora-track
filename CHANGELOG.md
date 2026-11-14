@@ -2,6 +2,49 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-14 (v15.1: Vercel build fix — `crons[]` schema allows ONLY path+schedule)
+
+Redeploy of v15 FAILED the build:
+`Invalid vercel.json · crons[0] should NOT have additional property 'headers'.
+Please remove it.` — the v15 cron entry had attached the tick-secret as a
+`headers` property with a `{{ process.env.XACQORA_TICK_SECRET }}`
+substitution. Neither is a real Vercel feature (confirmed against the
+current vercel.json docs): a `crons[]` entry is exactly `{ path,
+schedule }`. (Vercel also cannot template-expand env vars inside cron
+fields.)
+
+Fix:
+- `vercel.json`: cron entry reduced to `{ "path": "/admin/tick",
+  "schedule": "0 0 * * *" }` — schema-legal, build unblocked.
+- `server/index.js` `tickEndpoint` reworked around the fact that a Vercel
+  cron CANNOT present the secret:
+  * secret header present → timing-safe compare vs `XACQORA_TICK_SECRET`
+    (401 on mismatch), un-gated — the external-cron option-B + manual
+    path;
+  * no header on a serverless target (`XT_DISABLE_TICKER=1`) → the
+    Vercel-native cron: **self-gated to one tick per 20h** via
+    `settings.last_admin_tick_ts` (+ the per-IP rate limit), recorded in
+    audit_log; an anonymous caller can at worst force one bounded,
+    idempotent drain per 20h;
+  * no header on a self-hosted run → 403 (the 5s interval already
+    drains the queue).
+- `docs/deploy.md`: §1 serverless-safe bullet + §2 `XACQORA_TICK_SECRET`
+  row + §4 deploy note + §9 "v15.1 build break" block (exact Vercel
+  error, the schema rule, the 20h self-gate, and when the secret header
+  still matters — option B).
+- Security posture is unchanged-or-better: the old design assumed the
+  cron could carry the secret (it couldn't); now the Vercel path is
+  explicitly gated in-app and the secret remains for the paths that CAN
+  send headers.
+
+Verify: vercel.json parses and the cron entry is exactly `{ path,
+schedule }`; all in-process suites green on SQLite (security / spa 42 /
+isolation / gates / metalive / reports / webhook-keys 39); tickEndpoint
+gate logic verified in-process (fresh scratch DB: headerless serverless
+tick 200 then 429; self-hosted headerless 403; wrong secret 401;
+right secret 200). Re-deploy = `git push` → Vercel rebuilds commit
+`<this>` green.
+
 ## 2026-11-14 (v15: Vercel Hobby deploy fix — daily cron, serverless-safe ticker, stable FlexiFunnels URL)
 
 Vercel red box ("Hobby accounts are limited to daily cron jobs. This cron

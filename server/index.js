@@ -1401,16 +1401,52 @@ async function tickerCycle(opts = {}) {
 // turns the interval off and Vercel Cron POSTs to /admin/tick instead.
 if (!DISABLE_TICKER) setInterval(tickerCycle, 5000);
 
-// Phase H: cron-driven tick for serverless (Vercel). Gated by a shared secret so
-// the queue drain / scheduled pulls can be triggered on demand.
+// Phase H / v15.1: cron-driven tick for serverless (Vercel).
+//
+// Auth model (two trigger types, because Vercel's cron schema is path+schedule
+// ONLY — it cannot attach headers, so a Vercel cron can never present a
+// secret):
+//   1. Secret header (x-xacqora-tick-secret === XACQORA_TICK_SECRET) — the
+//      external-cron / manual path (option B: a Cloudflare Worker / GH
+//      Actions / VPS timer that CAN send the header) and self-hosted.
+//      No rate gate — the operator chose that cadence.
+//   2. No header, serverless target (XT_DISABLE_TICKER=1) — the Vercel-native
+//      daily cron. Self-gates to ONE tick per 20h (settings.last_admin_tick_ts):
+//      a Vercel cron fires once a day so the gate never blocks it, but a
+//      random attacker who finds the public path can force at most one
+//      bounded, idempotent queue-drain per 20h — nothing more.
+//   Self-hosted (interval ticker on): a headerless tick is refused (403) —
+//   the 5s interval already drains the queue.
 function tickEndpoint(res, req) {
+  const plain = (code, msg) => { res.writeHead(code, { 'Content-Type': 'text/plain' }); res.end(msg); };
   const secret = process.env.XACQORA_TICK_SECRET;
-  if (!secret) { res.writeHead(503, { 'Content-Type': 'text/plain' }); res.end('XACQORA_TICK_SECRET not set'); return; }
-  const provided = req.headers['x-xacqora-tick-secret'] || '';
-  const want = secret;
-  const a = Buffer.from(String(provided)); const b = Buffer.from(want);
-  const ok = (a.length === b.length) && (crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : (provided === want));
-  if (!ok) { res.writeHead(401, { 'Content-Type': 'text/plain' }); res.end('bad tick secret'); return; }
+  const provided = String(req.headers['x-xacqora-tick-secret'] || '');
+  let authorized = false;
+  if (provided) {
+    if (!secret) { plain(401, 'tick secret not configured on this host'); return; }
+    const a = Buffer.from(provided); const b = Buffer.from(secret);
+    authorized = a.length === b.length && (crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : (provided === secret));
+    if (!authorized) { plain(401, 'bad tick secret'); return; }
+  } else if (DISABLE_TICKER) {
+    // Vercel-native cron path: one tick per 20h (see the 2026-11-14 doc note
+    // — Vercel cron jobs cannot carry a secret header on Hobby).
+    const tx = makeTx(db, null);
+    const last = tx.get(`SELECT value FROM settings WHERE key='last_admin_tick_ts'`)?.value;
+    if (last && Date.now() - new Date(last).getTime() < 20 * 3600000) {
+      plain(429, 'Vercel-cron tick gate: one tick per 20h (secret header bypasses this gate)');
+      return;
+    }
+    authorized = true;
+    tx.run(`INSERT INTO settings (key, value) VALUES ('last_admin_tick_ts', ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`, new Date().toISOString());
+    audit(db, null, 'admin.tick_cron', 'settings', 'headerless Vercel-cron tick (20h gate)');
+  } else if (secret) {
+    plain(403, 'self-hosted: pass the x-xacqora-tick-secret header (the 5s interval already drains the queue)');
+    return;
+  } else {
+    plain(503, 'XACQORA_TICK_SECRET not set and not in serverless mode');
+    return;
+  }
   // Serverless-safe: a cron-triggered tick in a serverless target runs the
   // capped-drain variant (3.4) so one invocation stays inside the function
   // timeout. A self-hosted run with the interval on passes no opts.

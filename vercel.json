@@ -7,10 +7,6 @@
     { "source": "/(.*)", "destination": "/api" }
   ],
   "crons": [
-    {
-      "path": "/admin/tick",
-      "schedule": "0 0 * * *",
-      "headers": { "x-xacqora-tick-secret": "{{ process.env.XACQORA_TICK_SECRET }}" }
-    }
+    { "path": "/admin/tick", "schedule": "0 0 * * *" }
   ]
 }
