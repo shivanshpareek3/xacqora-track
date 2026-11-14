@@ -9,7 +9,7 @@
   "crons": [
     {
       "path": "/admin/tick",
-      "schedule": "*/5 * * * *",
+      "schedule": "0 0 * * *",
       "headers": { "x-xacqora-tick-secret": "{{ process.env.XACQORA_TICK_SECRET }}" }
     }
   ]

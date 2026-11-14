@@ -21,11 +21,14 @@ env vars and the Vercel dashboard only.
  ┌────────────────────────────┐        ┌──────────────────────────────┐
  │ Vercel (Node 24 function) │───────▶│ Managed Postgres (Mumbai)    │
  │  api/index.js → handleReq │        │  role xacq_app   (non-super, │
- │  /admin/tick  (cron 5m)   │        │             FORCE RLS binds) │
- └────────────────────────────┘        │  role xacq_backup (super,   │
-        │                              │             dump-only)      │
-        ▼                              └──────────────────────────────┘
- https://track.<domain>/xt.js  (subdomain or CDN, Phase H item 2)
+ │  /admin/tick  (daily tick)│        │             FORCE RLS binds) │
+ │  /webhooks/… (FlexiFunnels)│      │  role xacq_backup (super,    │
+ └────────────────────────────┘        │             dump-only)      │
+        │                              └──────────────────────────────┘
+        ▼
+ https://<your-app>.vercel.app   (stable public URL → the FlexiFunnels
+                                   webhook base, replaces dev tunnels)
+ https://track.<domain>/xt.js    (subdomain or CDN, Phase H item 2)
 ```
 
 Key properties:
@@ -33,14 +36,32 @@ Key properties:
 - **Serverless-safe app** — `server/index.js` no longer auto-listens when
   imported: the request handler is exported (`module.exports = { handleRequest,
   server }`) and `api/index.js` is the Vercel entry. The 5s in-process ticker
-  is replaced by **Vercel Cron → `POST /admin/tick`** every 5 minutes
-  (`vercel.json`), gated by the `XACQORA_TICK_SECRET` header. Self-hosted runs
-  (`npm start`) keep the interval and never call the endpoint.
+  is replaced by **Vercel Cron → `POST /admin/tick`** (`vercel.json`), gated
+  by the `XACQORA_TICK_SECRET` header. Self-hosted runs (`npm start`) keep the
+  interval and never call the endpoint.
+- **Hobby cron limit (v15)** — Vercel **Hobby** plans allow **at most one cron
+  firing per day**. The original `*/5 * * * *` (every 5 min) is rejected on
+  Hobby ("would run more than once per day") — it is a *warning*, not a build
+  failure, but it means the 5-min drain never runs. The committed `vercel.json`
+  is now **daily: `0 0 * * *`** (option A). See §9 for the options and how to
+  get sub-daily drains back without Pro.
+- **Real-time webhooks without a 5-min drain** — because the Hobby cron is
+  daily, a webhook that only *enqueued* would sit in the queue up to 24h. So
+  the inbound paths (`/api/ingest/<platform>` + the token URL
+  `/webhooks/<platform>/<slug>/<token>`) **process the FlexiFunnels/other
+  webhook INLINE on the serverless target** (the `DISABLE_TICKER` condition,
+  i.e. `XT_DISABLE_TICKER=1`): the adapter runs in the same function
+  invocation and the lead lands in Postgres immediately. If inline processing
+  throws, it falls back to the durable queue (the daily cron drains it). Local
+  dev + both test engines leave `XT_DISABLE_TICKER` unset, so they take the
+  original enqueue-only path — **byte-identical**.
 - **Queue drain on a timer** — `/admin/tick` runs the same ticker cycle as the
   interval: webhook jobs, scheduled Meta pulls, the daily backup, and the
-  Monday-9AM-IST weekly summary. A cron firing while a function instance is
-  still alive just re-runs an idempotent cycle (jobs are claimed in the queue,
-  deduped by `dedup_key`).
+  Monday-9AM-IST weekly summary. On Hobby it fires **daily**; a cron firing
+  while a function instance is still alive just re-runs an idempotent cycle
+  (jobs are claimed in the queue, deduped by `dedup_key`). Under the daily
+  cron, **Meta pull freshness is daily** unless you add an external cron
+  (§9-B) — manual "Pull now" (`/meta.html`) is always available.
 - **xt.js on its own subdomain** — third-party CSP pages (Meta-hosted
   Instant-Form thank-you pages, Lovable/WordPress clients) can't always load a
   script cross-origin. `xt.js` is already served with `Access-Control-Allow-Origin: *`
@@ -72,7 +93,19 @@ never go into AI chat.**
 | `XT_RATE_PER_MIN_IP` | Vercel | per-IP flood guard (Phase S.6) | `600` |
 | `XT_RATE_PER_MIN_ENDPOINT` | Vercel | per-endpoint cap | `300` |
 | `PORT` | Vercel | listen port (Vercel sets; harmless) | `4100` |
-| `XT_DISABLE_TICKER` | Vercel | `1` turns off the in-process interval (serverless) | `1` |
+| `XT_DISABLE_TICKER` | Vercel | `1` turns off the in-process interval (serverless) + switches webhooks to inline processing | `1` |
+| `DATA_MODE` | Vercel | `live` = real data only (seed/demo fixtures hidden); prod default | `live` |
+| `APP_URL` | Vercel | **public base for generated webhook URLs (FlexiFunnels paste points)** — set to the Vercel app URL | `https://<app>.vercel.app` |
+| `META_ACCESS_TOKEN` | Vercel | Meta system-user access token (env→DB bridge encrypts it onto the ad-account rows) | your token |
+| `META_AD_ACCOUNT_IDS` | Vercel | comma-list of ad account ids to bridge from env | `act_123,act_456` |
+| `META_PIXEL_ID` / `META_AD_ACCOUNT_NAME` / `META_CLIENT_ID` | Vercel | optional env→DB bridge extras (pixel, display name, target client) | per account |
+
+> **`APP_URL` is the FlexiFunnels webhook base (v15).** The "Webhooks & API
+> Keys" screen generates `/webhooks/<platform>/<slug>/<token>` URLs on
+> `APP_URL` when it is set; a Vercel deploy gives a **stable public URL** for
+> good, so the temporary trycloudflare/ngrok dev tunnels are retired. On the
+> screen, `baseIsProd` (true when `APP_URL`/`XACQORA_PUBLIC_URL` is set) hides
+> the "localhost won't reach FlexiFunnels" dev notice.
 
 ---
 
@@ -113,18 +146,28 @@ psql "$DATABASE_URL" -Atc "GRANT ALL ON ALL TABLES IN SCHEMA public TO PUBLIC;
 ```bash
 # once: link the repo, add the env vars from §2
 vercel link
-vercel env add DATABASE_URL      # paste the prod value (never commit)
+vercel env add DATABASE_URL       # paste the prod value (never commit)
 vercel env add PG_BACKUP_USER
 vercel env add XACQORA_SECRET_KEY
 vercel env add XACQORA_TICK_SECRET
-vercel env add XACQORA_LIVE
-# prod = XACQORA_LIVE=1, XT_DISABLE_TICKER=1, MOCK unset
+vercel env add XACQORA_LIVE       # = 1 in prod
+vercel env add DATA_MODE          # = live in prod
+vercel env add APP_URL            # = your Vercel app URL (FlexiFunnels webhook base)
+vercel env add XT_DISABLE_TICKER # = 1 (serverless: no in-process interval)
+# Meta env->DB bridge (optional): META_ACCESS_TOKEN, META_AD_ACCOUNT_IDS, ...
 
 vercel deploy --prod
 ```
 
-`vercel.json` (committed) does the rest: catchall rewrite → `api/index.js`,
-and the **`*/5 * * * *` cron → `/admin/tick`** with the tick-secret header.
+`vercel.json` (committed) does the rest: catchall rewrite → `api/index.js`
+(handles `/webhooks/*`, `/health`, `/admin/tick`, the SPA `/app` fallback, and
+every other route through the single function), and a **Hobby-legal daily
+cron `0 0 * * *` → `/admin/tick`** with the tick-secret header (Hobby allows at
+most one cron firing per day — the former `*/5 * * * *` was rejected; see §9).
+Because the drain is now daily, **inbound webhooks process INLINE on the
+serverless target** (a FlexiFunnels POST lands in Postgres in the same
+invocation, not at the next cron), and `/admin/tick` runs the capped-drain
+serverless cycle (3.4) so it stays inside the function timeout.
 
 **Self-hosted (VPS) alternative:** same code, `npm start` under a process
 manager; keep `XT_DISABLE_TICKER` unset so the in-process ticker runs; back the
@@ -160,8 +203,9 @@ bash scripts/staging.sh
   (Meta business-verification flag + CAPI live/dry flip; live mode itself is
   the `XACQORA_LIVE` env var, changed via Vercel + redeploy).
 - **Page on:** any `/health` signal boolean true for > 10 min, `secret_key_set`
-  false, or the 5-min `/admin/tick` missing three consecutive beats (queue age
-  gate, G4, will trip first).
+  false, or the daily `/admin/tick` (Hobby) missing its beat on two
+  consecutive days (queue age gate, G4, will trip first; sub-daily beats are
+  only available via an external cron, §9-B).
 
 ---
 
@@ -207,3 +251,68 @@ cutover (the checklist's entry condition).
   for Phase H).
 - **DB:** `pg_restore` from the newest `xacq_backup`-role dump
   (`scripts/restore-drill.sh` is exactly that path).
+
+---
+
+## 9. Hobby cron limit & pull-freshness options (v15)
+
+**The Hobby red box.** Vercel Hobby allows **at most one cron firing per
+day**. The original `vercel.json` shipped `*/5 * * * *` (every 5 min), which
+Hobby rejects with:
+
+> "Hobby accounts are limited to daily cron jobs. This cron expression
+> (`*/5 * * * *`) would run more than once per day."
+
+It is a **warning, not a build failure** — the deploy proceeds, but the 5-min
+drain never runs. Concretely: the 3-hour Meta auto-pull fires at most once
+a day, and a webhook that only *enqueued* would sit in the queue until the
+next daily cron.
+
+**Chosen — option A: daily cron (committed).** `vercel.json` now schedules
+`/admin/tick` at **`0 0 * * *`** (UTC, one firing/day — Hobby-legal). What
+that buys / gives up:
+
+- Meta auto-pull is **daily** (was 3-hour). The manual **"Pull now"** on
+  `/meta.html` (team-only) always works, so a fresher number is one click
+  away; only the *automatic* cadence coarsens.
+- **Webhooks are not delayed by the cron**: on the serverless target the
+  token-URL (`/webhooks/…`) and `/api/ingest` paths process the FlexiFunnels
+  event **inline** in the same function invocation (§1 "Real-time webhooks"),
+  so a lead lands in Postgres immediately, not at the next daily tick.
+- `/admin/tick` runs the **capped-drain serverless cycle** (`XT_TICK_MAX_JOBS`,
+  default 50) so one invocation stays inside the function timeout; un-claimed
+  jobs roll to the next fire. Heavy Meta pulls are per-account jobs (each
+  small on its own).
+
+> **Variant:** to align Monday's tick with the weekly-summary window
+> (`tickerCycle` writes the Mon-9AM-IST summary only when UTC hour = 3, i.e.
+> Mon 08:30–09:29 IST), schedule **`0 3 * * *`** instead — still one firing/
+> day, still Hobby-legal. (On Hobby the weekly PDF is audit-only anyway, since
+> the function FS is ephemeral.)
+
+**Option B — external cron (3-hour pull back, without Pro).** Keep the Vercel
+Hobby app (Vercel cron daily as a floor, or none) and have a free external
+timer POST to the secret-gated endpoint every 5 min / 3 h:
+
+```
+POST https://<your-app>.vercel.app/admin/tick
+header: x-xacqora-tick-secret: <XACQORA_TICK_SECRET>
+```
+
+Any of these work (store the secret in the hoster's env, not in the repo):
+a Cloudflare Worker cron trigger, GitHub Actions `schedule` (free; min cadence
+≈1 h), or a cheap VPS `curl` on crontab. The endpoint is gated by
+`XACQORA_TICK_SECRET`, so only that timer can trigger it. This restores
+sub-daily Meta-pull freshness on Hobby.
+
+**Option C — Vercel Pro (Arpit's budget call).** On Pro the Hobby "once a
+day" cap lifts, so restore **`*/5 * * * *`** (5-min drain, 3-hour pulls)
+exactly as originally designed and optionally raise `maxDuration` past 60 s
+for heavier ticks. No code change — just put the schedule back in `vercel.json`
+and redeploy.
+
+**Stable public URL for FlexiFunnels (v15).** A Vercel deploy gives the app a
+permanent `https://<app>.vercel.app` URL. Set **`APP_URL`** to it and the
+"Webhooks & API Keys" screen generates the token URLs on that base — the
+temporary trycloudflare / ngrok dev tunnels are **retired**; FlexiFunnels
+posts to the stable Vercel URL and leads land in Postgres in real time.

@@ -192,11 +192,31 @@ async function handleIngest(platform, kind, res, bodyJson, raw, req, clientHint)
       // the tracking-script path creates a touchpoint + lead directly
       processTrackerEvent(tx, kind, bodyJson, client_id);
       logIngest(tx, platform, client_id, test ? 'test' : 'processed', null, raw, null, test);
+      json(res, { ok: true, client_id, processed: true });
     } else {
+      // v15 (Vercel): on a serverless target there is no in-process interval
+      // ticker, so the durable queue is only drained by the (Hobby = daily)
+      // cron — a real-time FlexiFunnels lead would wait up to 24h. In the
+      // serverless case (XT_DISABLE_TICKER=1, i.e. DISABLE_TICKER) process the
+      // webhook INLINE in this invocation so the lead lands in Postgres now;
+      // on any error, fall back to the durable queue (nothing is dropped, the
+      // cron still drains it). Local dev / tests leave DISABLE_TICKER unset,
+      // so they take the original enqueue-only path — byte-identical.
+      if (DISABLE_TICKER) {
+        try {
+          await handleWebhook(makeTx(db, null), jobPayload);
+          logIngest(tx, platform, client_id, test ? 'test' : 'processed', null, raw, dedupKey(platform, bodyJson), test);
+          json(res, { ok: true, client_id, processed: true });
+          return;
+        } catch (inlineErr) {
+          // inline failed (DB hiccup) — fall through to the durable queue below.
+          console.error('[ingest:inline]', inlineErr.message);
+        }
+      }
       enqueue(db, 'webhook', jobPayload);
-      logIngest(tx, platform, client_id, test ? 'test' : 'queued', null, raw, null, test);
+      logIngest(tx, platform, client_id, test ? 'test' : 'queued', null, raw, dedupKey(platform, bodyJson), test);
+      json(res, { ok: true, client_id, queued: !test });
     }
-    json(res, { ok: true, client_id, queued: !test });
   } catch (e) {
     logIngest(tx, platform, client_id, 'failed', String(e.message || e).slice(0, 300), raw, null, test);
     json(res, { ok: false, error: String(e.message || e) }, 500);
@@ -290,6 +310,22 @@ async function handleTokenWebhook(platform, token, res, bodyJson, raw, req) {
       dedup_key: dedupKey(platform, bodyJson), test,
       endpoint_id: ep.id,
     };
+    // v15 (Vercel): on the serverless target the durable queue is drained only
+    // by the (Hobby = daily) cron, so process the webhook INLINE here and the
+    // FlexiFunnels lead lands in Postgres immediately. On error, fall back to
+    // the durable queue (the cron drains it). Local dev / tests keep the
+    // enqueue-only path (DISABLE_TICKER unset) — byte-identical.
+    if (DISABLE_TICKER) {
+      try {
+        await handleWebhook(makeTx(db, null), jobPayload);
+        W.recordEvent(tx, ep.id);
+        logIngest(tx, platform, ep.client_id, test ? 'test' : 'processed', null, raw, dedupKey(platform, bodyJson), test);
+        json(res, { ok: true, client_id: ep.client_id, processed: true, endpoint_id: ep.id });
+        return;
+      } catch (inlineErr) {
+        console.error('[webhooks:inline]', inlineErr.message);
+      }
+    }
     enqueue(db, 'webhook', jobPayload);
     W.recordEvent(tx, ep.id);
     logIngest(tx, platform, ep.client_id, test ? 'test' : 'queued', null, raw, dedupKey(platform, bodyJson), test);
@@ -1256,16 +1292,32 @@ Ravi,+919812345678,ravi@example.com,Mumbai,Paid,9999,1,1,2026-10-20T00:00:00Z"><
 // (gated by the XACQORA_TICK_SECRET header). Plain self-hosted runs keep the
 // interval and never need the endpoint.
 const DISABLE_TICKER = process.env.XT_DISABLE_TICKER === '1';
-async function tickerCycle() {
-  // (body below) — runs either on the interval or via POST /admin/tick
+async function tickerCycle(opts = {}) {
+  // opts.serverless (POST /admin/tick when XT_DISABLE_TICKER=1) keeps ONE
+  // invocation small enough for the Vercel function timeout (Hobby maxDuration
+  // 60s): the queue drain is capped by XT_TICK_MAX_JOBS and the heavy Meta
+  // pulls are per-account jobs (small on their own). Local self-hosted runs
+  // and all tests call tickerCycle() with no opts — byte-identical to the
+  // original 5s-interval behaviour.
   try {
     const tx = makeTx(db, null); // system ticker: queue + scheduled pulls
-    await tick(db, { handleWebhook }, 30);
     // scheduled Meta pull: every ad account whose last_pull is older than 3h
     const threeHoursAgo = new Date(Date.now() - 3 * 3600000).toISOString();
     const due = tx.all(`SELECT * FROM meta_ad_account WHERE auto_pull=1 AND status='connected'
       AND (last_pull_at IS NULL OR last_pull_at < ?)`, threeHoursAgo);
-    for (const a of due) enqueue(db, 'meta_pull', { ad_account_id: a.ad_account_id });
+    if (opts.serverless) {
+      // Serverless: enqueue the due pulls FIRST so this invocation's capped
+      // drain can process them (a Hobby cron fires at most once a day, so a
+      // pull enqueued after the drain would wait another full day).
+      for (const a of due) enqueue(db, 'meta_pull', { ad_account_id: a.ad_account_id });
+      const maxJobs = Number(process.env.XT_TICK_MAX_JOBS) || 50;
+      await tick(db, { handleWebhook }, maxJobs);
+      // jobs beyond the cap stay pending (next_run_at unchanged) and roll to
+      // the next cron fire — nothing is dropped.
+    } else {
+      await tick(db, { handleWebhook }, 30);
+      for (const a of due) enqueue(db, 'meta_pull', { ad_account_id: a.ad_account_id });
+    }
     // daily backup: once per IST calendar day (PRD §10: daily DB backup)
     const now = new Date();
     const ist = new Date(now.getTime() + 5.5 * 3600000);
@@ -1273,10 +1325,21 @@ async function tickerCycle() {
     const lastBackup = tx.get(`SELECT value FROM settings WHERE key='last_backup_date'`)?.value;
     if (lastBackup !== istDay && ist.getUTCHours() >= 0) {
       try {
-        const { runBackup } = require('./lib/backup');
-        const file = runBackup(db);
-        tx.run(`INSERT INTO settings (key, value) VALUES ('last_backup_date',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, istDay);
-        audit(db, null, 'backup.daily', 'backup', file);
+        if (opts.serverless) {
+          // Vercel: no pg_dump binary in the function runtime + ephemeral FS,
+          // so the in-function dump cannot run. The daily backup on Vercel is
+          // the managed Postgres provider's snapshot/PITR (Neon/Supabase
+          // automatic history). Record it HONESTLY in settings + audit so the
+          // /health backup signal reflects "backed up by provider" instead of
+          // going red — never a fake pg_dump file row.
+          tx.run(`INSERT INTO settings (key, value) VALUES ('last_backup_date',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, istDay);
+          audit(db, null, 'backup.daily', 'backup', 'serverless: provider-managed snapshot (no in-function pg_dump on Vercel)');
+        } else {
+          const { runBackup } = require('./lib/backup');
+          const file = runBackup(db);
+          tx.run(`INSERT INTO settings (key, value) VALUES ('last_backup_date',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, istDay);
+          audit(db, null, 'backup.daily', 'backup', file);
+        }
       } catch (e) {
         console.error('[backup]', e.message);
       }
@@ -1285,7 +1348,6 @@ async function tickerCycle() {
     // One page per client (portal card + PDF download), plus an all-client JSON
     // for the internal audit trail. Zero manual — the client just gets it.
     if (ist.getDay() === 1 && ist.getUTCHours() === 3 && now.getUTCMinutes() < 60) {
-      const { report: pdfReport } = require('./lib/pdf');
       const settings = {
         attribution_model: tx.get(`SELECT value FROM settings WHERE key='attribution_model'`)?.value,
         attribution_window_days: tx.get(`SELECT value FROM settings WHERE key='attribution_window_days'`)?.value,
@@ -1294,27 +1356,40 @@ async function tickerCycle() {
       // mode (seed rows are excluded from every screen there too).
       const dm = require('./lib/datamode');
       const live = dm.mode(tx) === dm.LIVE;
-      const outDir = path.join(__dirname, '..', 'reports');
-      fs.mkdirSync(outDir, { recursive: true });
       const date = now.toISOString().slice(0, 10);
-
-      // all-client summary (audit trail + team view)
       const wsAll = S.weeklySummary(tx, settings, null, live);
-      const allFile = path.join(outDir, `summary-${date}.json`);
-      fs.writeFileSync(allFile, JSON.stringify(wsAll, null, 2));
-      audit(db, null, 'weekly_summary', 'report', allFile.split('/').pop());
 
-      // one PDF + portal card per client
-      const clients = tx.all(`SELECT c.id, c.name FROM client c ORDER BY c.id`);
-      for (const c of clients) {
-        const ws = S.weeklySummary(tx, settings, [c.id], live);
-        const pdfBytes = pdfReport(S.weeklyPdfLines(ws, c.name));
-        const pdfFile = path.join(outDir, `summary-${date}-client${c.id}.pdf`);
-        fs.writeFileSync(pdfFile, pdfBytes);
-        // keep the latest PDF path in settings so the portal card can link it
-        tx.run(`INSERT INTO settings (key, value) VALUES ('weekly_pdf_client_${c.id}', ?)
-          ON CONFLICT(key) DO UPDATE SET value=excluded.value`, pdfFile);
-        audit(db, null, 'weekly_summary.pdf', 'report', pdfFile.split('/').pop() + ` (client ${c.id})`);
+      if (opts.serverless) {
+        // Vercel: the function FS is EPHEMERAL — a reports/summary-*.pdf write
+        // vanishes at the next cold start, and settings would then point at a
+        // path that 404s forever. So serverless records the summary in the
+        // audit trail only (Postgres-persisted) and writes NO PDF / portal
+        // link. The classic UI's manual "Download PDF" still works on a
+        // self-hosted run.
+        audit(db, null, 'weekly_summary', 'report',
+          `serverless: ${date} · ${wsAll.total ? Object.keys(wsAll.total || {}) : 'no'} leads (summary recorded; PDF skipped — ephemeral FS)`);
+      } else {
+        const { report: pdfReport } = require('./lib/pdf');
+        const outDir = path.join(__dirname, '..', 'reports');
+        fs.mkdirSync(outDir, { recursive: true });
+
+        // all-client summary (audit trail + team view)
+        const allFile = path.join(outDir, `summary-${date}.json`);
+        fs.writeFileSync(allFile, JSON.stringify(wsAll, null, 2));
+        audit(db, null, 'weekly_summary', 'report', allFile.split('/').pop());
+
+        // one PDF + portal card per client
+        const clients = tx.all(`SELECT c.id, c.name FROM client c ORDER BY c.id`);
+        for (const c of clients) {
+          const ws = S.weeklySummary(tx, settings, [c.id], live);
+          const pdfBytes = pdfReport(S.weeklyPdfLines(ws, c.name));
+          const pdfFile = path.join(outDir, `summary-${date}-client${c.id}.pdf`);
+          fs.writeFileSync(pdfFile, pdfBytes);
+          // keep the latest PDF path in settings so the portal card can link it
+          tx.run(`INSERT INTO settings (key, value) VALUES ('weekly_pdf_client_${c.id}', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value`, pdfFile);
+          audit(db, null, 'weekly_summary.pdf', 'report', pdfFile.split('/').pop() + ` (client ${c.id})`);
+        }
       }
     }
   } catch (e) {
@@ -1336,7 +1411,11 @@ function tickEndpoint(res, req) {
   const a = Buffer.from(String(provided)); const b = Buffer.from(want);
   const ok = (a.length === b.length) && (crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : (provided === want));
   if (!ok) { res.writeHead(401, { 'Content-Type': 'text/plain' }); res.end('bad tick secret'); return; }
-  tickerCycle().then(() => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); })
+  // Serverless-safe: a cron-triggered tick in a serverless target runs the
+  // capped-drain variant (3.4) so one invocation stays inside the function
+  // timeout. A self-hosted run with the interval on passes no opts.
+  const job = tickerCycle(DISABLE_TICKER ? { serverless: true } : {});
+  job.then(() => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); })
     .catch((e) => { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end(String(e.message || e)); });
 }
 

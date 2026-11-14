@@ -2,6 +2,66 @@
 
 Every completed task lands here so the next AI session has context. Newest first.
 
+## 2026-11-14 (v15: Vercel Hobby deploy fix — daily cron, serverless-safe ticker, stable FlexiFunnels URL)
+
+Vercel red box ("Hobby accounts are limited to daily cron jobs. This cron
+expression (`*/5 * * * *`) would run more than once per day") was blocking
+the Hobby deploy. Fix, without touching app core logic or the local
+SQLite/Postgres test paths:
+
+- **`vercel.json`: cron `*/5 * * * *` → `0 0 * * *`** (option A — Hobby-
+  legal daily drain to `/admin/tick`). Meta auto-pull is now daily;
+  manual "Pull now" still works anytime. (Option B external-cron timer and
+  C Vercel Pro are documented, not implemented.)
+- **Real-time webhooks on serverless**: with a daily drain a *queued*
+  FlexiFunnels event would wait up to 24h. So `handleIngest` +
+  `handleTokenWebhook` now process the webhook **inline in the same
+  function invocation when `XT_DISABLE_TICKER=1`** (falling back to the
+  durable queue on error — nothing is dropped). Local dev + all test
+  suites leave the flag unset → the enqueue-only path is byte-identical.
+- **Serverless-safe `/admin/tick`** (`tickerCycle({ serverless })`,
+  used by `tickEndpoint` when the interval is off): enqueue due Meta
+  pulls BEFORE the drain, cap the drain at `XT_TICK_MAX_JOBS` (default
+  50) so one invocation fits the function timeout; un-claimed jobs roll
+  to the next fire. In-function `pg_dump` and `reports/` PDF file
+  writes are skipped on Vercel (ephemeral FS, no pg_dump binary) and
+  recorded honestly in audit/settings instead — provider-managed
+  snapshots are the Vercel backup.
+- **`server/db.js` Vercel guard**: on a `VERCEL` host without
+  `DATABASE_URL`, `db.open()` throws at boot rather than silently
+  opening an ephemeral SQLite file. `node:sqlite` stays lazy (SQLite-
+  branch only) — the Postgres path never loads it.
+- **Postgres decision (3.2)**: prod stays on the sync `pg-native`
+  facade. `libpq@1.11.0` ships a compiled `addon.node` (node-gyp);
+  Vercel builds it at deploy time (`install: true` is set in
+  vercel.json — confirm the build log compiles it for the target
+  runtime). Documented fallback if that ever fails: swap
+  `server/pg.js`'s `require('pg-native')` for a `pg.Pool` sync-shim
+  (pure-JS `pg` is already a dependency) — 1-file change, no core
+  logic touched.
+- **`docs/deploy.md`**: §1 topology + Hobby-cron properties, §2 env
+  table extended (`DATA_MODE`, `APP_URL`, `META_ACCESS_TOKEN`,
+  `META_AD_ACCOUNT_IDS`, …), §4 deploy steps + new §9 "Hobby cron
+  limit & pull-freshness options" (A daily / B external cron timer /
+  C Pro) + the **stable public URL for FlexiFunnels** (set `APP_URL`
+  to the Vercel URL; dev tunnels retired).
+
+**Verify (done on the host the agent runs on):** all in-process suites
+green on SQLite (security / spa 42 / isolation / gates / metalive /
+reports / webhook-keys 39); module-load checks pass in both shapes
+(local interval ON; `XT_DISABLE_TICKER=1` off + no listen); Vercel
+guard throws as intended; vercel.json valid, no sub-daily cron. The
+Postgres in-process run needs the dev cluster (`scripts/pg-dev.sh`) —
+blocked in the agent sandbox (`shmget` denied; run it in a terminal).
+
+**Still user-side:** set the §2 env vars on the Vercel project
+(`DATABASE_URL` incl. `?sslmode=require`, `XACQORA_SECRET_KEY`,
+`XACQORA_TICK_SECRET`, `XT_DISABLE_TICKER=1`, `DATA_MODE=live`,
+`APP_URL`=Vercel URL, META_* as needed), `vercel deploy --prod`, then
+the live smoke test (deploy.md §9 note): `GET /health` 200 · `/app`
+loads · sample FlexiFunnels POST → lead in Postgres · paste the two
+generated URLs into FlexiFunnels.
+
 ## 2026-11-12 (v14.2: Classic UI — "Webhooks & API Keys" screen + sidebar entry)
 
 The v14/v14.1 screen shipped SPA-only (`/app/#/webhooks`). The user's daily

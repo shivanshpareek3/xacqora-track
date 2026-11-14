@@ -97,6 +97,19 @@ function open() {
   }
 
   // Local dev / tests: zero-dependency SQLite.
+  //
+  // Serverless guard (Vercel, PRD: "Vercel DB = Postgres, SQLite kabhi nahi"):
+  // the Vercel function runtime is ephemeral (filesystem resets between
+  // invocations) and node:sqlite is NOT part of the Vercel Node runtime — so
+  // if DATABASE_URL is missing on a serverless target we must fail LOUDLY at
+  // boot rather than silently open a SQLite file that vanishes (losing every
+  // lead/event/deal). Vercel sets the VERCEL env var; a local `node`/test
+  // never does, so this guard is a no-op for `node server/index.js` + tests.
+  if (process.env.VERCEL && !process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is required on the serverless target (Vercel). The app stores on Postgres there; the SQLite fallback is local-dev only. Set the DATABASE_URL env var (managed Postgres, sslmode=require).');
+  }
+  // node:sqlite is required LAZY, inside this SQLite-only branch, so the
+  // serverless/Postgres path (DATABASE_URL set) never loads node:sqlite at all.
   const { DatabaseSync } = require('node:sqlite');
   const dbFile = process.env.XACQORA_DB_FILE || path.join(__dirname, '..', 'xacqora.sqlite3');
   fs.mkdirSync(path.dirname(dbFile), { recursive: true });
